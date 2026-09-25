@@ -72,7 +72,9 @@ def test_dashboard_passes_optional_moonlight_nat_host_to_runtime():
 def test_dashboard_image_hash_covers_every_runtime_module():
     ensure = _text("server/blobedash-ensure.sh")
     assert 'find "$STATE_DIR/dashboard" -maxdepth 1 -type f -name \'*.py\'' in ensure
-    assert '[[ -n "${REPO_DIR:-}" && -d "$REPO_DIR/dashboard" ]]' in ensure
+    assert 'EPICVM_SYNC_RUNTIME_FROM_REPO:-0' in ensure
+    assert 'EPICVM_SYNC_RUNTIME_FROM_REPO:-0' in ensure
+    assert '-d "$REPO_DIR/dashboard"' in ensure
     assert 'REPO_DIR="${REPO_DIR:-/opt/blobe-vm/repo}"' not in ensure
     assert 'sha256sum "$STATE_DIR/server/blobedash.Dockerfile"' in ensure
 

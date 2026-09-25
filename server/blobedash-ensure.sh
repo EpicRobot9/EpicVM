@@ -109,7 +109,7 @@ ensure_blobedash_image() {
 # Keep the served dashboard runtime aligned with the repository checkout. The
 # state directory also contains mutable data, so copy only Python source files
 # instead of replacing the whole directory.
-if [[ -n "${REPO_DIR:-}" && -d "$REPO_DIR/dashboard" ]]; then
+if [[ "${EPICVM_SYNC_RUNTIME_FROM_REPO:-0}" == "1" && -n "${REPO_DIR:-}" && -d "$REPO_DIR/dashboard" ]]; then
   mkdir -p "$STATE_DIR/dashboard"
   while IFS= read -r -d '' dashboard_source; do
     install -m 644 "$dashboard_source" "$STATE_DIR/dashboard/$(basename "$dashboard_source")"
