@@ -12,10 +12,10 @@
     "@phosphor-icons/react": "^2.1.10",
     "react": "18.2.0",
     "react-dom": "18.2.0",
-    "react-router-dom": "6.17.0"
+    "react-router-dom": "7.18.4"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^5.0.0",
-    "vite": "5.1.0"
+    "@vitejs/plugin-react": "6.1.1",
+    "vite": "8.3.1"
   }
 }

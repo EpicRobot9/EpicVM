@@ -22,7 +22,6 @@ export default function APIInfo(){
     '/dashboard/api/list',
     '/dashboard/api/vm/stats',
     '/dashboard/api/vm/logs/<name>',
-    '/dashboard/api/vm/exec/<name>',
     '/dashboard/api/overview',
     '/dashboard/api/notifications',
     '/dashboard/api/jobs',

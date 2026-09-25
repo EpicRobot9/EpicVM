@@ -49,3 +49,24 @@ def test_quick_installer_accepts_epicvm_defaults_and_keeps_legacy_exports():
 def test_canonical_installers_use_epicvm_facing_copy():
     assert "BlobeVM Manager" not in INSTALLER
     assert "BlobeVM Host/VPS Installer" not in SERVER_INSTALLER
+
+
+def test_clean_install_ships_the_complete_dashboard_runtime():
+    assert 'find "$REPO_DIR/dashboard" -maxdepth 1 -type f -name \'*.py\'' in SERVER_INSTALLER
+    assert 'install -Dm644 "$dashboard_module"' in SERVER_INSTALLER
+    assert 'rsync -a --delete' in SERVER_INSTALLER
+    assert '/opt/blobe-vm/epicvm_web/' in SERVER_INSTALLER
+
+
+def test_dashboard_runtime_prefers_canonical_cli_and_keeps_legacy_alias():
+    ensure = (REPO / "server" / "blobedash-ensure.sh").read_text()
+    assert '-v /usr/local/bin/epicvm:/usr/local/bin/epicvm:ro' in ensure
+    assert 'install -Dm755 "$REPO_DIR/server/blobe-vm-manager" /usr/local/bin/blobe-vm-manager' in SERVER_INSTALLER
+    assert 'command -v epicvm' in QUICK_INSTALLER
+
+
+def test_multiseat_overlay_is_checked_in_and_loaded_by_public_app():
+    index = (REPO / "epicvm_web" / "index.html").read_text()
+    overlay = REPO / "epicvm_web" / "public" / "management-multiseat.js"
+    assert '<script type="module" src="/management-multiseat.js"></script>' in index
+    assert '/management/host-gaming/desktop-grants' in overlay.read_text()

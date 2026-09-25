@@ -11,6 +11,13 @@ __pycache__/
 /dashboard_v2/last_error.txt
 /dashboard_v2/test-results/
 /tmp/
+/\.pytest-*/
+/.pytest-tmp-local/
+/.omarchy-pytest.*
+/.epicvm-*.json
+/.tmp-*
+/dashboard/*.orig
+/remote_agent/windows/testResults.xml
 /opt/blobe-vm/remote-hosts.json
 /opt/blobe-vm/remote-hosts.json.inventory.json
 

@@ -70,18 +70,12 @@ find_free_port() {
 
 blobedash_build_hash() {
   local hash_input=""
-  for p in \
-    "$STATE_DIR/dashboard/app.py" \
-    "$STATE_DIR/dashboard/guacamole_orchestrator.py" \
-    "$STATE_DIR/dashboard/moonlight_orchestrator.py" \
-    "$STATE_DIR/dashboard/remote_agent_client.py" \
-    "$STATE_DIR/dashboard/optimizer.py" \
-    "$STATE_DIR/server/blobedash.Dockerfile"
-  do
+  while IFS= read -r p; do
     if [[ -f "$p" ]]; then
       hash_input+="$(sha256sum "$p")\n"
     fi
-  done
+  done < <(find "$STATE_DIR/dashboard" -maxdepth 1 -type f -name '*.py' -print | LC_ALL=C sort)
+  hash_input+="$(sha256sum "$STATE_DIR/server/blobedash.Dockerfile")\n"
   printf "%b" "$hash_input" | sha256sum | awk '{print $1}'
 }
 
@@ -112,14 +106,17 @@ ensure_blobedash_image() {
   trap - RETURN
 }
 
-# Ensure dashboard app exists
-if [[ ! -f "$APP_PATH" ]]; then
-  if [[ -n "${REPO_DIR:-}" && -f "${REPO_DIR}/dashboard/app.py" ]]; then
-    mkdir -p "$(dirname "$APP_PATH")"
-    cp -f "${REPO_DIR}/dashboard/app.py" "$APP_PATH"
-  else
-    echo "dashboard app not found at $APP_PATH and REPO_DIR unknown" >&2
-  fi
+# Keep the served dashboard runtime aligned with the repository checkout. The
+# state directory also contains mutable data, so copy only Python source files
+# instead of replacing the whole directory.
+if [[ -n "${REPO_DIR:-}" && -d "$REPO_DIR/dashboard" ]]; then
+  mkdir -p "$STATE_DIR/dashboard"
+  while IFS= read -r -d '' dashboard_source; do
+    install -m 644 "$dashboard_source" "$STATE_DIR/dashboard/$(basename "$dashboard_source")"
+  done < <(find "$REPO_DIR/dashboard" -maxdepth 1 -type f -name '*.py' -print0 | sort -z)
+elif [[ ! -f "$APP_PATH" ]]; then
+  echo "dashboard app not found at $APP_PATH and repository runtime is unavailable" >&2
+  exit 1
 fi
 
 
@@ -207,7 +204,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
   -v "$STATE_DIR:/opt/blobe-vm" \
   -v /opt/epicvm:/opt/epicvm \
   -v /var/blobe:/var/blobe \
-  -v /usr/local/bin/blobe-vm-manager:/usr/local/bin/blobe-vm-manager:ro \
+  -v /usr/local/bin/epicvm:/usr/local/bin/epicvm:ro \
   -v "${HOST_DOCKER_BIN}:/usr/bin/docker:ro" \
   -v "${HOST_DOCKER_COMPOSE_BIN}:/usr/libexec/docker/cli-plugins/docker-compose:ro" \
   -v /var/run/docker.sock:/var/run/docker.sock \

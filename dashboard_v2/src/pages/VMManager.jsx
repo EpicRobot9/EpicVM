@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import Button from '../components/Button'
 import apiFetch from '../lib/fetchWrapper'
 import Modal from '../components/Modal'
-import VmExec from '../components/VmExec'
 import { useToasts } from '../components/ToastProvider'
 import { instanceNamesKey, pollDelayMs } from '../lib/polling'
 import { canCacheVmSettingsResponse, clearRemovedVmState, createLoadInFlightRunner, createLogSelectionTracker } from '../lib/vmManagerRaces'
@@ -1343,9 +1342,7 @@ export default function VMManager(){
         <div style={{display:'flex',gap:12, flexWrap:'wrap'}}>
           <div style={{flex:'1 1 620px'}}>
             <iframe title={`VM ${selected}`} src={selectedVmUrl || `/EpicVM/vm/${encodeURIComponent(selected)}/`} style={{width:'100%',height:360,border:'1px solid rgba(255,255,255,0.04)', background:'#020617'}} />
-            {selectedVmHostId === 'local' ? <div style={{marginTop:12}}>
-              <VmExec vmName={selected} />
-            </div> : <div className="vm-placement-notice" style={{marginTop:12}}>Remote console is served by the selected host URL.</div>}
+            <div className="vm-placement-notice" style={{marginTop:12}}>Use the VM console for interactive maintenance. Dashboard actions and logs remain available here.</div>
           </div>
           <div style={{width:420,maxWidth:'100%',display:'flex',flexDirection:'column',gap:8}}>
             <div style={{fontSize:13,color:'var(--muted)'}}>Console / Logs</div>

@@ -22,11 +22,15 @@ def test_dashboard_overview_combines_real_host_inventory_and_activity(monkeypatc
     monkeypatch.setattr(dashboard_app, 'manager_json_list', lambda: [
         {'name': 'real-vm', 'status': 'blobevm_real-vm (running)', 'url': '/vm/real-vm/'},
     ])
+    monkeypatch.setattr(dashboard_app, 'manager_json_fleet_list', lambda: [
+        {'name': 'real-vm', 'status': 'blobevm_real-vm (running)', 'url': '/vm/real-vm/'},
+    ])
     monkeypatch.setattr(
         dashboard_app.dash_optimizer,
-        'status',
-        lambda: {'stats': {'history': {'events': [{'action': 'start', 'vm': 'real-vm', 'ts': 1700000000}]}}},
+        '_history_state',
+        lambda: {'events': [{'action': 'start', 'vm': 'real-vm', 'ts': 1700000000}]},
     )
+    monkeypatch.setattr(dashboard_app.dash_optimizer, 'status', lambda: (_ for _ in ()).throw(AssertionError('expensive optimizer status must not run')))
     monkeypatch.setattr(dashboard_app.platform, 'node', lambda: 'real-host')
     monkeypatch.setattr(dashboard_app, '_read_os_release', lambda: 'Real Linux')
     monkeypatch.setattr(dashboard_app, '_kernel_release', lambda: 'real-kernel')
@@ -44,7 +48,9 @@ def test_dashboard_overview_combines_real_host_inventory_and_activity(monkeypatc
 def test_dashboard_overview_does_not_fabricate_empty_activity(monkeypatch):
     monkeypatch.setattr(dashboard_app, '_get_system_stats', lambda: {})
     monkeypatch.setattr(dashboard_app, 'manager_json_list', lambda: [])
-    monkeypatch.setattr(dashboard_app.dash_optimizer, 'status', lambda: {'stats': {'history': {'events': []}}})
+    monkeypatch.setattr(dashboard_app, 'manager_json_fleet_list', lambda: [])
+    monkeypatch.setattr(dashboard_app.dash_optimizer, '_history_state', lambda: {'events': []})
+    monkeypatch.setattr(dashboard_app.dash_optimizer, 'status', lambda: (_ for _ in ()).throw(AssertionError('expensive optimizer status must not run')))
     monkeypatch.setattr(dashboard_app.platform, 'node', lambda: 'real-host')
     monkeypatch.setattr(dashboard_app, '_read_os_release', lambda: 'Real Linux')
     monkeypatch.setattr(dashboard_app, '_kernel_release', lambda: 'real-kernel')

@@ -67,3 +67,20 @@ def test_dashboard_passes_optional_moonlight_nat_host_to_runtime():
     assert runtime_arg in ensure
     assert runtime_arg in installer
     assert 'echo "EPICVM_MOONLIGHT_NAT_HOST=$(sh_q "${EPICVM_MOONLIGHT_NAT_HOST:-}")";' in installer
+
+
+def test_dashboard_image_hash_covers_every_runtime_module():
+    ensure = _text("server/blobedash-ensure.sh")
+    assert 'find "$STATE_DIR/dashboard" -maxdepth 1 -type f -name \'*.py\'' in ensure
+    assert '[[ -n "${REPO_DIR:-}" && -d "$REPO_DIR/dashboard" ]]' in ensure
+    assert 'REPO_DIR="${REPO_DIR:-/opt/blobe-vm/repo}"' not in ensure
+    assert 'sha256sum "$STATE_DIR/server/blobedash.Dockerfile"' in ensure
+
+
+def test_production_dashboard_uses_gunicorn_and_healthcheck():
+    dockerfile = _text("server/blobedash.Dockerfile")
+    assert "gunicorn==26.2.0" in dockerfile
+    assert '"wsgi:app"' in dockerfile
+    assert "HEALTHCHECK" in dockerfile
+    assert "/Dashboard/" in dockerfile
+    assert (REPO_ROOT / "dashboard" / "wsgi.py").is_file()

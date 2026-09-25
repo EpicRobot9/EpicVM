@@ -1,7 +1,10 @@
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 
 MANAGER = Path(__file__).parents[1] / "server" / "blobe-vm-manager"
@@ -27,8 +30,16 @@ def run_manager(tmp_path, *args):
         "PATH": f"{bin_dir}:{env['PATH']}",
         "BLOBEVM_IMAGE": "test-image",
     })
+    command = [str(MANAGER), *args]
+    if os.name == "nt":
+        bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+        if not bash.is_file():
+            pytest.skip("Git Bash is required for the Bash CLI integration on Windows")
+        if shutil.which("jq") is None:
+            pytest.skip("jq is a required production runtime dependency for the nested Docker CLI")
+        command = [str(bash), *command]
     return subprocess.run(
-        [str(MANAGER), *args], env=env, text=True,
+        command, env=env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     ), docker_log
 

@@ -38,7 +38,7 @@ def read_hosts(path: Path) -> list[dict]:
     if not path.exists():
         return []
     try:
-        if stat.S_IMODE(path.stat().st_mode) & 0o077:
+        if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) & 0o077:
             raise SystemExit("remote host registry must not be group/world readable")
     except OSError as exc:
         raise SystemExit(f"cannot stat remote host registry: {exc}")
@@ -115,7 +115,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 def read_token_file(path: str | os.PathLike[str]) -> str:
     token_path = Path(path).expanduser()
     try:
-        if stat.S_IMODE(token_path.stat().st_mode) & 0o077:
+        if os.name != "nt" and stat.S_IMODE(token_path.stat().st_mode) & 0o077:
             raise SystemExit("token file must not be group/world readable")
         return token_path.read_text(encoding="utf-8").strip()
     except OSError as exc:

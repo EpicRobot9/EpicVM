@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from 'react'
 import apiFetch from '../lib/fetchWrapper'
-import VmExec from '../components/VmExec'
 import Button from '../components/Button'
 
 export default function AdvancedTools(){
@@ -58,9 +57,7 @@ export default function AdvancedTools(){
           <a href={selected ? `/EpicVM/vm/${encodeURIComponent(selected)}/` : '/EpicVM/Dashboard'} target="_blank" rel="noreferrer"><Button>Open selected VM</Button></a>
         </div>
 
-        <div style={{marginTop:6}}>
-          <VmExec vmName={selected} />
-        </div>
+        <div style={{marginTop:12,fontSize:13,color:'var(--muted)'}}>For VM maintenance, use the supported read-only diagnostics above and connect through the VM console for interactive work.</div>
       </div>
     </div>
   )

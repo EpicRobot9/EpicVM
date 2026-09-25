@@ -2,6 +2,8 @@
 import os, json, subprocess, shlex, base64, socket, threading, time, sqlite3, secrets, platform
 import shutil
 import re
+import ipaddress
+import tempfile
 from urllib import request as urlrequest, error as urlerror
 from urllib.parse import quote as url_quote, urlparse
 from html import escape as html_escape
@@ -56,6 +58,95 @@ except Exception:
     psutil = None
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
+
+_FAVICON_MAX_BYTES = 512 * 1024
+_FAVICON_SIGNATURES = {
+    b'\x89PNG\r\n\x1a\n': 'image/png',
+    b'\xff\xd8\xff': 'image/jpeg',
+    b'GIF87a': 'image/gif',
+    b'GIF89a': 'image/gif',
+    b'\x00\x00\x01\x00': 'image/x-icon',
+}
+
+
+def _validate_vm_name(name: str) -> str:
+    safe = str(name or '').strip().lower()
+    if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,62}', safe):
+        raise ValueError('Invalid VM name')
+    return safe
+
+
+def _detect_favicon_mimetype(content: bytes) -> str:
+    for signature, mimetype in _FAVICON_SIGNATURES.items():
+        if content.startswith(signature):
+            return mimetype
+    if len(content) >= 12 and content[:4] == b'RIFF' and content[8:12] == b'WEBP':
+        return 'image/webp'
+    raise ValueError('Favicon must be PNG, JPEG, GIF, WebP, or ICO')
+
+
+def _read_favicon_upload(upload) -> bytes:
+    if upload is None or not getattr(upload, 'filename', ''):
+        raise ValueError('No file provided')
+    content = upload.read(_FAVICON_MAX_BYTES + 1)
+    if not content:
+        raise ValueError('Favicon file is empty')
+    if len(content) > _FAVICON_MAX_BYTES:
+        raise ValueError('Favicon file exceeds 512 KiB')
+    _detect_favicon_mimetype(content)
+    return content
+
+
+def _write_favicon_atomically(path: str, content: bytes) -> None:
+    target = os.path.abspath(path)
+    expected_root = os.path.abspath(os.path.join(_state_dir(), 'dashboard'))
+    if os.path.commonpath([target, expected_root]) != expected_root:
+        raise ValueError('Favicon path is outside the dashboard state directory')
+    os.makedirs(expected_root, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix='.favicon.', dir=expected_root)
+    try:
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _validate_favicon_url(value: str) -> str:
+    parsed = urlparse(str(value or '').strip())
+    hostname = str(parsed.hostname or '').strip().lower()
+    if not hostname or parsed.username or parsed.password:
+        raise ValueError('Favicon URL is invalid')
+    if parsed.scheme == 'http' and hostname not in {'localhost', '127.0.0.1', '::1'}:
+        raise ValueError('Favicon URL must use HTTPS')
+    if parsed.scheme not in {'http', 'https'}:
+        raise ValueError('Favicon URL must use HTTP or HTTPS')
+    if parsed.scheme == 'https':
+        try:
+            addresses = {item[4][0].split('%', 1)[0] for item in socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)}
+        except OSError as exc:
+            raise ValueError('Favicon URL host could not be resolved') from exc
+        if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+            raise ValueError('Favicon URL must resolve to a public address')
+    return parsed.geturl()
+
+
+def _safe_favicon_reference(value: str) -> str:
+    favicon = str(value or '').strip()
+    if favicon.startswith('/') and not favicon.startswith('//'):
+        return favicon
+    try:
+        return _validate_favicon_url(favicon)
+    except ValueError:
+        return ''
  
 # --- Admin authentication helpers (must be defined before route decorators) ---
 # BLOBEDASH_USER/PASS are the sole credentials for new installs. The legacy
@@ -2650,20 +2741,27 @@ def _known_vm_names():
     local/other-host VMs.
     """
     names = set()
-    try:
-        providers = getattr(VM_HOST_REGISTRY, 'providers', {}) or {}
+    providers = getattr(VM_HOST_REGISTRY, 'providers', {}) or {}
+    if isinstance(providers, dict) and providers:
         for host_id in providers:
             try:
-                inventory = manager_json_list(host_id)
+                listed = manager_json_list(host_id)
             except Exception:
                 continue
-            names.update(str(item.get('name')) for item in inventory if item.get('name'))
-        if not providers:
-            inventory = manager_json_list()
-            names.update(str(item.get('name')) for item in inventory if item.get('name'))
-    except Exception:
+            names.update(
+                str(item.get('name') or '').strip().lower()
+                for item in listed
+                if isinstance(item, dict) and str(item.get('name') or '').strip()
+            )
         return names
-    return names
+    try:
+        return {
+            str(item.get('name') or '').strip().lower()
+            for item in manager_json_list()
+            if isinstance(item, dict) and str(item.get('name') or '').strip()
+        }
+    except Exception:
+        return set()
 
 def _validate_known_vm_names(names):
     names = _normalize_vm_names(names)
@@ -2913,7 +3011,7 @@ def _safe_portal_next(next_url: str) -> str:
 
 def _render_vm_denied(name: str, user):
     username = (user or {}).get('username', '')
-    page = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VM Login</title><style>body{{margin:0;font-family:Inter,system-ui,Arial;background:radial-gradient(circle at top,#101933 0%,#050816 58%,#03050d 100%);color:#e7f0f4;display:grid;place-items:center;min-height:100vh;padding:24px}}.card{{max-width:430px;width:100%;box-sizing:border-box;background:#071117;border:1px solid #1a2b33;border-top:2px solid #02bdf3;border-radius:5px;padding:34px;box-shadow:none}}.brand{{display:flex;align-items:center;gap:11px;border-bottom:1px solid #1a2b33;padding-bottom:20px;margin-bottom:26px}}.brand-mark{{display:grid;place-items:center;width:32px;height:32px;border-radius:5px;background:#02bdf3;color:#00131b;font-weight:900}}.brand-name{{font-size:18px;font-weight:700}}h1{{margin:0 0 8px;font-size:26px;font-weight:500;letter-spacing:-.025em}}.muted{{color:#9fb0b8;line-height:1.55}}input,button{{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:4px;border:1px solid #29404a;background:#061016;color:#e7f0f4;margin-top:10px;font:inherit}}input:focus{{outline:2px solid rgba(2,189,243,.25);border-color:#02bdf3}}button{{background:#02bdf3;color:#00131b;border-color:#34cdf8;cursor:pointer;font-weight:700}}button:hover{{background:#35cdf6}}#err{{color:#ff9ab0!important;margin-top:10px}}</style></head><body><div class=card><div class=brand><span class=brand-mark>B</span><span class=brand-name>BlobeVM</span></div><h1>VM Login</h1><div class=muted>Sign in to access restricted BlobeVM instances.</div><form onsubmit="return doLogin(event)"><input id=u placeholder="Username" autocomplete="username" /><input id=p type=password placeholder="Password" autocomplete="current-password" /><button>Sign in</button><div id=err style="color:#fca5a5;margin-top:10px"></div></form></div><script>async function doLogin(e){{e.preventDefault();const r=await fetch('/portal/api/auth/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{username:document.getElementById('u').value,password:document.getElementById('p').value}})}});const j=await r.json().catch(()=>({{}}));if(j.ok){{location.href={next_js};return false}}document.getElementById('err').textContent=j.error||'Login failed';return false}}</script></body></html>'''
+    page = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EpicVM Login</title><style>body{{margin:0;font-family:Inter,system-ui,Arial;background:radial-gradient(circle at top,#101933 0%,#050816 58%,#03050d 100%);color:#e7f0f4;display:grid;place-items:center;min-height:100vh;padding:24px}}.card{{max-width:430px;width:100%;box-sizing:border-box;background:#071117;border:1px solid #1a2b33;border-top:2px solid #02bdf3;border-radius:5px;padding:34px;box-shadow:none}}.brand{{display:flex;align-items:center;gap:11px;border-bottom:1px solid #1a2b33;padding-bottom:20px;margin-bottom:26px}}.brand-mark{{display:grid;place-items:center;width:32px;height:32px;border-radius:5px;background:#02bdf3;color:#00131b;font-weight:900}}.brand-name{{font-size:18px;font-weight:700}}h1{{margin:0 0 8px;font-size:26px;font-weight:500;letter-spacing:-.025em}}.muted{{color:#9fb0b8;line-height:1.55}}input,button{{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:4px;border:1px solid #29404a;background:#061016;color:#e7f0f4;margin-top:10px;font:inherit}}input:focus{{outline:2px solid rgba(2,189,243,.25);border-color:#02bdf3}}button{{background:#02bdf3;color:#00131b;border-color:#34cdf8;cursor:pointer;font-weight:700}}button:hover{{background:#35cdf6}}#err{{color:#ff9ab0!important;margin-top:10px}}</style></head><body><div class=card><div class=brand><span class=brand-mark>E</span><span class=brand-name>EpicVM</span></div><h1>VM Login</h1><div class=muted>Sign in to access restricted EpicVM instances.</div><form onsubmit="return doLogin(event)"><input id=u placeholder="Username" autocomplete="username" /><input id=p type=password placeholder="Password" autocomplete="current-password" /><button>Sign in</button><div id=err style="color:#fca5a5;margin-top:10px"></div></form></div><script>async function doLogin(e){{e.preventDefault();const r=await fetch('/portal/api/auth/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{username:document.getElementById('u').value,password:document.getElementById('p').value}})}});const j=await r.json().catch(()=>({{}}));if(j.ok){{location.href={next_js};return false}}document.getElementById('err').textContent=j.error||'Login failed';return false}}</script></body></html>'''
     return Response(page, mimetype='text/html')
 
 def _enforce_vm_user_access(name: str):
@@ -2997,6 +3095,8 @@ def _guess_icon_mimetype(path: str) -> str:
 
 def _send_icon_file(path: str):
     mimetype = _guess_icon_mimetype(path)
+    if mimetype == 'application/octet-stream':
+        abort(415)
     resp = send_file(path, mimetype=mimetype, conditional=False)
     resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     resp.headers['Pragma'] = 'no-cache'
@@ -3597,7 +3697,10 @@ def _load_dashboard_settings():
     try:
         if os.path.isfile(p):
             with open(p, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, dict):
+                    data['favicon'] = _safe_favicon_reference(data.get('favicon', ''))
+                    return data
     except Exception:
         pass
     # defaults
@@ -3624,7 +3727,15 @@ def dashboard_favicon():
     # If no local file, try to redirect to configured favicon URL
     cfg = _load_dashboard_settings()
     if cfg.get('favicon'):
-        return '', 302, {'Location': cfg.get('favicon'), 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Pragma': 'no-cache', 'Expires': '0'}
+        favicon = str(cfg.get('favicon') or '').strip()
+        if favicon.startswith('/') and not favicon.startswith('//'):
+            safe_favicon = favicon
+        else:
+            try:
+                safe_favicon = _validate_favicon_url(favicon)
+            except ValueError:
+                abort(404)
+        return '', 302, {'Location': safe_favicon, 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Pragma': 'no-cache', 'Expires': '0'}
     # Not found
     abort(404)
 
@@ -3645,6 +3756,8 @@ def api_get_settings():
 @app.post('/dashboard/api/settings')
 @auth_required
 def api_set_settings():
+    if request.content_length and request.content_length > _FAVICON_MAX_BYTES:
+        return jsonify({'ok': False, 'error': 'Request exceeds 512 KiB'}), 413
     data = request.get_json(silent=True) if request.is_json else None
     data = data if isinstance(data, dict) else request.values
     title = str(data.get('title','') or '').strip()
@@ -3671,28 +3784,13 @@ def api_set_settings():
         except Exception:
             pass
     else:
-        # treat favicon as URL: try to download and save as favicon.ico under state_dir/dashboard/
-        if favicon.lower().startswith('http://') or favicon.lower().startswith('https://'):
-            try:
-                resp = urlrequest.urlopen(favicon, timeout=8)
-                data = resp.read()
-                try:
-                    ddir = os.path.join(_state_dir(), 'dashboard')
-                    os.makedirs(ddir, exist_ok=True)
-                    with open(os.path.join(ddir, 'favicon.ico'), 'wb') as f:
-                        f.write(data)
-                    # prefer local serve
-                    cfg['favicon'] = ''
-                except Exception:
-                    # fallback to storing URL
-                    cfg['favicon'] = favicon
-            except Exception:
-                # if download failed, just store URL so template can reference it
-                cfg['favicon'] = favicon
-        else:
-            # treat as direct URL or path; store it
+        if favicon.startswith('/') and not favicon.startswith('//'):
             cfg['favicon'] = favicon
-        
+        else:
+            try:
+                cfg['favicon'] = _validate_favicon_url(favicon)
+            except ValueError as exc:
+                return jsonify({'ok': False, 'error': str(exc)}), 400
     ok = _save_dashboard_settings(cfg)
     return jsonify({'ok': bool(ok)})
 
@@ -3701,49 +3799,42 @@ def api_set_settings():
 @app.post('/dashboard/api/upload-favicon')
 @auth_required
 def api_upload_favicon():
-    # Expect a form file field named 'file'
-    f = None
     try:
         f = request.files.get('file')
-    except Exception:
-        pass
-    if not f:
-        return jsonify({'ok': False, 'error': 'No file provided'}), 400
-    try:
+        content = _read_favicon_upload(f)
         ddir = os.path.join(_state_dir(), 'dashboard')
         os.makedirs(ddir, exist_ok=True)
         outp = os.path.join(ddir, 'favicon.ico')
-        # Save file bytes
-        f.save(outp)
+        _write_favicon_atomically(outp, content)
         # clear stored URL in settings so local file is preferred
         cfg = _load_dashboard_settings()
         cfg['favicon'] = ''
         _save_dashboard_settings(cfg)
         return jsonify({'ok': True})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+    except ValueError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+    except Exception:
+        app.logger.exception('failed to upload dashboard favicon')
+        return jsonify({'ok': False, 'error': 'Unable to save favicon'}), 500
 
 
 @app.post('/dashboard/api/upload-vm-favicon/<name>')
 @auth_required
 def api_upload_vm_favicon(name):
-    f = None
     try:
+        safe = _validate_vm_name(name)
         f = request.files.get('file')
-    except Exception:
-        pass
-    if not f:
-        return jsonify({'ok': False, 'error': 'No file provided'}), 400
-    try:
+        content = _read_favicon_upload(f)
         ddir = os.path.join(_state_dir(), 'dashboard', 'vm-fav')
         os.makedirs(ddir, exist_ok=True)
-        # normalize name
-        safe = re.sub(r'[^A-Za-z0-9_-]', '_', name)
         outp = os.path.join(ddir, f"{safe}.ico")
-        f.save(outp)
+        _write_favicon_atomically(outp, content)
         return jsonify({'ok': True})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+    except ValueError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+    except Exception:
+        app.logger.exception('failed to upload VM favicon')
+        return jsonify({'ok': False, 'error': 'Unable to save favicon'}), 500
 
 
     # Serve dashboard v2 production assets requested from absolute `/assets/*` paths
@@ -4475,7 +4566,7 @@ def portal_login_page():
         return redirect(_safe_portal_next(request.args.get('next')))
     next_url = _safe_portal_next(request.args.get('next'))
     next_js = json.dumps(next_url)
-    page = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VM Login</title><style>body{{margin:0;font-family:Inter,system-ui,Arial;background:radial-gradient(circle at top,#101933 0%,#050816 58%,#03050d 100%);color:#e7f0f4;display:grid;place-items:center;min-height:100vh;padding:24px}}.card{{max-width:430px;width:100%;box-sizing:border-box;background:#071117;border:1px solid #1a2b33;border-top:2px solid #02bdf3;border-radius:5px;padding:34px;box-shadow:none}}.brand{{display:flex;align-items:center;gap:11px;border-bottom:1px solid #1a2b33;padding-bottom:20px;margin-bottom:26px}}.brand-mark{{display:grid;place-items:center;width:32px;height:32px;border-radius:5px;background:#02bdf3;color:#00131b;font-weight:900}}.brand-name{{font-size:18px;font-weight:700}}h1{{margin:0 0 8px;font-size:26px;font-weight:500;letter-spacing:-.025em}}.muted{{color:#9fb0b8;line-height:1.55}}input,button{{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:4px;border:1px solid #29404a;background:#061016;color:#e7f0f4;margin-top:10px;font:inherit}}input:focus{{outline:2px solid rgba(2,189,243,.25);border-color:#02bdf3}}button{{background:#02bdf3;color:#00131b;border-color:#34cdf8;cursor:pointer;font-weight:700}}button:hover{{background:#35cdf6}}#err{{color:#ff9ab0!important;margin-top:10px}}</style></head><body><div class=card><div class=brand><span class=brand-mark>B</span><span class=brand-name>BlobeVM</span></div><h1>VM Login</h1><div class=muted>Sign in to access restricted BlobeVM instances.</div><form onsubmit="return doLogin(event)"><input id=u placeholder="Username" autocomplete="username" /><input id=p type=password placeholder="Password" autocomplete="current-password" /><button>Sign in</button><div id=err style="color:#fca5a5;margin-top:10px"></div></form></div><script>async function doLogin(e){{e.preventDefault();const r=await fetch('/portal/api/auth/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{username:document.getElementById('u').value,password:document.getElementById('p').value}})}});const j=await r.json().catch(()=>({{}}));if(j.ok){{location.href={next_js};return false}}document.getElementById('err').textContent=j.error||'Login failed';return false}}</script></body></html>'''
+    page = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EpicVM Login</title><style>body{{margin:0;font-family:Inter,system-ui,Arial;background:radial-gradient(circle at top,#101933 0%,#050816 58%,#03050d 100%);color:#e7f0f4;display:grid;place-items:center;min-height:100vh;padding:24px}}.card{{max-width:430px;width:100%;box-sizing:border-box;background:#071117;border:1px solid #1a2b33;border-top:2px solid #02bdf3;border-radius:5px;padding:34px;box-shadow:none}}.brand{{display:flex;align-items:center;gap:11px;border-bottom:1px solid #1a2b33;padding-bottom:20px;margin-bottom:26px}}.brand-mark{{display:grid;place-items:center;width:32px;height:32px;border-radius:5px;background:#02bdf3;color:#00131b;font-weight:900}}.brand-name{{font-size:18px;font-weight:700}}h1{{margin:0 0 8px;font-size:26px;font-weight:500;letter-spacing:-.025em}}.muted{{color:#9fb0b8;line-height:1.55}}input,button{{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:4px;border:1px solid #29404a;background:#061016;color:#e7f0f4;margin-top:10px;font:inherit}}input:focus{{outline:2px solid rgba(2,189,243,.25);border-color:#02bdf3}}button{{background:#02bdf3;color:#00131b;border-color:#34cdf8;cursor:pointer;font-weight:700}}button:hover{{background:#35cdf6}}#err{{color:#ff9ab0!important;margin-top:10px}}</style></head><body><div class=card><div class=brand><span class=brand-mark>E</span><span class=brand-name>EpicVM</span></div><h1>VM Login</h1><div class=muted>Sign in to access restricted EpicVM instances.</div><form onsubmit="return doLogin(event)"><input id=u placeholder="Username" autocomplete="username" /><input id=p type=password placeholder="Password" autocomplete="current-password" /><button>Sign in</button><div id=err style="color:#fca5a5;margin-top:10px"></div></form></div><script>async function doLogin(e){{e.preventDefault();const r=await fetch('/portal/api/auth/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{username:document.getElementById('u').value,password:document.getElementById('p').value}})}});const j=await r.json().catch(()=>({{}}));if(j.ok){{location.href={next_js};return false}}document.getElementById('err').textContent=j.error||'Login failed';return false}}</script></body></html>'''
     return Response(page, mimetype='text/html')
 
 # --- EpicVM namespace aliases for the existing portal (no duplicated logic) ---
@@ -4960,7 +5051,10 @@ def api_set_vm_settings(name):
 def dashboard_vm_favicon(name):
     # Serve per-VM favicon if exists, otherwise redirect to main favicon (which may itself redirect)
     ddir = os.path.join(_state_dir(), 'dashboard', 'vm-fav')
-    safe = re.sub(r'[^A-Za-z0-9_-]', '_', name)
+    try:
+        safe = _validate_vm_name(name)
+    except ValueError:
+        abort(404)
     candidate = os.path.join(ddir, f"{safe}.ico")
     if os.path.isfile(candidate):
         return _send_icon_file(candidate)
@@ -7441,36 +7535,11 @@ def dashboard_v2_info_alias():
 @app.post('/Dashboard/api/vm/exec/<name>')
 @v2_auth_required
 def dashboard_v2_vm_exec(name):
-    """Execute a single command inside the VM container named `blobevm_<name>`.
-    Expects JSON payload: {"cmd": "<command string>"} and returns stdout/stderr.
-    This is intended for short-lived commands (timeout 10s) and requires the
-    Flask process to have access to the host Docker CLI.
-    """
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        cmd = data.get('cmd') if isinstance(data, dict) else None
-        if not cmd or not isinstance(cmd, str):
-            return jsonify({'ok': False, 'error': 'missing cmd'}), 400
-        cname = f'blobevm_{name}'
-        # Try bash first, fallback to sh
-        exec_cmds = [
-            ['docker', 'exec', cname, '/bin/bash', '-lc', cmd],
-            ['docker', 'exec', cname, '/bin/sh', '-lc', cmd]
-        ]
-        last_exc = None
-        for ec in exec_cmds:
-            try:
-                proc = subprocess.run(ec, capture_output=True, text=True, timeout=10)
-                return jsonify({'ok': proc.returncode == 0, 'returncode': proc.returncode, 'output': proc.stdout, 'error_output': proc.stderr})
-            except subprocess.TimeoutExpired as e:
-                return jsonify({'ok': False, 'error': 'timeout', 'output': getattr(e, 'output', ''), 'stderr': getattr(e, 'stderr', '')}), 504
-            except Exception as e:
-                last_exc = e
-                continue
-        # If we get here, no exec succeeded
-        return jsonify({'ok': False, 'error': str(last_exc) if last_exc else 'exec failed'}), 500
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({
+        'ok': False,
+        'error': 'Interactive VM command execution is disabled. Use read-only diagnostics or the VM console instead.',
+        'code': 'capability_unsafe',
+    }), 410
 
 
 @app.post('/dashboard/api/vm/exec/<name>')

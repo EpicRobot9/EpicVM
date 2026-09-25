@@ -1,0 +1,7 @@
+node_modules
+dist
+.pytest_cache
+test-results
+coverage
+*.log
+*.orig

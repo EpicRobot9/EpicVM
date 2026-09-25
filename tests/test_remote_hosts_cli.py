@@ -2,6 +2,7 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 import io
 import json
+import os
 import stat
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI_PATH = ROOT / "server" / "epicvm-remote-host"
+POSIX = os.name != "nt"
 
 
 def load_cli():
@@ -30,7 +32,8 @@ def test_token_generate_is_redacted_and_add_list_stay_redacted(tmp_path, capsys)
     assert cli.main(["token-generate", "--output", str(token_file)]) == 0
     generated = json.loads(capsys.readouterr().out)
     assert generated == {"token": "[REDACTED]", "token_file": str(token_file)}
-    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+    if POSIX:
+        assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
 
     assert cli.main([
         "--registry", str(registry), "add", "epic-pc", "Epic PC", "http://100.64.0.2:8765",
@@ -38,7 +41,8 @@ def test_token_generate_is_redacted_and_add_list_stay_redacted(tmp_path, capsys)
     ]) == 0
     added = json.loads(capsys.readouterr().out)
     assert "token" not in added
-    assert stat.S_IMODE(registry.stat().st_mode) == 0o600
+    if POSIX:
+        assert stat.S_IMODE(registry.stat().st_mode) == 0o600
 
     assert cli.main(["--registry", str(registry), "list"]) == 0
     listed = json.loads(capsys.readouterr().out)
@@ -53,6 +57,8 @@ def test_token_file_must_be_private(tmp_path):
     token_file.write_text("secret-token\n")
     token_file.chmod(0o644)
 
+    if not POSIX:
+        pytest.skip("Windows does not expose POSIX group/world mode bits")
     with pytest.raises(SystemExit, match="token file"):
         cli.main([
             "--registry", str(registry), "add", "epic-pc", "Epic PC", "http://100.64.0.2:8765",
