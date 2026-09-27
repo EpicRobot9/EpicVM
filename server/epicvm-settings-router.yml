@@ -1,0 +1,22 @@
+# Install in the active Traefik file-provider directory. Exact paths only:
+# /settings belongs to EpicVM; unrelated applications are not captured.
+http:
+  routers:
+    epicvm-settings-secure:
+      rule: "Host(`techexplore.us`) && (Path(`/settings`) || Path(`/settings/`))"
+      entryPoints: [websecure]
+      priority: 700
+      tls:
+        certResolver: myresolver
+      service: blobedash@docker
+    epicvm-settings:
+      rule: "Host(`techexplore.us`) && (Path(`/settings`) || Path(`/settings/`))"
+      entryPoints: [web]
+      priority: 700
+      middlewares: [epicvm-settings-https]
+      service: blobedash@docker
+  middlewares:
+    epicvm-settings-https:
+      redirectScheme:
+        scheme: https
+        permanent: true

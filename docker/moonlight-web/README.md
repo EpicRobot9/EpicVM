@@ -18,11 +18,33 @@ docker build -f docker/moonlight-web/Dockerfile \
 ```
 
 The deployment's `/opt/blobe-vm/.env` must set
-`EPICVM_MOONLIGHT_IMAGE` to the resulting local tag. The normal orchestrator
-still requires a digest-pinned image when it receives a registry reference;
-the local overlay tag is intentionally scoped to the host where it was built.
-Record the image ID and rollback to the prior digest-pinned image if live
-verification fails.
+`EPICVM_MOONLIGHT_IMAGE` to the resulting image's `repo@sha256:` reference.
+The orchestrator requires a digest-pinned reference, including for a locally
+built overlay. Record the previous image reference for rollback.
+
+## Host-seat browser latency profile
+
+`Dockerfile.host-seat` pins the Moonlight Web release used by the deployed
+MultiSeat stream and patches only `default_settings.js`. New `/vm/seat-.../`
+browser sessions start at 1080p with one queued video frame and the canvas
+renderer drawing on frame submission. Gaming VM defaults and saved browser
+preferences are unchanged. The settings remain adjustable if a user's network
+needs more buffering.
+
+The profile was selected after a live host-seat comparison at 60 fps: Epic
+reported quicker, smoother keyboard and mouse feedback with those settings.
+This does not establish a measured input-to-picture latency or rhythm-game
+acceptance on other networks.
+
+From this directory on the deployment host:
+
+```bash
+docker build -f Dockerfile.host-seat -t epicvm/moonlight-web:host-seat-lowlatency .
+docker image inspect epicvm/moonlight-web:host-seat-lowlatency \
+  --format '{{index .RepoDigests 0}}'
+```
+
+Use the printed reference for `EPICVM_MOONLIGHT_IMAGE`.
 
 ## Verification
 

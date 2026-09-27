@@ -1,0 +1,86 @@
+PHASE A ROOT CAUSE - 2026-09-25
+================================================================
+
+REPRODUCTION
+  job id     = bd21164e3c454731899d4f2af73722a6
+  name       = phasea-std-01  (standard, 4cpu/8GB/96GB)
+  submitted  = 2026-09-25T18:01:48Z  via POST /v1/provisioning-jobs
+  timeline   = queued -> cloning -> booting -> setup_failed:preclaim
+  settled    = 2026-09-25T18:13:56Z  (~12 min)
+  final      = state=setup_failed:preclaim
+              errorCode=guest_bootstrap_not_ready
+              failureStage=preclaim
+              completedStages=[]   claimConsumed=false   templateVersion=1.2.0
+              vmId=caa75a4e-15a3-4bcc-928e-d268f5a85252
+  NOTE: this is NOT the predicted post-ready demotion. It fails EARLIER, at the
+        pre-claim bootstrap gate, and never reaches network_setup or Tailscale.
+
+ROOT CAUSE (proven, not inferred)
+  Provisioning.ps1:1087-1098 gates on State.Provider.TestBootstrapGuest with a
+  600s window. That is GuestProvider.ps1:801 Test-EpicVMGuestBootstrapReady,
+  which runs PowerShell Direct with the DPAPI-stored bootstrap credential and
+  swallows every error (catch { return False }).
+
+  Raw probe against a VM recreated from the PRESERVED failed clone disk:
+      New-PSSession -VMName <vm> -Credential <EpicVMBootstrap from bootstrap.dpapi>
+      -> PSSessionOpenFailed | "The credential is invalid."
+    Heartbeat integration service = 'OK'   (guest OS is alive and fully booted)
+    A deliberately wrong credential returns the SAME message, so the guest is
+    reachable and PowerShell Direct works - only the credential is rejected.
+
+  Same raw probe against the PRISTINE TEMPLATE ITSELF
+  (E:\EpicVM\templates\win11-25h2\win11-25h2.vhdx, manifest sha256 verified):
+      -> "The credential is invalid."
+    Heartbeat = 'OK'
+
+  CONCLUSION: the password inside C:\ProgramData\EpicVM\agent\bootstrap.dpapi
+  does NOT match the EpicVMBootstrap account baked into the published template.
+  Every clone inherits that mismatch, so TestBootstrapGuest can never return
+  true, and every provisioning job dies at preclaim. This is a single shared
+  root cause for the guest_bootstrap_not_ready family in the job history.
+
+WHY THE ERROR WAS HIDDEN
+  Test-EpicVMGuestBootstrapReady returns False on any exception and discards the
+  message, so the operator only ever sees the generic
+  'The cloned guest did not become ready for secure setup.' A wrong-password
+  condition is indistinguishable from a slow boot at the API surface.
+
+TIMELINE EVIDENCE (drift)
+  bootstrap.dpapi           2026-08-27 07:22:08
+  clean-source.vhdx         2026-08-27 07:21:17
+  win11-25h2.vhdx (template) 2026-08-26 19:41:17
+  manifest.json             2026-08-26 19:43:03
+  config.json               2026-08-20 20:33:43
+  The credential was written ~12h AFTER the published template was built. A
+  rebuild of the clean source on 08-27 produced a different EpicVMBootstrap
+  password than the template that ships in templates\win11-25h2, and the
+  credential file was then overwritten with the new one. There is also a
+  leftover '.bootstrap-fe7c825efb214d338b7e717b9f3ca849.tmp' from 08-10, which
+  matches the legacy-blob migration path in TemplateBuilder.ps1:104-108.
+
+WHAT IS NOT THE CAUSE (ruled out with evidence)
+  - guest internet egress: fine (15 prior jobs completed the whole pipeline)
+  - Hyper-V / template integrity: hash matches, boots, Heartbeat OK
+  - Tailscale enrollment: never reached in this run
+  - the NAT / Get-NetNat empty external prefix: cosmetic, not causal
+
+CLEANUP PERFORMED
+  Diagnostic VMs phasea-diag-01 and phasea-tmpl-probe removed, their VHDs and
+  directories removed. E:\EpicVM\vms is back to only 'quarantine'. The failed
+  clone is preserved at
+  E:\EpicVM\vms\quarantine\phasea-std-01-1790360036\ (21.22 GB) as evidence.
+  The 75 historical job records were not modified.
+
+NEXT DECISION REQUIRED FROM EPIC (no automatic fix applied)
+  Two mutually exclusive fixes; both are template-affecting:
+   A) Rebuild the win11-25h2 template using the CURRENT bootstrap.dpapi, so the
+      baked account matches the stored credential. Cost: a full template build
+      in a maintenance window. Also reconcile manifest 1.2.0 vs builder 1.4.0.
+   B) Reset the EpicVMBootstrap password inside the EXISTING template to match
+      bootstrap.dpapi, then re-publish. Cheaper, but mutates the published
+      immutable image, so its manifest sha256 must be recomputed and re-stamped.
+  Recommendation: B if the image is otherwise good (it boots clean, Heartbeat OK),
+  because it avoids a full rebuild and preserves the verified guest. Must be run
+  offline in the builder VM and the manifest re-stamped afterwards. Either way,
+  Test-EpicVMGuestBootstrapReady should stop swallowing the failure reason so the
+  next occurrence is diagnosable from the API alone.

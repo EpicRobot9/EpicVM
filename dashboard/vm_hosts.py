@@ -1,7 +1,7 @@
 """VM host/provider contracts used by the dashboard.
 
 The first provider is deliberately small: it keeps the existing local
-``blobe-vm-manager`` subprocess interface intact while giving callers a host
+``epicvm`` subprocess interface intact while giving callers a host
 identity that a remote provider can implement later.
 """
 
@@ -75,10 +75,10 @@ class LocalDockerHost:
     @staticmethod
     def _default_manager() -> str:
         app_root = "/opt/blobe-vm"
-        manager = os.environ.get("BLOBEVM_MANAGER") or os.path.join(
-            app_root, "server", "blobe-vm-manager"
+        manager = os.environ.get("EPICVM_MANAGER") or os.environ.get("BLOBEVM_MANAGER") or os.path.join(
+            app_root, "server", "epicvm"
         )
-        return manager if os.path.isfile(manager) else "blobe-vm-manager"
+        return manager if os.path.isfile(manager) else "epicvm"
 
     @property
     def id(self) -> str:
@@ -98,7 +98,7 @@ class LocalDockerHost:
         return [self.manager, *(str(arg) for arg in args)]
 
     def run_manager(self, *args: object, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        """Run ``blobe-vm-manager`` with the exact supplied subprocess options."""
+        """Run ``epicvm`` with the exact supplied subprocess options."""
 
         try:
             return subprocess.run(self.command(*args), **kwargs)

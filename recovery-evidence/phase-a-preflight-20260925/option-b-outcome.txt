@@ -1,0 +1,101 @@
+OBSERVABILITY FIX + OPTION B ATTEMPT - 2026-09-25
+=====================================================
+
+PART 1 - OBSERVABILITY FIX: APPLIED AND PARSE-VERIFIED
+--------------------------------------------------------
+Test-EpicVMGuestBootstrapReady no longer swallows the failure reason.
+
+  remote_agent/windows/providers/GuestProvider.ps1
+    - Test-EpicVMGuestBootstrapReady : added [ref]. Distinguishes
+        bootstrap_credential_unavailable (host secret unreadable),
+        guest_readiness_script_incomplete (script ran, returned not-ok), and
+        any PowerShell Direct failure classified via the EXISTING
+        Get-EpicVMPowerShellDirectFailureCode, which already returns
+        guest_credentials_rejected / hyperv_vm_not_running /
+        guest_heartbeat_unhealthy / direct_open_timeout etc.
+    - Wait-EpicVMGuestBootstrapReady : added [ref], tracks the last
+        observed code across polls and returns it on timeout.
+
+  remote_agent/windows/providers/HyperVProvider.ps1
+    - provider.TestBootstrapGuest now returns [ordered]@{ ok=<bool>;
+      failureCode=<code> } instead of a bare boolean.
+
+  remote_agent/windows/Provisioning.ps1  (the preclaim gate, ~line 1087)
+    - Consumes the new shape, and on failure throws the CLASSIFIED code rather
+      than the generic guest_bootstrap_not_ready.
+    - guest_credentials_rejected now carries an explicit operator message:
+      'The guest rejected the stored bootstrap credential. The published
+       template and the host credential store are out of sync.'
+    - Records the code on Job.lastAttemptCode so it survives into the job record.
+    - Both guest_credentials_rejected and bootstrap_credential_unavailable were
+      ALREADY mapped to setup_failed:guest by the existing stage classifier, so
+      no stage-mapping change was needed.
+
+  Verification: all three files parse clean via
+  [System.Management.Automation.Language.Parser]::ParseFile. NOT yet deployed to
+  C:\ProgramData\EpicVM\agent and NOT yet exercised by a live job.
+
+PART 2 - OPTION B: ATTEMPTED, BLOCKED, ABANDONED SAFELY
+-------------------------------------------------------
+Goal: reset EpicVMBootstrap's password inside the published template so it
+matches the host bootstrap.dpapi, without a full rebuild.
+
+What was tried, in order:
+ 1. Offline SAM edit. Mounted the disk (G:), confirmed
+    Windows\System32\config\SAM present, loaded it with reg load -> succeeded.
+    Enumerating HKLM\EPICVMSAM\SAM\Domains\Account\Users ->
+    'Requested registry access is not allowed.' A live SAM denies this by design.
+    No offline SAM tooling on the host: chntpw absent, no libguestfs, SAMLib
+    present is only the in-box samlib.dll (not the SAMLib .NET library).
+    -> route closed.
+
+ 2. unattend.xml specialize pass. Wrote a LocalAccounts + AdministratorPassword
+    unattend to the disk root and Windows\Panther, booted the builder VM, then
+    tested PowerShell Direct with the host credential -> still
+    'The credential is invalid.'
+
+    WHY IT FAILED (evidence, not assumption): after the boot,
+    Windows\Panther\setupact.log lastWrite was still 2026-08-12 22:06:30 and its
+    tail was the original build log. Windows had not written a specialize pass
+    today. Specialize only runs during an actual sysprep specialize/generalize,
+    not on a plain boot of an already-generalized image. The unattend.xml sat on
+    the disk untouched.
+
+    -> making this work requires re-running sysprep, which is a rebuild.
+       That is Option A wearing Option B's name, so the attempt was abandoned
+       rather than silently escalating scope.
+
+STATE AFTER THE ATTEMPT (verified)
+  - Published template BYTE-IDENTICAL: manifest sha256 e1d11c8a...c4670cc,
+    recomputed after the attempt -> UNCHANGED=True.
+  - Disks mounted during the work were dismounted; SAM/SOFTWARE hives unloaded.
+  - All diagnostic VMs removed. E:\EpicVM\vms back to only 'quarantine'.
+  - E:\EpicVM\template-work\phasea-optionb removed.
+  - Host has only the two pre-existing template-builder VMs, both Off.
+  - The failed production clone is still preserved as evidence at
+    E:\EpicVM\vms\quarantine\phasea-std-01-1790360036\ (21.22 GB).
+
+SECURITY OBSERVATION (worth acting on separately)
+  The host bootstrap password is 4 characters long
+  (Get-EpicVMBootstrapCredential -> passwordLength=4). It is DPAPI-sealed and only
+  readable by SYSTEM/Administrators, and it is used to reach a disposable guest
+  over PowerShell Direct, so it is not an Internet-exposed secret. Still, a
+  4-character local admin password inside every clone is weak by any standard
+  and should be rotated to a strong generated value when the template is next
+  rebuilt. This is a finding, not something changed here.
+
+RECOMMENDATION
+  Option B is not viable without sysprep, i.e. without effectively doing Option
+  A. So the real choice is:
+    A) Rebuild win11-25h2 with a freshly generated strong bootstrap password,
+       then re-stamp the manifest. This also fixes the 4-char password, the
+       manifest 1.2.0 vs builder 1.4.0 drift, and the stray legacy
+       .bootstrap-*.tmp blob. One maintenance window, several problems closed.
+    B') Find and supply the ORIGINAL template bootstrap password (the one baked
+       on 08-26) and write it back into bootstrap.dpapi instead. That is a
+       host-side change only, needs no template mutation at all, and is the
+       cheapest possible fix IF the original secret is recoverable.
+  B' is worth checking first because it is host-only and non-destructive.
+  Recommend: try B' for 10 minutes (look for the original secret in the
+  08-26 builder records / session history); if it is not recoverable, run A and
+  fold in the password rotation and manifest reconciliation.

@@ -1,7 +1,0 @@
-﻿{
-    "attempted":  true,
-    "exitCode":  0,
-    "output":  "SERVICE_NAME: vmicvmsession          TYPE               : 30  WIN32           STATE              : 2  START_PENDING                                  (NOT_STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)         WIN32_EXIT_CODE    : 0  (0x0)         SERVICE_EXIT_CODE  : 0  (0x0)         CHECKPOINT         : 0x0         WAIT_HINT          : 0x7d0         PID                : 59536         FLAGS              :",
-    "after":  "Stopped",
-    "uacAccepted":  true
-}

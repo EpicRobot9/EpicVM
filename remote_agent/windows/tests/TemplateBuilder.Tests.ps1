@@ -12,7 +12,6 @@ Describe 'EpicVM template builder' {
         (Get-Command Invoke-EpicVMTemplateBuild).CommandType | Should -Be 'Function'
         (Get-Content (Join-Path $windowsRoot 'TemplateBuilder.ps1') -Raw) | Should -Match 'Private'
         (Get-Content (Join-Path $windowsRoot 'TemplateBuilder.ps1') -Raw) | Should -Match '/generalize /shutdown /mode:vm'
-        (Get-Content (Join-Path $windowsRoot 'TemplateBuilder.ps1') -Raw) | Should -Not -Match "'/oobe'"
         (Get-Content (Join-Path $windowsRoot 'TemplateBuilder.ps1') -Raw) | Should -Match 'Export-VM'
     }
 
@@ -95,12 +94,16 @@ Describe 'EpicVM template builder' {
         $sanitizer | Should -Match '<ProtectYourPC>3</ProtectYourPC>'
         $sanitizer | Should -Match '<TimeZone>\$safeTimeZone</TimeZone>'
         $sanitizer | Should -Match 'DisablePrivacyExperience'
+        $sanitizer | Should -Match 'WriteAllText\(\$unattendPath'
+        $sanitizer | Should -Match '\[xml\]\[IO\.File\]::ReadAllText\(\$unattendPath\)'
+        $sanitizer | Should -Match 'Register-ScheduledTask -TaskName ''EpicVM-TimeBaseline'''
+        $sanitizer | Should -Match 'Unregister-ScheduledTask -TaskName ''EpicVM-TimeBaseline'''
     }
 
-    It 'keeps the interactive-oobe gate while adding only the explicit unattend flag' {
+    It 'keeps the no-oobe claim contract while retaining the validated answer file' {
         $builder = Get-Content -LiteralPath (Join-Path $windowsRoot 'TemplateBuilder.ps1') -Raw
-        $builder | Should -Not -Match "'/oobe'"
         $builder | Should -Match "@\('/generalize','/shutdown','/mode:vm','/unattend:"
+        $builder | Should -Not -Match "@\('/generalize','/oobe'"
     }
 
     It 'pins the clone time baseline to the host zone captured at build time' {
@@ -109,7 +112,7 @@ Describe 'EpicVM template builder' {
         $builder | Should -Match 'Set-Service -Name ''w32time'' -StartupType Automatic'
         $builder | Should -Match 'tzutil\.exe /s \(\[string\]\$TimeZoneId\)'
         $builder | Should -Match '@\(\$BootstrapName,\$bootstrapPlain,\$BootstrapPath,\$SunshineVersion,\$GuestTimeZoneId\)'
-        $builder | Should -Match 'templateVersion=''1\.2\.0'''
+        $builder | Should -Match 'templateVersion=''1\.4\.0'''
         $builder | Should -Match 'timeZone=\$GuestTimeZoneId'
     }
 }

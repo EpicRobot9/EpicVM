@@ -131,10 +131,6 @@ Describe 'EpicVM provisioning safety' {
         Complete-EpicVMProvisioningConsole -State $state -Job $job -Request @{
             routePrefix='/vm/alpha/'
             guestTcpVerified=$true
-            videoFrameVerified=$true
-            keyboardInputVerified=$true
-            mouseInputVerified=$true
-            frameMetrics=@{nonblackFraction=0.74;meanLuma=40.5;stdDev=41.2;decodedFramesDelta=150;durationMs=5000}
         }
         $job.failureDetailCode | Should -BeNullOrEmpty
         $job.lastAttemptCode | Should -BeNullOrEmpty
@@ -212,7 +208,7 @@ Describe 'EpicVM provisioning safety' {
         $response.Json | Should -Not -Match 'transient-password|automatic-api-claim'
     }
 
-    It 'rejects console completion without rendered frame and both input channels' {
+    It 'rejects automated console completion without verified guest transport' {
         $config=Get-EpicVMDefaultConfig
         $config.ProvisioningStatePath=Join-Path $TestDrive 'console-evidence-required.json'
         $provider=New-ProvisioningTestProvider
@@ -224,12 +220,12 @@ Describe 'EpicVM provisioning safety' {
         $job.completedStages=@('claim','guest_setup','network_setup','management_handoff')
         $state.Provisioning.Jobs[$job.id]=$job
 
-        { Complete-EpicVMProvisioningConsole -State $state -Job $job -Request @{routePrefix='/vm/evidence-required--epic-pc/';guestTcpVerified=$true} } | Should -Throw
+        { Complete-EpicVMProvisioningConsole -State $state -Job $job -Request @{routePrefix='/vm/evidence-required--epic-pc/';guestTcpVerified=$false} } | Should -Throw
         $job.state | Should -Not -Be 'ready'
         $job.streamValidationVerified | Should -BeFalse
     }
 
-    It 'persists explicit rendered frame and keyboard/mouse evidence on ready' {
+    It 'persists automated route readiness without manual keyboard or mouse evidence' {
         $config=Get-EpicVMDefaultConfig
         $config.ProvisioningStatePath=Join-Path $TestDrive 'console-evidence-persisted.json'
         $provider=New-ProvisioningTestProvider
@@ -244,18 +240,13 @@ Describe 'EpicVM provisioning safety' {
         Complete-EpicVMProvisioningConsole -State $state -Job $job -Request @{
             routePrefix='/vm/evidence-persisted--epic-pc/'
             guestTcpVerified=$true
-            videoFrameVerified=$true
-            keyboardInputVerified=$true
-            mouseInputVerified=$true
-            frameMetrics=@{nonblackFraction=0.74;meanLuma=40.5;stdDev=41.2;decodedFramesDelta=150;durationMs=5000}
         }
         $job.state | Should -Be 'ready'
-        $job.consoleFrameVerified | Should -BeTrue
-        $job.keyboardInputVerified | Should -BeTrue
-        $job.mouseInputVerified | Should -BeTrue
+        $job.consoleFrameVerified | Should -BeFalse
+        $job.keyboardInputVerified | Should -BeFalse
+        $job.mouseInputVerified | Should -BeFalse
         $job.streamValidationVerified | Should -BeTrue
-        (ConvertTo-EpicVMRedactedJob -Job $job).consoleFrameVerified | Should -BeTrue
-        (Get-Content -LiteralPath $config.ProvisioningStatePath -Raw) | Should -Match 'consoleFrameVerified|keyboardInputVerified|mouseInputVerified'
+        (ConvertTo-EpicVMRedactedJob -Job $job).streamValidationVerified | Should -BeTrue
     }
 
     It 'accepts a validated host-scoped console route' {
@@ -271,10 +262,6 @@ Describe 'EpicVM provisioning safety' {
         Complete-EpicVMProvisioningConsole -State $state -Job $job -Request @{
             routePrefix='/vm/alpha--epic-pc/'
             guestTcpVerified=$true
-            videoFrameVerified=$true
-            keyboardInputVerified=$true
-            mouseInputVerified=$true
-            frameMetrics=@{nonblackFraction=0.74;meanLuma=40.5;stdDev=41.2;decodedFramesDelta=150;durationMs=5000}
         }
         $job.state | Should -Be 'ready'
         $job.consoleRoutePrefix | Should -Be '/vm/alpha--epic-pc/'
@@ -344,15 +331,13 @@ Describe 'EpicVM provisioning safety' {
         $job=New-EpicVMProvisioningJobObject -Id 'job-ready-recovery' -Name 'alpha' -Profile 'standard' -State 'ready'
         $job.claimConsumed=$true
         $job.claimUsed=$true
+        $job.vmId='c7fd609d-5850-4f03-9a58-b425d8696711'
         $job.tailnetIp='100.111.82.1'
+        $job.tailnetDeviceId='device-ready-recovery'
+        $job.managementTransport='tailscale_winrm'
+        $job.managementReadyAt=[DateTime]::UtcNow.AddMinutes(-3).ToString('o')
         $job.consoleRoutePrefix='/vm/alpha--epic-pc/'
         $job.consoleVerifiedAt=[DateTime]::UtcNow.AddMinutes(-2).ToString('o')
-        $job.consoleFrameVerified=$true
-        $job.consoleFrameVerifiedAt=[DateTime]::UtcNow.AddMinutes(-2).ToString('o')
-        $job.keyboardInputVerified=$true
-        $job.keyboardInputVerifiedAt=[DateTime]::UtcNow.AddMinutes(-2).ToString('o')
-        $job.mouseInputVerified=$true
-        $job.mouseInputVerifiedAt=[DateTime]::UtcNow.AddMinutes(-2).ToString('o')
         $job.streamValidationVerified=$true
         $job.completedStages=@('claim','guest_setup','network_setup','management_handoff','streaming_setup','stream_validation')
         $job.failureStage='streaming'
@@ -373,7 +358,7 @@ Describe 'EpicVM provisioning safety' {
         $job.consoleRoutePrefix | Should -Be '/vm/alpha--epic-pc/'
     }
 
-    It 'persists a canonical rejection of legacy ready records during recovery' {
+    It 'persists a canonical rejection of legacy ready records missing the validated stream gate' {
         $config=Get-EpicVMDefaultConfig
         $config.ProvisioningStatePath=Join-Path $TestDrive 'legacy-ready-recovery.json'
         @([ordered]@{
@@ -384,7 +369,6 @@ Describe 'EpicVM provisioning safety' {
             completedStages=@('claim','guest_setup','network_setup','management_handoff','streaming_setup','stream_validation')
             claimConsumed=$true
             claimUsed=$true
-            streamValidationVerified=$true
             consoleVerifiedAt='2026-08-20T00:00:00Z'
             consoleRoutePrefix='/vm/legacy-ready--epic-pc/'
             tailnetIp='100.111.82.1'
@@ -424,7 +408,7 @@ Describe 'EpicVM provisioning safety' {
         $job.consoleRepairOutcome | Should -BeNullOrEmpty
     }
 
-    It 'rejects reconcile-only setup for a legacy ready record without visual input evidence' {
+    It 'rejects reconcile-only setup for a legacy ready record without automated readiness evidence' {
         $config=Get-EpicVMDefaultConfig
         $config.ProvisioningStatePath=Join-Path $TestDrive 'legacy-ready-reconcile.json'
         $provider=New-ProvisioningTestProvider
@@ -669,7 +653,7 @@ Describe 'EpicVM network-stage recovery' {
         $job.claimConsumed=$true; $job.claimUsed=$true; $job.claimHash=$null
         $job.completedStages=@('claim','guest_setup','network_setup','management_handoff','streaming_setup','stream_validation')
         $job.guestSetupVerified=$true; $job.managementTransport='tailscale_winrm'; $job.managementReadyAt=[DateTime]::UtcNow.ToString('o'); $job.tailnetIp='100.111.82.1'; $job.tailnetDeviceId='device-old-network'
-        $job.consoleRoutePrefix='/vm/ready-network-recoverable--epic-pc/'; $job.consoleVerifiedAt=[DateTime]::UtcNow.ToString('o'); $job.consoleFrameVerified=$true; $job.keyboardInputVerified=$true; $job.mouseInputVerified=$true; $job.streamValidationVerified=$true
+        $job.consoleRoutePrefix='/vm/ready-network-recoverable--epic-pc/'; $job.consoleVerifiedAt=[DateTime]::UtcNow.ToString('o'); $job.streamValidationVerified=$true
         $state.Provisioning.Jobs[$job.id]=$job
         Save-EpicVMProvisioningStore -Store $state.Provisioning
 
@@ -718,6 +702,39 @@ Describe 'EpicVM network-stage recovery' {
         $job.managementTransport | Should -Be 'tailscale_winrm'
         $job.claimConsumed | Should -BeTrue
         $script:streamingNetworkDirectCalls | Should -Be 2
+        (Get-Content -LiteralPath $config.ProvisioningStatePath -Raw) | Should -Not -Match 'transient-password|operator'
+    }
+
+    It 're-enrolls a retained guest when its Tailscale state is lost after reboot' {
+        $config=Get-EpicVMDefaultConfig
+        $config.ProvisioningStatePath=Join-Path $TestDrive 'streaming-network-reenroll.json'
+        $script:reenrollDirectCalls=0
+        $provider=New-ProvisioningTestProvider
+        $provider | Add-Member NoteProperty PowerShellDirectInvoker { param($name,$credential,$scriptBlock,$args)
+            $script:reenrollDirectCalls++
+            if(@($args).Count -gt 0) { return @{ok=$true;ip='100.111.82.4';deviceId='device-reenrolled'} }
+            if($scriptBlock.ToString() -match 'Get-NetIPAddress') { throw 'retained Tailscale state is unavailable' }
+            return @{ok=$true;managementEndpoint=$true;firewallScoped=$true}
+        }
+        $provider | Add-Member NoteProperty EnrollTailscale { param($name,$username,$password)
+            @{ok=$true;ip='100.111.82.4';deviceId='device-reenrolled';managementReady=$true;managementTransport='tailscale_winrm'}
+        }
+        $state=New-EpicVMAgentState -Config $config -Token 'agent-token' -Provider $provider
+        $job=New-EpicVMProvisioningJobObject -Id 'job-streaming-network-reenroll' -Name 'streaming-network-reenroll' -Profile 'standard' -State 'setup_failed:streaming'
+        $job.vmId='5b3c52d1-7fd9-4a85-86f8-467d54fa0710'
+        $job.claimConsumed=$true; $job.claimUsed=$true; $job.claimHash=$null
+        $job.completedStages=@('claim','guest_setup','network_setup','management_handoff','streaming_setup')
+        $job.guestSetupVerified=$true; $job.managementTransport='tailscale_winrm'; $job.tailnetIp='100.111.82.1'; $job.tailnetDeviceId='device-old-reenroll'
+        $state.Provisioning.Jobs[$job.id]=$job
+        Save-EpicVMProvisioningStore -Store $state.Provisioning
+
+        Invoke-EpicVMProvisioningNetworkRecovery -State $state -Job $job -Request @{username='operator';password='transient-password';reverify=$true} | Out-Null
+
+        $job.state | Should -Be 'streaming_setup'
+        $job.tailnetIp | Should -Be '100.111.82.4'
+        $job.tailnetDeviceId | Should -Be 'device-reenrolled'
+        $job.managementTransport | Should -Be 'tailscale_winrm'
+        $script:reenrollDirectCalls | Should -Be 2
         (Get-Content -LiteralPath $config.ProvisioningStatePath -Raw) | Should -Not -Match 'transient-password|operator'
     }
 
@@ -867,6 +884,36 @@ Describe 'EpicVM Gaming provisioning contract' {
         { New-EpicVMProvisioningJob -State $state -Request @{name='gaming-two';profile='gaming'} } | Should -Throw
     }
 
+    It 'does not reserve GPU capacity for a stopped guest awaiting console verification' {
+        $config=Get-EpicVMDefaultConfig
+        $config.EnableGamingProvisioning=$true
+        $config.ProvisioningStatePath=Join-Path $TestDrive 'gaming-stopped-capacity.json'
+        $provider=New-ProvisioningTestProvider
+        $provider.GetVMs={ @(@{name='retained';id='retained-id';state='Off';profile='gaming'}) }
+        $state=New-EpicVMAgentState -Config $config -Token 'agent-token' -Provider $provider
+        $job=New-EpicVMProvisioningJobObject -Id 'retained-job' -Name 'retained' -Profile gaming -State streaming_setup
+        $job.vmId='retained-id'
+        $state.Provisioning.Jobs[$job.id]=$job
+        Save-EpicVMProvisioningStore -Store $state.Provisioning
+        $created=New-EpicVMProvisioningJob -State $state -Request @{name='new-gaming';profile='gaming'}
+        $created.state | Should -Be queued
+        $state.Provisioning.Jobs['retained-job'].vmId | Should -Be 'retained-id'
+    }
+
+    It 'allows another Gaming VM to be queued while a ready Gaming VM is running' {
+        $config=Get-EpicVMDefaultConfig
+        $config.EnableGamingProvisioning=$true
+        $config.ProvisioningStatePath=Join-Path $TestDrive 'gaming-running-capacity.json'
+        $provider=New-ProvisioningTestProvider
+        $provider.GetVMs={ @(@{name='existing-gaming';id='existing-gaming-id';state='Running';profile='gaming'}) }
+        $state=New-EpicVMAgentState -Config $config -Token 'agent-token' -Provider $provider
+
+        $created=New-EpicVMProvisioningJob -State $state -Request @{name='new-gaming';profile='gaming'}
+
+        $created.state | Should -Be queued
+        $created.name | Should -Be 'new-gaming'
+    }
+
     It 'requires and records the Gaming guest GPU validation gate before streaming setup' {
         $config=Get-EpicVMDefaultConfig
         $config.EnableGamingProvisioning=$true
@@ -914,7 +961,7 @@ Describe 'EpicVM Gaming provisioning contract' {
         $job.state | Should -Not -Be 'streaming_setup'
     }
 
-    It 'rejects console completion when frame metrics are missing (false-ready guard)' {
+    It 'withholds gaming readiness without decoded browser metrics' {
         $config=Get-EpicVMDefaultConfig
         $config.EnableGamingProvisioning=$true
         $config.ProvisioningStatePath=Join-Path $TestDrive 'frame-metrics-missing.json'
@@ -931,16 +978,23 @@ Describe 'EpicVM Gaming provisioning contract' {
         { Complete-EpicVMProvisioningConsole -State $state -Job $job -Request @{
             routePrefix='/vm/metrics-missing--epic-pc/'
             guestTcpVerified=$true
-            videoFrameVerified=$true
-            keyboardInputVerified=$true
-            mouseInputVerified=$true
         } } | Should -Throw
 
         $job.state | Should -Not -Be 'ready'
         $job.streamValidationVerified | Should -BeFalse
+        $job.gamingCaptureConfigured | Should -BeTrue
+        $job.keyboardInputVerified | Should -BeFalse
+        $job.mouseInputVerified | Should -BeFalse
     }
 
-    It 'rejects console completion with black or frozen frame metrics (false-ready guard)' {
+    It 'rejects console completion with invalid frame metrics: <Case>' -ForEach @(
+        @{Case='black';Field='nonblackFraction';Value=0.0},
+        @{Case='frozen';Field='decodedFramesDelta';Value=0},
+        @{Case='infinite';Field='durationMs';Value=[double]::PositiveInfinity},
+        @{Case='invalid fraction';Field='nonblackFraction';Value=1.5},
+        @{Case='white';Field='meanLuma';Value=255},
+        @{Case='invalid deviation';Field='stdDev';Value=130}
+    ) {
         $config=Get-EpicVMDefaultConfig
         $config.EnableGamingProvisioning=$true
         $config.ProvisioningStatePath=Join-Path $TestDrive 'frame-metrics-black.json'
@@ -954,20 +1008,19 @@ Describe 'EpicVM Gaming provisioning contract' {
         $job.completedStages=@('claim','guest_setup','network_setup','management_handoff','gaming_gpu')
         $state.Provisioning.Jobs[$job.id]=$job
 
+        $metrics=@{nonblackFraction=0.74;meanLuma=40.5;stdDev=41.2;decodedFramesDelta=150;durationMs=5000}
+        $metrics[$Field]=$Value
         { Complete-EpicVMProvisioningConsole -State $state -Job $job -Request @{
             routePrefix='/vm/metrics-black--epic-pc/'
             guestTcpVerified=$true
-            videoFrameVerified=$true
-            keyboardInputVerified=$true
-            mouseInputVerified=$true
-            frameMetrics=@{nonblackFraction=0.0;meanLuma=0.0;stdDev=0.0;decodedFramesDelta=0;durationMs=20000}
+            frameMetrics=$metrics
         } } | Should -Throw
 
         $job.state | Should -Not -Be 'ready'
         $job.streamValidationVerified | Should -BeFalse
     }
 
-    It 'accepts console completion with real frame evidence and reaches ready' {
+    It 'accepts optional frame evidence without setting manual attestations' {
         $config=Get-EpicVMDefaultConfig
         $config.EnableGamingProvisioning=$true
         $config.ProvisioningStatePath=Join-Path $TestDrive 'frame-metrics-good.json'
@@ -984,23 +1037,26 @@ Describe 'EpicVM Gaming provisioning contract' {
         Complete-EpicVMProvisioningConsole -State $state -Job $job -Request @{
             routePrefix='/vm/metrics-good--epic-pc/'
             guestTcpVerified=$true
-            videoFrameVerified=$true
-            keyboardInputVerified=$true
-            mouseInputVerified=$true
             frameMetrics=@{nonblackFraction=0.7452;meanLuma=40.76;stdDev=41.2;decodedFramesDelta=169;durationMs=5000}
         }
 
         $job.state | Should -Be 'ready'
         $job.streamValidationVerified | Should -BeTrue
-        $job.keyboardInputVerified | Should -BeTrue
-        $job.mouseInputVerified | Should -BeTrue
+        $job.consoleFrameVerified | Should -BeTrue
+        $job.consoleFrameVerifiedAt | Should -Not -BeNullOrEmpty
+        # Manual input attestations remain untouched by the automated
+        # readiness transition.
+        $job.keyboardInputVerified | Should -BeFalse
+        $job.mouseInputVerified | Should -BeFalse
     }
 
     It 'selects the gaming capture configuration only for gaming Sunshine setup' {
         $guestText = Get-Content (Join-Path $windowsRoot 'providers' 'GuestProvider.ps1') -Raw
         $guestText | Should -Match 'function Get-EpicVMGamingSunshineCaptureScript'
         $guestText | Should -Match 'Get-EpicVMSunshineConfigurationScript -ForGaming \(\[bool\]\$IsGaming\)'
-        $guestText | Should -Match 'output_name = Virtual Display'
+        $guestText | Should -Match "friendly_name -eq 'VDD by MTT'"
+        $guestText | Should -Match 'output_name = .*displayId'
+        $guestText | Should -Match 'encoder = amdvce'
         $guestText | Should -Match 'AutoAdminLogon'
         $guestText | Should -Match 'Root\\MttVDD'
     }

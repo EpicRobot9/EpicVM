@@ -311,7 +311,7 @@ def test_guest_network_recovery_worker_repairs_with_new_verified_address(monkeyp
 
         def console_complete(self, job_id, **kwargs):
             calls.append(("console_complete", job_id, kwargs))
-            return {"ok": True}
+            return {"ok": True, "job": {"state": "ready"}}
 
     class Orchestrator:
         def repair_staged(self, *args, **kwargs):
@@ -338,11 +338,13 @@ def test_guest_network_recovery_worker_repairs_with_new_verified_address(monkeyp
         {"guest_username": "operator", "guest_password": "transient-password", "reverify": True},
     )
     assert any(item[0] == "repair_staged" and item[2]["guest_ip"] == "100.83.6.72" for item in calls)
-    assert not any(item[0] == "console_complete" for item in calls)
+    completion = next(item for item in calls if item[0] == "console_complete")
+    assert set(completion[2]) == {"route_prefix", "guest_tcp_verified"}
+    assert completion[2]["guest_tcp_verified"] is True
     task = module._CONSOLE_RETRY_TASKS[task_key]
-    assert task["status"] == "pending_visual"
+    assert task["status"] == "ready"
     assert task["routeReady"] is True
-    assert task["visualValidationRequired"] is True
+    assert task["visualValidationRequired"] is False
     assert "transient-password" not in repr(module._CONSOLE_RETRY_TASKS)
 
 
@@ -372,7 +374,7 @@ def test_guest_network_recovery_worker_revalidates_streaming_failure(monkeypatch
 
         def console_complete(self, job_id, **kwargs):
             calls.append(("console_complete", job_id, kwargs))
-            return {"ok": True}
+            return {"ok": True, "job": {"state": "ready"}}
 
     class Orchestrator:
         def repair_staged(self, *args, **kwargs):
@@ -399,10 +401,13 @@ def test_guest_network_recovery_worker_revalidates_streaming_failure(monkeypatch
         {"guest_username": "operator", "guest_password": "transient-password", "reverify": True},
     )
     assert any(item[0] == "repair_staged" and item[2]["guest_ip"] == "100.124.226.19" for item in calls)
+    completion = next(item for item in calls if item[0] == "console_complete")
+    assert set(completion[2]) == {"route_prefix", "guest_tcp_verified"}
+    assert completion[2]["guest_tcp_verified"] is True
     task = module._CONSOLE_RETRY_TASKS[task_key]
-    assert task["status"] == "pending_visual"
+    assert task["status"] == "ready"
     assert task["routeReady"] is True
-    assert task["visualValidationRequired"] is True
+    assert task["visualValidationRequired"] is False
 
 
 def test_forward_auth_does_not_preflight_unrelated_vm_requests(monkeypatch, tmp_path):
@@ -457,3 +462,45 @@ def test_vm_wrapper_accepts_dashboard_admin_session_when_enabled(monkeypatch, tm
         "/vm/alpha/", headers={"Cookie": "Dashboard-Auth=valid-admin-session"}
     ):
         assert module._enforce_vm_user_access("alpha") is None
+
+
+def test_restricted_vm_denial_login_returns_to_local_requested_vm(monkeypatch, tmp_path):
+    module = load_app(monkeypatch)
+    monkeypatch.setenv("BLOBEDASH_STATE", str(tmp_path))
+    monkeypatch.setattr(module, "_current_portal_user", lambda: {"username": "other", "assignedVms": []})
+    monkeypatch.setattr(module, "_vm_access_mode", lambda name: "restricted")
+
+    response = module.app.test_client().get("/dashboard/vm/alpha/?tab=console")
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert 'location.href="/dashboard/vm/alpha/?tab=console"' in body
+
+
+def test_restricted_vm_denial_login_returns_to_epicvm_requested_vm(monkeypatch, tmp_path):
+    module = load_app(monkeypatch)
+    monkeypatch.setenv("BLOBEDASH_STATE", str(tmp_path))
+    monkeypatch.setattr(module, "_current_portal_user", lambda: {"username": "other", "assignedVms": []})
+    monkeypatch.setattr(module, "_vm_access_mode", lambda name: "restricted")
+
+    response = module.app.test_client().get("/EpicVM/vm/alpha/?tab=console")
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert 'location.href="/EpicVM/vm/alpha/?tab=console"' in body
+
+
+def test_restricted_vm_denial_escapes_query_before_inline_login_redirect(monkeypatch, tmp_path):
+    module = load_app(monkeypatch)
+    monkeypatch.setenv("BLOBEDASH_STATE", str(tmp_path))
+    monkeypatch.setattr(module, "_current_portal_user", lambda: {"username": "other", "assignedVms": []})
+    monkeypatch.setattr(module, "_vm_access_mode", lambda name: "restricted")
+
+    response = module.app.test_client().get(
+        "/dashboard/vm/alpha/?tab=</script><script>alert(1)</script>"
+    )
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "</script><script>" not in body
+    assert r"\u003c/script\u003e\u003cscript\u003ealert(1)\u003c/script\u003e" in body

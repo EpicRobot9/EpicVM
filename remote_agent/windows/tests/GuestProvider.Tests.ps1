@@ -8,6 +8,34 @@ BeforeAll {
 }
 
 Describe 'PowerShell Direct guest provider' {
+    It 'waits for the new interactive desktop after requesting one guest reboot' {
+        Mock Invoke-EpicVMPowerShellDirectOnce { @{ok=$true} }
+        $script:desktopPolls=0
+        Mock Invoke-EpicVMManagementTransport { $script:desktopPolls++; @{ok=($script:desktopPolls -ge 2)} }
+        Mock Start-Sleep {}
+        $credential=[PSCredential]::new('operator',(ConvertTo-SecureString 'fixture-password' -AsPlainText -Force))
+        Wait-EpicVMGamingDesktopAfterRestart -Provider @{} -VmName alpha -VmId 'fixture-vm' -GuestAddress '100.64.0.2' -Credential $credential -DirectCredential $credential -GuestUser operator -PreviousBoot 'previous-boot' -TimeoutSeconds 3
+        Should -Invoke Invoke-EpicVMPowerShellDirectOnce -Times 1 -ParameterFilter {$VmName -eq 'alpha' -and $Script.ToString() -match 'shutdown.exe'}
+        Should -Invoke Invoke-EpicVMManagementTransport -Times 2 -ParameterFilter {$ArgumentList[1] -eq 'previous-boot' -and $RetryCount -eq 0}
+    }
+    It 'requires a changed boot, the expected user, and a desktop process' -ForEach @(
+        @{LoggedOn=$true;NewBoot=$true;SessionId=1;Expected=$true},
+        @{LoggedOn=$false;NewBoot=$true;SessionId=1;Expected=$false},
+        @{LoggedOn=$true;NewBoot=$false;SessionId=1;Expected=$false},
+        @{LoggedOn=$true;NewBoot=$true;SessionId=0;Expected=$false}
+    ) {
+        $script:desktopLoggedOn=$LoggedOn
+        $script:desktopNewBoot=$NewBoot
+        $script:desktopSessionId=$SessionId
+        Mock Get-CimInstance { param($ClassName)
+            if($ClassName -eq 'Win32_ComputerSystem') { @{UserName=$(if($script:desktopLoggedOn){$env:COMPUTERNAME+'\operator'}else{''})} }
+            else { @{LastBootUpTime=$(if($script:desktopNewBoot){[DateTime]'2026-09-13T20:00:00Z'}else{[DateTime]'2026-09-13T19:00:00Z'})} }
+        }
+        Mock Get-Process { [pscustomobject]@{SessionId=$script:desktopSessionId} }
+        $previous=([DateTime]'2026-09-13T19:00:00Z').ToUniversalTime().ToString('o')
+        $result=& (Get-EpicVMGamingDesktopSessionScript) operator $previous
+        $result.ok | Should -Be $Expected
+    }
     It 'uses the injected boundary and returns only redacted verification fields' {
         $script:invoked = $false
         $provider = [pscustomobject]@{

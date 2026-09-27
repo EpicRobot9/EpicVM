@@ -32,11 +32,8 @@ except ImportError:  # pragma: no cover - direct module loading
 
 
 HOST_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
-# NOTE: the deployment tree is /opt/bloe-vm (bloe, not the legacy "blobe"
-# spelling) and that directory is what gets bind-mounted into the dashboard
-# container. Remote hosts enrolled on the host land there, so the default must
-# match it or ConfiguredVmHostRegistry silently loads zero remote providers.
-DEFAULT_REMOTE_HOSTS_FILE = "/opt/bloe-vm/remote-hosts.json"
+# Match the installer and the persistent directory mounted into the dashboard.
+DEFAULT_REMOTE_HOSTS_FILE = "/opt/blobe-vm/remote-hosts.json"
 _TOKEN_PREFIX = "EV1:"
 _TOKEN_AAD = b"EpicVM remote host token v1"
 

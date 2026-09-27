@@ -2,7 +2,7 @@ import React from 'react'
 import { useNavigate } from 'react-router-dom'
 
 // Shared chrome for the auth pages so Sign In / Request Access / Pending feel
-// like part of the same EpicVM portal (orange-bordered header + BETA pill).
+// like part of the same EpicVM management and portal experience.
 // `rightLink` overrides the default contextual link (Sign In <-> Request Access).
 // Pass rightLink={null} to hide it (e.g. on the status/pending screens).
 export default function AuthShell({ children, title, rightLink }) {
@@ -23,6 +23,7 @@ export default function AuthShell({ children, title, rightLink }) {
           <span className="evm-beta-pill">BETA</span>
         </div>
         <div className="evm-ph-right">
+          <a className="evm-link-btn" href="/EpicVM/settings">Settings</a>
           {link}
         </div>
       </header>

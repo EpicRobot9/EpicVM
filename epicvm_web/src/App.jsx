@@ -6,6 +6,13 @@ import Signin from './pages/Signin'
 import Pending from './pages/Pending'
 import Portal from './pages/Portal'
 import { me } from './api'
+import AccountWorkspace from './pages/AccountWorkspace'
+
+function PortalGate({ user, status, children }) {
+  if (!user) return <Navigate to="/signin" replace />
+  if (status === 'pending' || status === 'rejected') return <Navigate to="/pending" replace />
+  return children
+}
 
 export default function App() {
   const [user, setUser] = useState(null) // null = loading, false = anon, object = authed
@@ -27,18 +34,25 @@ export default function App() {
     return () => { live = false }
   }, [location.pathname])
 
+  useEffect(() => {
+    if (!user || !['pending', 'approved'].includes(user.accountStatus || 'approved')) return
+    let live = true
+    const timer = window.setInterval(() => {
+      me().then((next) => { if (live && next) setUser(next) }).catch(() => {})
+    }, 7000)
+    return () => { live = false; window.clearInterval(timer) }
+  }, [user && user.username, user && user.accountStatus])
+
+  if (/^\/(settings|Management)\/?$/i.test(location.pathname)) {
+    return <AccountWorkspace management={location.pathname.toLowerCase().startsWith('/management')} />
+  }
+
   if (checking) {
     return <div className="evm-loading" role="status">Loading…</div>
   }
 
   // Status gating for /portal/*: pending/rejected users get the status view, not the console.
   const status = user ? (user.accountStatus || 'approved') : 'anon'
-
-  const PortalGate = ({ children }) => {
-    if (!user) return <Navigate to="/signin" replace />
-    if (status === 'pending' || status === 'rejected') return <Navigate to="/pending" replace />
-    return children
-  }
 
   return (
     <Routes>
@@ -47,7 +61,7 @@ export default function App() {
       <Route path="/pending" element={<Pending user={user} />} />
       <Route
         path="/portal"
-        element={<PortalGate><Portal user={user} onSignout={() => { setUser(false); window.location.assign('/EpicVM/') }} /></PortalGate>}
+        element={<PortalGate user={user} status={status}><Portal user={user} onSignout={() => { setUser(false); window.location.assign('/EpicVM/') }} /></PortalGate>}
       />
       <Route
         path="/"

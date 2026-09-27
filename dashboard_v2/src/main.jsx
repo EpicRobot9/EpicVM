@@ -4,11 +4,12 @@ import { BrowserRouter } from 'react-router-dom'
 import App from './App'
 import './index.css'
 import { ThemeProvider } from './lib/theme.jsx'
+import { dashboardBasename } from './lib/dashboardLocation.js'
 
 createRoot(document.getElementById('root')).render(
   <React.StrictMode>
     <ThemeProvider>
-      <BrowserRouter basename="/EpicVM/Dashboard">
+      <BrowserRouter basename={dashboardBasename(window.location.pathname)}>
         <App />
       </BrowserRouter>
     </ThemeProvider>

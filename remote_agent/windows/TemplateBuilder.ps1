@@ -211,11 +211,9 @@ function Get-EpicVMTemplateGuestSanitizer {
         Get-Service -Name Tailscale -ErrorAction SilentlyContinue | Stop-Service -Force -ErrorAction SilentlyContinue
         @('Application','System','Setup','Security') | ForEach-Object { Clear-WinEvent -LogName $_ -ErrorAction SilentlyContinue }
         Remove-Item 'C:\Windows\Panther\*','C:\Windows\Temp\*','C:\Windows\Logs\*' -Recurse -Force -ErrorAction SilentlyContinue
-        # Clones re-enter interactive OOBE on first boot because /generalize
-        # resets OOBE state and no answer file exists.  Write one now so the
-        # first boot of every generalized clone auto-completes the remaining
-        # screens instead of needing robot clicks; the sanitized bootstrap
-        # account intentionally stays so PowerShell Direct probing continues.
+        # Keep the no-/oobe image contract: PowerShell Direct must be available
+        # before the claim, so Windows cannot be left inside interactive OOBE.
+        # The bootstrap account intentionally stays for first-boot setup.
         $oobePolicy=New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' -Force
         Set-ItemProperty -LiteralPath $oobePolicy.PSPath -Name 'DisablePrivacyExperience' -Value 1 -Type DWord
         # Time-sync baseline for clones: w32time always-on and the machine
@@ -250,12 +248,33 @@ function Get-EpicVMTemplateGuestSanitizer {
   </settings>
 </unattend>
 "@
-            $unattendXml | Set-Content -LiteralPath (Join-Path $env:SystemRoot 'System32\Sysprep\unattend.xml') -Encoding UTF8
+            $unattendPath=Join-Path $env:SystemRoot 'System32\Sysprep\unattend.xml'
+            [IO.File]::WriteAllText($unattendPath,$unattendXml,[Text.UTF8Encoding]::new($false))
+            if(-not (Test-Path -LiteralPath $unattendPath -PathType Leaf)){throw 'unattend_write_failed'}
+            try {
+                $null=[xml][IO.File]::ReadAllText($unattendPath)
+            } catch { throw 'unattend_validation_failed' }
+            # /generalize resets the zone before a clone can authenticate and
+            # the no-/oobe contract does not execute oobeSystem settings.
+            # Apply the host zone once at startup under SYSTEM, then self-delete.
+            $baselinePath=Join-Path $env:SystemRoot 'System32\EpicVM-TimeBaseline.ps1'
+            $baselineScript=@'
+$ErrorActionPreference='SilentlyContinue'
+tzutil.exe /s '__EPICVM_TIMEZONE__'
+Set-Service -Name 'w32time' -StartupType Automatic
+Start-Service -Name 'w32time'
+Unregister-ScheduledTask -TaskName 'EpicVM-TimeBaseline' -Confirm:$false
+Remove-Item -LiteralPath $PSCommandPath -Force
+'@.Replace('__EPICVM_TIMEZONE__',[string]$TimeZoneId)
+            [IO.File]::WriteAllText($baselinePath,$baselineScript,[Text.UTF8Encoding]::new($false))
+            $baselineAction=New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$baselinePath`""
+            $baselineTrigger=New-ScheduledTaskTrigger -AtStartup
+            Register-ScheduledTask -TaskName 'EpicVM-TimeBaseline' -Action $baselineAction -Trigger $baselineTrigger -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+            if($null -eq (Get-ScheduledTask -TaskName 'EpicVM-TimeBaseline' -ErrorAction SilentlyContinue)){throw 'time_baseline_task_registration_failed'}
         }
         # Keep the sanitized bootstrap account available for the first
-        # PowerShell Direct probe.  /oobe would stop at interactive Windows
-        # setup and make unattended provisioning impossible; generalized
-        # clones still receive a fresh machine identity on their first boot.
+        # PowerShell Direct probe. Generalized clones receive a fresh machine
+        # identity without entering interactive OOBE before the claim.
         $sysprepProcess=Start-Process -FilePath "$env:SystemRoot\System32\Sysprep\Sysprep.exe" -ArgumentList @('/generalize','/shutdown','/mode:vm','/unattend:C:\Windows\System32\Sysprep\unattend.xml') -Wait -PassThru -WindowStyle Hidden
         $sysprepExitCode=$sysprepProcess.ExitCode
         if($sysprepExitCode -ne 0){
@@ -392,7 +411,7 @@ function Invoke-EpicVMTemplateBuild {
         Copy-Item -LiteralPath $builderDisk -Destination (Join-Path $stageRoot 'win11-25h2.vhdx') -Force -ErrorAction Stop
         $imagePath=Join-Path $stageRoot 'win11-25h2.vhdx'
         $hash=(Get-FileHash -LiteralPath $imagePath -Algorithm SHA256).Hash.ToLowerInvariant()
-        $manifest=[ordered]@{ templateVersion='1.2.0'; name=$TemplateName; build=('win11-25h2-' + (Get-Date).ToUniversalTime().ToString('yyyyMMdd')); windowsBuild='Windows 11 25H2'; sha256=$hash; imagePath=(Join-Path $finalRoot 'win11-25h2.vhdx'); bootstrap='machine-dpapi-encrypted-system-admin'; sunshine='installed'; sunshineVersion=$SunshineVersion; sunshineService='SunshineService'; sunshineCredentials='request-only'; gpu='none'; gpuPartition='none'; diskType='Dynamic'; sourceVm=$SourceName; sysprep='/generalize /shutdown /mode:vm /unattend'; unattend='oobe-bypass+locale+timezone'; timeZone=$GuestTimeZoneId; network='private-switch'; fullCopy=$true; immutable=$true; sanitation='accounts;profiles;browser-data;logs;tailscale-identity;sunshine-credentials;machine-generalize'; createdAt=[DateTime]::UtcNow.ToString('o') }
+        $manifest=[ordered]@{ templateVersion='1.4.0'; name=$TemplateName; build=('win11-25h2-' + (Get-Date).ToUniversalTime().ToString('yyyyMMdd')); windowsBuild='Windows 11 25H2'; sha256=$hash; imagePath=(Join-Path $finalRoot 'win11-25h2.vhdx'); bootstrap='machine-dpapi-encrypted-system-admin'; sunshine='installed'; sunshineVersion=$SunshineVersion; sunshineService='SunshineService'; sunshineCredentials='request-only'; gpu='none'; gpuPartition='none'; diskType='Dynamic'; sourceVm=$SourceName; sysprep='/generalize /shutdown /mode:vm /unattend'; unattend='validated-oobe-file+startup-time-baseline'; timeZone=$GuestTimeZoneId; network='private-switch'; fullCopy=$true; immutable=$true; sanitation='accounts;profiles;browser-data;logs;tailscale-identity;sunshine-credentials;machine-generalize'; createdAt=[DateTime]::UtcNow.ToString('o') }
         $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stageRoot 'manifest.json') -Encoding UTF8 -NoNewline
         New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
         Move-Item -LiteralPath $stageRoot -Destination $finalRoot -Force

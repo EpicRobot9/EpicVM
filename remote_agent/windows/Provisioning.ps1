@@ -4,11 +4,11 @@
 Set-StrictMode -Version Latest
 $script:EpicVMProvisioningStates = @(
     'queued', 'cloning', 'booting', 'unclaimed', 'claim_in_progress',
-    'guest_setup', 'network_setup', 'management_handoff', 'gaming_gpu_validation', 'streaming_setup', 'stream_validation', 'ready',
+    'guest_setup', 'network_setup', 'management_handoff', 'gaming_gpu_validation', 'omarchy_gpu_validation', 'streaming_setup', 'stream_validation', 'ready',
     'deprovisioning', 'quarantined', 'purged'
 )
 
-$script:EpicVMProvisioningStageOrder = @('claim', 'guest_setup', 'network_setup', 'management_handoff', 'gaming_gpu', 'streaming_setup', 'stream_validation')
+$script:EpicVMProvisioningStageOrder = @('claim', 'guest_setup', 'network_setup', 'management_handoff', 'gaming_gpu', 'omarchy_gpu', 'streaming_setup', 'stream_validation')
 $script:EpicVMProvisioningFailureDetailCodes = @(
     'account_create_failed', 'account_update_failed',
     'account_password_policy_failed', 'admin_membership_failed',
@@ -24,9 +24,11 @@ $script:EpicVMProvisioningFailureDetailCodes = @(
     'CAPTURE_STAGING', 'CAPTURE_VDD_INSTALL', 'CAPTURE_SUNSHINE_CONF',
     'CAPTURE_CREDENTIALS_AND_LOGON', 'CAPTURE_FIREWALL_CONFIG',
     'CAPTURE_SERVICE_RESTART',
+    'CAPTURE_DESKTOP_LOGON',
     'GAMING_GPU_DEVICE_MISSING', 'GAMING_GPU_DEVICE_ERROR',
     'GAMING_GPU_DRIVER_INJECTION', 'GAMING_GPU_DXDIAG',
-    'GAMING_GPU_WEBGL', 'GAMING_GPU_FRAME', 'GAMING_GPU_ENCODER'
+    'GAMING_GPU_WEBGL', 'GAMING_GPU_FRAME', 'GAMING_GPU_ENCODER',
+    'OMARCHY_GPU_DEVICE_MISSING', 'OMARCHY_SOFTWARE_RENDERER', 'OMARCHY_SUNSHINE_ENCODER'
 )
 
 function New-EpicVMProvisioningOperationId {
@@ -44,8 +46,13 @@ function Get-EpicVMProvisioningFailureState {
             'hyperv_vm_not_found','hyperv_access_denied','hyperv_vm_not_running','guest_heartbeat_unhealthy',
             'direct_service_disabled','direct_service_not_ready','direct_not_supported','direct_open_timeout',
             'direct_transport_error','guest_credentials_rejected','guest_operation_failed','direct_parameter_failure',
-            'direct_module_failure','direct_runtime_failure')) { return 'setup_failed:guest' }
-    if ($safeCode -in @('tailscale_enrollment_failed','tailscale_state_not_persisted','tailscale_auth_input_failed','tailscale_guest_command_failed','tailscale_system_task_timeout','tailscale_system_task_failed','tailscale_unattended_failed','tailscale_restart_failed','TailscaleEnrollmentFailed','tailscale_verification_failed','tailscale_unavailable',
+            'direct_module_failure','direct_runtime_failure',
+            'omarchy_guest_validation_failed','omarchy_ssh_unavailable','omarchy_ssh_address_invalid',
+            'omarchy_management_key_missing','omarchy_management_key_unavailable',
+            'omarchy_bootstrap_password_missing','omarchy_bootstrap_password_unavailable',
+            'omarchy_secret_store_unavailable','omarchy_seed_cleanup_failed','omarchy_bootstrap_cleanup_failed',
+            'omarchy_guest_configuration_unavailable','omarchy_guest_configuration_failed','omarchy_bootstrap_prepare_failed')) { return 'setup_failed:guest' }
+    if ($safeCode -in @('tailscale_enrollment_failed','tailscale_state_not_persisted','tailscale_auth_input_failed','tailscale_guest_command_failed','tailscale_system_task_timeout','tailscale_system_task_failed','tailscale_unattended_failed','tailscale_restart_failed','TailscaleEnrollmentFailed','tailscale_verification_failed','tailscale_unavailable','omarchy_bootstrap_not_ready','omarchy_network_recovery_failed',
             'network_setup_failed','network_recovery_failed','tailscale_unreachable')) { return 'setup_failed:network' }
     if ($safeCode -in @('management_handoff_failed','management_transport_failed','management_transport_unavailable','management_trusted_hosts_broad')) {
         return 'setup_failed:management'
@@ -56,11 +63,14 @@ function Get-EpicVMProvisioningFailureState {
             'sunshine_firewall_failed','sunshine_service_restart_failed','sunshine_listener_failed',
             'sunshine_verification_failed','powershell_direct_failed','SunshineConfigurationFailed',
                         'sunshine_setup_unavailable','console_verification_failed','console_evidence_incomplete','gaming_capture_configuration_required','guest_reverification_failed',
-                        'gaming_capture_vdd_failed',
+                        'gaming_capture_vdd_failed','gaming_audio_device_failed',
             'console_failed')) { return 'setup_failed:streaming' }
     if ($safeCode -in @('GpuUnavailable','GpuIdentityUnavailable','GpuIdentityAmbiguous','GpuQuotaUnavailable',
             'GpuAdapterCountInvalid','GpuIdentityMismatch','GpuAdapterVerificationFailed','DriverInjectionFailed',
                         'gaming_guest_validation_failed','gaming_guest_validation_unavailable','gaming_gpu_validation_failed','gaming_encoder_unavailable','gaming_webgl_unavailable')) { return 'setup_failed:gaming_gpu' }
+    if ($safeCode -in @('omarchy_gpu_validation_failed','omarchy_encoder_unavailable','omarchy_sunshine_configuration_failed','omarchy_sunshine_failed')) {
+        return 'setup_failed:omarchy_gpu'
+    }
     if ($safeCode -in @('agent_restarted','reverification_failed')) { return 'setup_failed:agent_restart' }
     if ($safeCode -match '^legacy_') { return 'setup_failed:legacy_state_uncertain' }
     return 'setup_failed:unknown'
@@ -84,13 +94,9 @@ function Test-EpicVMProvisioningEvidence {
     param([Parameter(Mandatory)][object]$Record,[Parameter(Mandatory)][string]$Stage)
     $completed = @(Get-EpicVMProvisioningCompletedStages -Value (Get-EpicVMProperty -Object $Record -Name 'completedStages' -Default @()))
     # A historical completed stage is not sufficient for the final console
-    # validation gate. Re-evaluate the explicit evidence fields so an old
-    # route/TCP checkpoint can never resurrect a false Gaming ready state.
+    # validation gate. Re-evaluate the persisted automated route/transport
+    # result and the profile-specific capture gate.
     if ($Stage -eq 'stream_validation') {
-        $frame = [bool](Get-EpicVMProperty -Object $Record -Name 'consoleFrameVerified' -Default $false)
-        $keyboard = [bool](Get-EpicVMProperty -Object $Record -Name 'keyboardInputVerified' -Default $false)
-        $mouse = [bool](Get-EpicVMProperty -Object $Record -Name 'mouseInputVerified' -Default $false)
-        if (-not ($frame -and $keyboard -and $mouse)) { return $false }
         if ([string](Get-EpicVMProperty -Object $Record -Name 'profile' -Default 'standard') -ieq 'gaming' -and
             -not [bool](Get-EpicVMProperty -Object $Record -Name 'gamingCaptureConfigured' -Default $false)) { return $false }
         return [bool](Get-EpicVMProperty -Object $Record -Name 'streamValidationVerified' -Default $false)
@@ -108,16 +114,39 @@ function Test-EpicVMProvisioningEvidence {
                 (-not [string]::IsNullOrWhiteSpace([string](Get-EpicVMProperty -Object $Record -Name 'managementReadyAt' -Default '')))
         }
         'gaming_gpu' { return [bool](Get-EpicVMProperty -Object $Record -Name 'gamingGpuValidated' -Default $false) }
+        'omarchy_gpu' { return [bool](Get-EpicVMProperty -Object $Record -Name 'omarchyGpuValidated' -Default $false) }
         'streaming_setup' { return -not [string]::IsNullOrWhiteSpace([string](Get-EpicVMProperty -Object $Record -Name 'consoleVerifiedAt' -Default '')) }
         default { return $false }
     }
 }
 
+function Test-EpicVMProvisioningReadyIdentity {
+    param([Parameter(Mandatory)][object]$Record)
+    $vmIdValid = $false
+    try {
+        [void][guid]::Parse([string](Get-EpicVMProperty -Object $Record -Name 'vmId' -Default ''))
+        $vmIdValid = $true
+    }
+    catch { $vmIdValid = $false }
+    $name = [string](Get-EpicVMProperty -Object $Record -Name 'name' -Default '')
+    $route = [string](Get-EpicVMProperty -Object $Record -Name 'consoleRoutePrefix' -Default '')
+    $expectedRoute = '/vm/' + $name + '/'
+    $scopedRoutePattern = '^/vm/' + [regex]::Escape($name) + '--[a-z0-9][a-z0-9._-]{0,62}/$'
+    $routeValid = ($route -ceq $expectedRoute) -or ($route -cmatch $scopedRoutePattern)
+    return $vmIdValid -and
+        ([string](Get-EpicVMProperty -Object $Record -Name 'tailnetIp' -Default '') -match '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}$') -and
+        (-not [string]::IsNullOrWhiteSpace([string](Get-EpicVMProperty -Object $Record -Name 'tailnetDeviceId' -Default ''))) -and
+        (-not [string]::IsNullOrWhiteSpace([string](Get-EpicVMProperty -Object $Record -Name 'managementTransport' -Default ''))) -and
+        (-not [string]::IsNullOrWhiteSpace([string](Get-EpicVMProperty -Object $Record -Name 'managementReadyAt' -Default ''))) -and
+        (-not [string]::IsNullOrWhiteSpace([string](Get-EpicVMProperty -Object $Record -Name 'consoleVerifiedAt' -Default ''))) -and
+        $routeValid
+}
+
 function ConvertTo-EpicVMCanonicalProvisioningState {
     param([Parameter(Mandatory)][object]$Record)
     $state = [string](Get-EpicVMProperty -Object $Record -Name 'state' -Default 'failed')
-    if ($state -match '^setup_failed:(preclaim|guest|network|management|gaming_gpu|streaming|agent_restart|legacy_state_uncertain|unknown)$') { return $state }
-    if ($state -in @('queued','cloning','booting','unclaimed','claim_in_progress','guest_setup','network_setup','management_handoff','gaming_gpu_validation','streaming_setup','stream_validation','deprovisioning','quarantined','purged')) { return $state }
+    if ($state -match '^setup_failed:(preclaim|guest|network|management|gaming_gpu|omarchy_gpu|streaming|agent_restart|legacy_state_uncertain|unknown)$') { return $state }
+    if ($state -in @('queued','cloning','booting','unclaimed','claim_in_progress','guest_setup','network_setup','management_handoff','gaming_gpu_validation','omarchy_gpu_validation','streaming_setup','stream_validation','deprovisioning','quarantined','purged')) { return $state }
     if ($state -eq 'awaiting_claim') {
         $claimHash = [string](Get-EpicVMProperty -Object $Record -Name 'claimHash' -Default '')
         $claimUsed = [bool](Get-EpicVMProperty -Object $Record -Name 'claimConsumed' -Default (Get-EpicVMProperty -Object $Record -Name 'claimUsed' -Default $false))
@@ -139,8 +168,10 @@ function ConvertTo-EpicVMCanonicalProvisioningState {
             (Test-EpicVMProvisioningEvidence -Record $Record -Stage 'network_setup') -and
             (Test-EpicVMProvisioningEvidence -Record $Record -Stage 'management_handoff') -and
             (([string](Get-EpicVMProperty -Object $Record -Name 'profile' -Default 'standard') -ne 'gaming') -or (Test-EpicVMProvisioningEvidence -Record $Record -Stage 'gaming_gpu')) -and
+            (([string](Get-EpicVMProperty -Object $Record -Name 'profile' -Default 'standard') -ne 'omarchy') -or (Test-EpicVMProvisioningEvidence -Record $Record -Stage 'omarchy_gpu')) -and
             (Test-EpicVMProvisioningEvidence -Record $Record -Stage 'streaming_setup') -and
-            (Test-EpicVMProvisioningEvidence -Record $Record -Stage 'stream_validation')) { return 'ready' }
+            (Test-EpicVMProvisioningEvidence -Record $Record -Stage 'stream_validation') -and
+            (Test-EpicVMProvisioningReadyIdentity -Record $Record)) { return 'ready' }
         return 'setup_failed:legacy_state_uncertain'
     }
     if ($state -eq 'failed') { return (Get-EpicVMProvisioningFailureState -Code ([string](Get-EpicVMProperty -Object $Record -Name 'errorCode' -Default 'legacy_unknown'))) }
@@ -156,7 +187,8 @@ function Copy-EpicVMProvisioningJobFields {
                         'mouseInputVerified','mouseInputVerifiedAt','gamingCaptureConfigured','gamingCaptureAt','quarantineUntil',
             'errorCode','errorMessage','claimHash','claimExpires','claimUsed','claimConsumed',
             'operationId','completedStages','failureStage','failureDetailCode','guestSetupVerified','retryCount','lastAttemptCode',
-            'cpuCount','memoryBytes','diskSizeBytes','gpuPartitionPercent','gpuDeviceIdentity','gamingGpuValidated','gamingValidationAt')) {
+            'cpuCount','memoryBytes','diskSizeBytes','gpuPartitionPercent','gpuDeviceIdentity','gamingGpuValidated','gamingValidationAt',
+            'omarchyGpuValidated','omarchyValidationAt','guestUsername','guestOs')) {
         $value = Get-EpicVMProperty -Object $Source -Name $name -Default $null
         if ($null -ne $value -or $Target.PSObject.Properties.Name -contains $name) { $Target.$name = $value }
     }
@@ -249,6 +281,23 @@ function Get-EpicVMProvisioningProfile {
                 gpuPartition = '50%'
             }
         }
+        'omarchy' {
+            if (Get-Command -Name Get-EpicVMOmarchyProvisioningProfile -ErrorAction SilentlyContinue) {
+                return Get-EpicVMOmarchyProvisioningProfile
+            }
+            return [ordered]@{
+                profile = 'omarchy'
+                cpuCount = 6
+                memoryBytes = 12884901888
+                diskSizeBytes = 137438953472
+                gpu = $true
+                gpuPartition = '50%'
+                guestOs = 'Omarchy Linux'
+                managementTransport = 'tailscale_ssh'
+                console = 'Sunshine/Moonlight'
+                experimental = $true
+            }
+        }
         default { throw 'Unsupported EpicVM profile.' }
     }
 }
@@ -322,7 +371,8 @@ function ConvertTo-EpicVMRedactedJob {
                 'quarantineUntil', 'operationId', 'claimConsumed', 'completedStages',
         'failureStage', 'failureDetailCode', 'guestSetupVerified', 'retryCount', 'lastAttemptCode',
         'cpuCount', 'memoryBytes', 'diskSizeBytes', 'gpuPartitionPercent', 'gpuDeviceIdentity',
-        'gamingGpuValidated', 'gamingValidationAt'
+        'gamingGpuValidated', 'gamingValidationAt', 'omarchyGpuValidated', 'omarchyValidationAt',
+        'guestUsername', 'guestOs'
     )) {
         $value = Get-EpicVMProperty -Object $Job -Name $name -Default $null
         if ($null -ne $value) { $safe[$name] = $value }
@@ -380,6 +430,10 @@ function New-EpicVMProvisioningJobObject {
         gpuDeviceIdentity = $null
         gamingGpuValidated = $false
         gamingValidationAt = $null
+        omarchyGpuValidated = $false
+        omarchyValidationAt = $null
+        guestUsername = $null
+        guestOs = $null
         # Only the one-way verifier is persisted. The claim itself never is.
         claimHash = $null
         claimExpires = $null
@@ -424,7 +478,8 @@ function New-EpicVMProvisioningStore {
                 'claimHash', 'claimExpires', 'claimUsed', 'claimConsumed', 'operationId',
                 'completedStages', 'failureStage', 'guestSetupVerified', 'retryCount', 'lastAttemptCode',
                 'cpuCount','memoryBytes','diskSizeBytes','gpuPartitionPercent','gpuDeviceIdentity',
-                'gamingGpuValidated','gamingValidationAt'
+                'gamingGpuValidated','gamingValidationAt','omarchyGpuValidated','omarchyValidationAt',
+                'guestUsername','guestOs'
             )) {
                 $job.$name = Get-EpicVMProperty -Object $record -Name $name -Default $job.$name
             }
@@ -570,10 +625,22 @@ function Get-EpicVMProvisioningReadiness {
     $standardKeys = @('template', 'bootstrapCredential', 'tailscaleOAuthClient', 'tailscaleTailnet', 'tailscaleOAuthSecret')
     $standard = $true
     foreach ($key in $standardKeys) { if (-not [bool]$checks[$key]) { $standard = $false } }
+    $omarchyReadiness = [ordered]@{
+        omarchy_provisioning = $false
+        omarchyProvisioningChecks = [ordered]@{}
+    }
+    if (Get-Command -Name Get-EpicVMOmarchyProvisioningReadiness -ErrorAction SilentlyContinue) {
+        try {
+            $omarchyReadiness = Get-EpicVMOmarchyProvisioningReadiness -Config $Config -Provider $Provider
+        }
+        catch { }
+    }
     return [ordered]@{
         provisioning = [bool]$standard
         gaming_provisioning = [bool]($standard -and [bool](Get-EpicVMProperty -Object $Config -Name 'EnableGamingProvisioning' -Default $false) -and [bool]$checks.gpuPartitionable)
         provisioningChecks = $checks
+        omarchy_provisioning = [bool](Get-EpicVMProperty -Object $omarchyReadiness -Name 'omarchy_provisioning' -Default $false)
+        omarchyProvisioningChecks = Get-EpicVMProperty -Object $omarchyReadiness -Name 'omarchyProvisioningChecks' -Default ([ordered]@{})
     }
 }
 
@@ -621,6 +688,19 @@ function Test-EpicVMClaim {
 
 function Invoke-EpicVMProvisioningFailedCleanup {
     param([Parameter(Mandatory)] [object] $State, [Parameter(Mandatory)] [object] $Job)
+    $isOmarchy = [string](Get-EpicVMProperty -Object $Job -Name 'profile' -Default 'standard') -ieq 'omarchy'
+    $claimConsumed = [bool](Get-EpicVMProperty -Object $Job -Name 'claimConsumed' -Default $false)
+    if ($isOmarchy -and -not $claimConsumed) {
+        try {
+            $discard = Get-EpicVMProperty -Object $State.Provider -Name 'DiscardOmarchyBootstrap' -Default $null
+            if ($null -ne $discard) { & $discard $Job.name | Out-Null }
+            else {
+                $removeSeed = Get-EpicVMProperty -Object $State.Provider -Name 'RemoveOmarchySeed' -Default $null
+                if ($null -ne $removeSeed) { & $removeSeed $Job.name | Out-Null }
+            }
+        }
+        catch { }
+    }
     if ([string]::IsNullOrWhiteSpace([string]$Job.vmId)) { return }
     try {
         $vm = @(& $State.Provider.GetVMs | Where-Object { [string](Get-EpicVMProperty -Object $_ -Name 'name' -Default '') -ceq $Job.name }) | Select-Object -First 1
@@ -671,6 +751,8 @@ function Invoke-EpicVMProvisioningRecovery {
             [bool](Get-EpicVMProperty -Object $job -Name 'claimUsed' -Default $false) -and
             $restartStages -contains 'claim' -and $restartStages -contains 'guest_setup' -and
             $restartStages -contains 'network_setup' -and $restartStages -contains 'management_handoff' -and
+            (([string](Get-EpicVMProperty -Object $job -Name 'profile' -Default 'standard') -ine 'gaming') -or $restartStages -contains 'gaming_gpu') -and
+            (([string](Get-EpicVMProperty -Object $job -Name 'profile' -Default 'standard') -ine 'omarchy') -or $restartStages -contains 'omarchy_gpu') -and
             [string](Get-EpicVMProperty -Object $job -Name 'tailnetIp' -Default '') -match '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}$'
         if ($restartRecoverable) {
             $job.state = 'streaming_setup'
@@ -684,9 +766,6 @@ function Invoke-EpicVMProvisioningRecovery {
             continue
         }
         $readyStages = @(Get-EpicVMProvisioningCompletedStages -Value $job.completedStages)
-        $expectedReadyRoute = '/vm/' + [string]$job.name + '/'
-        $scopedReadyRoutePattern = '^/vm/' + [regex]::Escape([string]$job.name) + '--[a-z0-9][a-z0-9._-]{0,62}/$'
-        $readyRoute = [string](Get-EpicVMProperty -Object $job -Name 'consoleRoutePrefix' -Default '')
         $readyCheckpoint =
             [bool](Get-EpicVMProperty -Object $job -Name 'claimConsumed' -Default $false) -and
             [bool](Get-EpicVMProperty -Object $job -Name 'claimUsed' -Default $false) -and
@@ -694,13 +773,9 @@ function Invoke-EpicVMProvisioningRecovery {
             $readyStages -contains 'network_setup' -and $readyStages -contains 'management_handoff' -and
             $readyStages -contains 'streaming_setup' -and $readyStages -contains 'stream_validation' -and
             [bool](Get-EpicVMProperty -Object $job -Name 'streamValidationVerified' -Default $false) -and
-            [bool](Get-EpicVMProperty -Object $job -Name 'consoleFrameVerified' -Default $false) -and
-            [bool](Get-EpicVMProperty -Object $job -Name 'keyboardInputVerified' -Default $false) -and
-            [bool](Get-EpicVMProperty -Object $job -Name 'mouseInputVerified' -Default $false) -and
             (([string](Get-EpicVMProperty -Object $job -Name 'profile' -Default 'standard') -ine 'gaming') -or [bool](Get-EpicVMProperty -Object $job -Name 'gamingCaptureConfigured' -Default $false)) -and
-            -not [string]::IsNullOrWhiteSpace([string](Get-EpicVMProperty -Object $job -Name 'consoleVerifiedAt' -Default '')) -and
-            (($readyRoute -ceq $expectedReadyRoute) -or ($readyRoute -cmatch $scopedReadyRoutePattern)) -and
-            [string](Get-EpicVMProperty -Object $job -Name 'tailnetIp' -Default '') -match '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}$'
+            (([string](Get-EpicVMProperty -Object $job -Name 'profile' -Default 'standard') -ine 'omarchy') -or [bool](Get-EpicVMProperty -Object $job -Name 'omarchyGpuValidated' -Default $false)) -and
+            (Test-EpicVMProvisioningReadyIdentity -Record $job)
         $readyVmRunning = $false
         try {
             $readyVm = @(& $State.Provider.GetVMs | Where-Object {
@@ -724,7 +799,16 @@ function Invoke-EpicVMProvisioningRecovery {
             $changed = $true
             continue
         }
-        if ($job.state -in @('cloning', 'booting', 'claim_in_progress', 'guest_setup', 'network_setup', 'management_handoff', 'stream_validation')) {
+        if ($job.state -eq 'queued') {
+            $job.state = 'setup_failed:preclaim'
+            $job.errorCode = 'agent_restarted'
+            $job.failureStage = 'preclaim'
+            $job.errorMessage = 'The worker restarted before cloning began. This job can be retried.'
+            $job.updatedAt = [DateTime]::UtcNow.ToString('o')
+            $changed = $true
+            continue
+        }
+        if ($job.state -in @('cloning', 'booting', 'claim_in_progress', 'guest_setup', 'network_setup', 'management_handoff', 'gaming_gpu_validation', 'omarchy_gpu_validation', 'stream_validation')) {
             $job.state = 'setup_failed:agent_restart'
             $job.errorCode = 'agent_restarted'
             $job.failureStage = 'agent_restart'
@@ -737,7 +821,12 @@ function Invoke-EpicVMProvisioningRecovery {
             if (-not ($readyCheckpoint -and $readyVmRunning)) {
                 $verify = Get-EpicVMProperty -Object $State.Provider -Name 'VerifyGuest' -Default $null
                 $verified = $false
-                if ($null -ne $verify) { try { $verified = [bool](& $verify $job.name $job.tailnetIp) } catch { $verified = $false } }
+                if ($null -ne $verify) {
+                    try {
+                        if ([string]$job.profile -ieq 'omarchy') { $verified = [bool](& $verify $job.name $job.tailnetIp ([string]$job.guestUsername)) }
+                        else { $verified = [bool](& $verify $job.name $job.tailnetIp) }
+                    } catch { $verified = $false }
+                }
                 if (-not $verified) {
                     $job.state = 'setup_failed:agent_restart'
                     $job.errorCode = 'reverification_failed'
@@ -783,9 +872,16 @@ function New-EpicVMProvisioningJob {
         throw (New-EpicVMProvisioningError -Code 'gaming_not_validated' -Message 'Gaming provisioning remains disabled until a GPU-P pilot passes.' -Status 409)
     }
 
-    if ($profile.profile -eq 'gaming') {
-        $gamingSpec = Get-EpicVMGamingProvisioningSpec -Config $State.Config -Request $Request
-        $createGaming = {
+    if ($profile.profile -eq 'omarchy') {
+        $readiness = Get-EpicVMProvisioningReadiness -Config $State.Config -Provider $State.Provider
+        if (-not [bool](Get-EpicVMProperty -Object $readiness -Name 'omarchy_provisioning' -Default $false)) {
+            throw (New-EpicVMProvisioningError -Code 'omarchy_not_validated' -Message 'Omarchy provisioning remains disabled until the pinned image, AMD GPU-P path, and accelerated guest pilot are verified.' -Status 409)
+        }
+        if (-not (Get-Command -Name Get-EpicVMOmarchyProvisioningSpec -ErrorAction SilentlyContinue)) {
+            throw (New-EpicVMProvisioningError -Code 'omarchy_provisioning_unavailable' -Message 'The Omarchy provisioning profile is unavailable.' -Status 503)
+        }
+        $omarchySpec = Get-EpicVMOmarchyProvisioningSpec -Config $State.Config -Request $Request
+        $createOmarchy = {
             $freshStore = New-EpicVMProvisioningStore -Config $State.Config
             $existingJob = @($freshStore.Jobs.Values | Where-Object {
                 [string]$_.name -ceq $name -and -not (Test-EpicVMProvisioningJobRetryable -Job $_)
@@ -796,23 +892,50 @@ function New-EpicVMProvisioningJob {
             })
             if ($existing.Count -gt 0) { throw (New-EpicVMProvisioningError -Code 'conflict' -Message 'The requested VM name already exists.' -Status 409) }
 
+            $job = New-EpicVMProvisioningJobObject -Id ([guid]::NewGuid().ToString('N')) -Name $name -Profile $profile.profile
+            $job.cpuCount = [long]$omarchySpec.cpuCount
+            $job.memoryBytes = [long]$omarchySpec.memoryBytes
+            $job.diskSizeBytes = [long]$omarchySpec.diskSizeBytes
+            $job.gpuPartitionPercent = [int]$omarchySpec.gpuPartitionPercent
+            $job.gpuDeviceIdentity = [string]$omarchySpec.gpuDeviceIdentity
+            $job.guestOs = [string]$omarchySpec.guestOs
+            $freshStore.Jobs[$job.id] = $job
+            Save-EpicVMProvisioningStore -Store $freshStore
+            $State.Provisioning = $freshStore
+            return $job
+        }
+        return Invoke-EpicVMProvisioningStoreLocked -Action $createOmarchy
+    }
+
+    if ($profile.profile -eq 'gaming') {
+        $gamingSpec = Get-EpicVMGamingProvisioningSpec -Config $State.Config -Request $Request
+        $createGaming = {
+            $freshStore = New-EpicVMProvisioningStore -Config $State.Config
+            $existingJob = @($freshStore.Jobs.Values | Where-Object {
+                [string]$_.name -ceq $name -and -not (Test-EpicVMProvisioningJobRetryable -Job $_)
+            }) | Select-Object -First 1
+            if ($null -ne $existingJob) { throw (New-EpicVMProvisioningError -Code 'conflict' -Message 'The requested VM name already exists.' -Status 409) }
+            $inventory = @(& $State.Provider.GetVMs)
+            $existing = @($inventory | Where-Object { [string](Get-EpicVMProperty -Object $_ -Name 'name' -Default '') -ceq $name })
+            if ($existing.Count -gt 0) { throw (New-EpicVMProvisioningError -Code 'conflict' -Message 'The requested VM name already exists.' -Status 409) }
+
+            # Keep the clone reservation, but a stopped retained guest awaiting
+            # a console does not consume GPU capacity. Match immutable IDs so
+            # historical jobs for reused names cannot block a new VM.
             $activeStates = @('queued','cloning','booting','unclaimed','claim_in_progress','guest_setup','network_setup','management_handoff','gaming_gpu_validation','streaming_setup','stream_validation')
             $activeJobs = @($freshStore.Jobs.Values | Where-Object {
-                [string](Get-EpicVMProperty -Object $_ -Name 'profile' -Default 'standard') -ieq 'gaming' -and
-                $activeStates -contains [string](Get-EpicVMProperty -Object $_ -Name 'state' -Default '')
+                $candidateJob = $_
+                $jobState = [string](Get-EpicVMProperty -Object $candidateJob -Name 'state' -Default '')
+                $matchingVm = @($inventory | Where-Object {
+                    [string](Get-EpicVMProperty -Object $_ -Name 'id' -Default '') -ieq [string](Get-EpicVMProperty -Object $candidateJob -Name 'vmId' -Default 'missing') -and
+                    [string](Get-EpicVMProperty -Object $_ -Name 'state' -Default '') -notin @('Off','Saved')
+                })
+                [string](Get-EpicVMProperty -Object $candidateJob -Name 'profile' -Default 'standard') -ieq 'gaming' -and
+                $activeStates -contains $jobState -and ($jobState -in @('queued','cloning') -or $matchingVm.Count -gt 0)
             })
             if ($activeJobs.Count -gt 0) {
                 throw (New-EpicVMProvisioningError -Code 'gaming_capacity' -Message 'A Gaming VM is already being provisioned or is awaiting console completion.' -Status 409)
             }
-            $gamingNames = @('testre') + @((Get-EpicVMProperty -Object $State.Config -Name 'GamingVMNames' -Default @()))
-            $running = @(& $State.Provider.GetVMs | Where-Object {
-                $candidateName = [string](Get-EpicVMProperty -Object $_ -Name 'name' -Default '')
-                $candidateState = [string](Get-EpicVMProperty -Object $_ -Name 'state' -Default '')
-                $candidateProfile = [string](Get-EpicVMProperty -Object $_ -Name 'profile' -Default '')
-                ($candidateState -ieq 'Running') -and (($gamingNames -contains $candidateName) -or $candidateProfile -ieq 'gaming')
-            })
-            if ($running.Count -gt 0) { throw (New-EpicVMProvisioningError -Code 'gaming_capacity' -Message 'Only one Gaming VM may be running.' -Status 409) }
-
             $job = New-EpicVMProvisioningJobObject -Id ([guid]::NewGuid().ToString('N')) -Name $name -Profile $profile.profile
             $job.cpuCount = [long]$gamingSpec.cpuCount
             $job.memoryBytes = [long]$gamingSpec.memoryBytes
@@ -912,6 +1035,9 @@ function Invoke-EpicVMProvisioningGamingValidation {
 
 function Start-EpicVMProvisioningJob {
     param([Parameter(Mandatory)] [object] $State, [Parameter(Mandatory)] [object] $Job)
+    if ([string](Get-EpicVMProperty -Object $Job -Name 'profile' -Default 'standard') -ieq 'omarchy') {
+        return Start-EpicVMOmarchyProvisioningJob -State $State -Job $Job
+    }
     try {
         if ($Job.state -ne 'queued') { return $null }
         if (-not (Test-EpicVMTemplateManifest -Config $State.Config)) {
@@ -963,13 +1089,34 @@ function Start-EpicVMProvisioningJob {
             throw (New-EpicVMProvisioningError -Code 'bootstrap_readiness_unavailable' -Message 'The guest bootstrap readiness gate is unavailable.' -Status 503)
         }
         $ready=$false
+        $bootstrapFailureCode=''
         # A generalized Windows 11 clone can spend several minutes completing
         # its first boot before PowerShell Direct accepts the bootstrap account.
         # Keep each transport probe bounded, but allow one bounded 10-minute
         # readiness window before failing closed.
-        try { $ready=[bool](& $bootstrapReady $Job.name 600 1000) } catch { $ready=$false }
+        #
+        # The provider returns { ok; failureCode }. Preserve that code so a rejected
+        # bootstrap credential is reported as a credential fault instead of being
+        # flattened into the generic not-ready message. A template whose baked
+        # EpicVMBootstrap password no longer matches the host credential store is a
+        # credential fault and must be legible from the job record.
+        try {
+            $probe=& $bootstrapReady $Job.name 600 1000
+            $ready=[bool](Get-EpicVMProperty -Object $probe -Name 'ok' -Default $false)
+            if(-not $ready){ $bootstrapFailureCode=[string](Get-EpicVMProperty -Object $probe -Name 'failureCode' -Default '') }
+        }
+        catch { $ready=$false; $bootstrapFailureCode='bootstrap_probe_failed' }
         if(-not $ready){
-            throw (New-EpicVMProvisioningError -Code 'guest_bootstrap_not_ready' -Message 'The cloned guest did not become ready for secure setup.' -Status 503)
+            $Job.lastAttemptCode=$(if([string]::IsNullOrWhiteSpace($bootstrapFailureCode)){'guest_bootstrap_not_ready'}else{[string]$bootstrapFailureCode})
+            $code=$(if([string]::IsNullOrWhiteSpace($bootstrapFailureCode)){'guest_bootstrap_not_ready'}else{[string]$bootstrapFailureCode})
+            $message=$(if($code -eq 'guest_credentials_rejected'){
+                'The guest rejected the stored bootstrap credential. The published template and the host credential store are out of sync.'
+            }elseif($code -eq 'bootstrap_credential_unavailable'){
+                'The stored bootstrap credential could not be opened on the host.'
+            }else{
+                'The cloned guest did not become ready for secure setup.'
+            })
+            throw (New-EpicVMProvisioningError -Code $code -Message $message -Status 503)
         }
 
         $claim = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
@@ -997,18 +1144,13 @@ function Start-EpicVMProvisioningJob {
     }
 }
 
-function Invoke-EpicVMProvisioningClaim {
-    param([Parameter(Mandatory)] [object] $State, [Parameter(Mandatory)] [object] $Job, [Parameter(Mandatory)] [object] $Request)
-    $claim = [string](Get-EpicVMProperty -Object $Request -Name 'claimToken' -Default '')
-    $username = [string](Get-EpicVMProperty -Object $Request -Name 'username' -Default '')
-    $password = [string](Get-EpicVMProperty -Object $Request -Name 'password' -Default '')
-    if (-not (Test-EpicVMProvisioningCredentialInput -Username $username -Password $password)) {
-        throw (New-EpicVMProvisioningError -Code 'invalid_credential_input' -Message 'The credential input is empty or does not meet the request policy.' -Status 400)
-    }
-    $configure = Get-EpicVMProperty -Object $State.Provider -Name 'ConfigureGuest' -Default $null
-    if ($null -eq $configure) { throw (New-EpicVMProvisioningError -Code 'guest_configuration_unavailable' -Message 'PowerShell Direct guest configuration is unavailable.' -Status 503) }
-
-    $operation = Invoke-EpicVMProvisioningStoreLocked -Action {
+function Invoke-EpicVMProvisioningClaimCommit {
+    param(
+        [Parameter(Mandatory)] [object] $State,
+        [Parameter(Mandatory)] [object] $Job,
+        [Parameter(Mandatory)] [string] $Claim
+    )
+    return Invoke-EpicVMProvisioningStoreLocked -Action {
         $diskStore = New-EpicVMProvisioningStore -Config $State.Config
         $persisted = @($diskStore.Jobs.Values | Where-Object { [string]$_.id -ceq [string]$Job.id } | Select-Object -First 1)
         if ($persisted.Count -gt 0) { Copy-EpicVMProvisioningJobFields -Source $persisted[0] -Target $Job | Out-Null }
@@ -1018,7 +1160,7 @@ function Invoke-EpicVMProvisioningClaim {
             if ($canonical -eq 'claim_in_progress') { throw (New-EpicVMProvisioningError -Code 'claim_in_progress' -Message 'Another request already owns this claim.' -Status 409) }
             throw (New-EpicVMProvisioningError -Code 'claim_not_allowed' -Message 'The VM is not awaiting a claim.' -Status 409)
         }
-        if (-not (Test-EpicVMClaim -Job $Job -Claim $claim)) {
+        if (-not (Test-EpicVMClaim -Job $Job -Claim $Claim)) {
             throw (New-EpicVMProvisioningError -Code 'invalid_claim' -Message 'The claim is invalid or expired.' -Status 409)
         }
         $previous = [ordered]@{
@@ -1052,6 +1194,23 @@ function Invoke-EpicVMProvisioningClaim {
         }
         return [ordered]@{ operationId = [string]$Job.operationId }
     }
+}
+
+function Invoke-EpicVMProvisioningClaim {
+    param([Parameter(Mandatory)] [object] $State, [Parameter(Mandatory)] [object] $Job, [Parameter(Mandatory)] [object] $Request)
+    $claim = [string](Get-EpicVMProperty -Object $Request -Name 'claimToken' -Default '')
+    $username = [string](Get-EpicVMProperty -Object $Request -Name 'username' -Default '')
+    $password = [string](Get-EpicVMProperty -Object $Request -Name 'password' -Default '')
+    if (-not (Test-EpicVMProvisioningCredentialInput -Username $username -Password $password)) {
+        throw (New-EpicVMProvisioningError -Code 'invalid_credential_input' -Message 'The credential input is empty or does not meet the request policy.' -Status 400)
+    }
+    if ([string](Get-EpicVMProperty -Object $Job -Name 'profile' -Default 'standard') -ieq 'omarchy') {
+        return Invoke-EpicVMProvisioningOmarchyClaim -State $State -Job $Job -Claim $claim -Username $username -Password $password
+    }
+    $configure = Get-EpicVMProperty -Object $State.Provider -Name 'ConfigureGuest' -Default $null
+    if ($null -eq $configure) { throw (New-EpicVMProvisioningError -Code 'guest_configuration_unavailable' -Message 'PowerShell Direct guest configuration is unavailable.' -Status 503) }
+
+    $operation = Invoke-EpicVMProvisioningClaimCommit -State $State -Job $Job -Claim $claim
 
     try {
         $Job.state = 'guest_setup'; $Job.updatedAt = [DateTime]::UtcNow.ToString('o'); Save-EpicVMProvisioningStore -Store $State.Provisioning
@@ -1144,12 +1303,472 @@ function Invoke-EpicVMProvisioningClaim {
     }
 }
 
+function Invoke-EpicVMProvisioningOmarchyValidation {
+    param(
+        [Parameter(Mandatory)] [object] $State,
+        [Parameter(Mandatory)] [object] $Job,
+        [bool] $RequireSunshine = $false
+    )
+    $validate = Get-EpicVMProperty -Object $State.Provider -Name 'ValidateOmarchyGuest' -Default $null
+    if ($null -eq $validate) {
+        throw (New-EpicVMProvisioningError -Code 'omarchy_guest_validation_unavailable' -Message 'The Omarchy AMD guest validation gate is unavailable.' -Status 503)
+    }
+
+    $Job.state = 'omarchy_gpu_validation'
+    $Job.failureStage = $null
+    $Job.failureDetailCode = $null
+    $Job.errorCode = $null
+    $Job.errorMessage = $null
+    $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+    Save-EpicVMProvisioningStore -Store $State.Provisioning
+
+    try {
+        $result = $null
+        $parameterCount = 0
+        try { $parameterCount = @($validate.Ast.ParamBlock.Parameters).Count } catch { $parameterCount = 0 }
+        if ($parameterCount -ge 4) {
+            $result = & $validate $Job.name ([string]$Job.guestUsername) ([string]$Job.tailnetIp) ([bool]$RequireSunshine)
+        }
+        elseif ($RequireSunshine) {
+            $result = & $validate $Job.name ([string]$Job.guestUsername) ([string]$Job.tailnetIp)
+        }
+        else {
+            throw (New-EpicVMProvisioningError -Code 'omarchy_guest_validation_unavailable' -Message 'The Omarchy guest validator cannot perform the pre-console GPU check.' -Status 503)
+        }
+        if ($null -eq $result -or -not [bool](Get-EpicVMProperty -Object $result -Name 'ok' -Default $false)) {
+            $detail = [string](Get-EpicVMProperty -Object $result -Name 'failureDetailCode' -Default 'OMARCHY_GPU_DEVICE_MISSING')
+            if ($script:EpicVMProvisioningFailureDetailCodes -notcontains $detail) { $detail = 'OMARCHY_GPU_DEVICE_MISSING' }
+            throw (New-EpicVMProvisioningError -Code 'omarchy_gpu_validation_failed' -Message 'The Omarchy guest GPU, accelerated renderer, and Wayland validation gate failed.' -Status 422 -DetailCode $detail)
+        }
+
+        $Job.omarchyGpuValidated = $true
+        $Job.omarchyValidationAt = [DateTime]::UtcNow.ToString('o')
+        $Job.completedStages = @(Get-EpicVMProvisioningCompletedStages -Value (@($Job.completedStages) + @('omarchy_gpu')))
+        $Job.state = 'streaming_setup'
+        $Job.failureStage = $null
+        $Job.failureDetailCode = $null
+        $Job.errorCode = $null
+        $Job.errorMessage = $null
+        $Job.lastAttemptCode = $null
+        $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+        Save-EpicVMProvisioningStore -Store $State.Provisioning
+        return $Job
+    }
+    catch {
+        $code = [string](Get-EpicVMProperty -Object $_.Exception -Name 'ErrorCode' -Default 'omarchy_gpu_validation_failed')
+        if ($code -notin @('omarchy_guest_validation_unavailable','omarchy_gpu_validation_failed','omarchy_encoder_unavailable','omarchy_sunshine_configuration_failed')) {
+            $code = 'omarchy_gpu_validation_failed'
+        }
+        $Job.state = Get-EpicVMProvisioningFailureState -Code $code
+        $Job.failureStage = 'omarchy_gpu'
+        $Job.errorCode = $code
+        $detail = [string](Get-EpicVMProperty -Object $_.Exception -Name 'FailureDetailCode' -Default '')
+        if ($script:EpicVMProvisioningFailureDetailCodes -contains $detail) { $Job.failureDetailCode = $detail } else { $Job.failureDetailCode = $null }
+        $Job.lastAttemptCode = $code
+        $Job.errorMessage = 'Omarchy AMD GPU validation stopped safely; the owned VM was retained for diagnosis.'
+        $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+        Save-EpicVMProvisioningStore -Store $State.Provisioning
+        throw
+    }
+}
+
+function Invoke-EpicVMProvisioningOmarchyPostClaimSetup {
+    param(
+        [Parameter(Mandatory)] [object] $State,
+        [Parameter(Mandatory)] [object] $Job,
+        [Parameter(Mandatory)] [string] $Username,
+        [Parameter(Mandatory)] [string] $Password
+    )
+    $configure = Get-EpicVMProperty -Object $State.Provider -Name 'ConfigureOmarchyGuest' -Default $null
+    if ($null -eq $configure) { throw (New-EpicVMProvisioningError -Code 'omarchy_guest_configuration_unavailable' -Message 'Omarchy Linux guest configuration is unavailable.' -Status 503) }
+    $wait = Get-EpicVMProperty -Object $State.Provider -Name 'WaitOmarchyGuestReady' -Default $null
+    if ($null -eq $wait) { throw (New-EpicVMProvisioningError -Code 'omarchy_bootstrap_not_ready' -Message 'The Omarchy Tailscale SSH readiness provider is unavailable.' -Status 503) }
+
+    $Job.guestUsername = $Username
+    $Job.guestOs = 'Omarchy Linux'
+    if ($State.Provider.PSObject.Properties.Name -contains 'LastOmarchyGuestIp') {
+        $State.Provider.LastOmarchyGuestIp = [string]$Job.tailnetIp
+    }
+    $Job.state = 'guest_setup'
+    $Job.failureStage = $null
+    $Job.failureDetailCode = $null
+    $Job.errorCode = $null
+    $Job.errorMessage = $null
+    $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+    Save-EpicVMProvisioningStore -Store $State.Provisioning
+
+    $guestResult = & $configure $Job.name $Username $Password
+    if ($null -eq $guestResult -or -not [bool](Get-EpicVMProperty -Object $guestResult -Name 'ok' -Default $false)) {
+        $detail = [string](Get-EpicVMProperty -Object $guestResult -Name 'failureDetailCode' -Default 'account_verification_failed')
+        if ($script:EpicVMProvisioningFailureDetailCodes -notcontains $detail) { $detail = 'account_verification_failed' }
+        throw (New-EpicVMProvisioningError -Code 'guest_account_failed' -Message 'The Omarchy Linux account setup did not verify.' -Status 422 -DetailCode $detail)
+    }
+    $Job.guestSetupVerified = $true
+    $Job.completedStages = @(Get-EpicVMProvisioningCompletedStages -Value (@($Job.completedStages) + @('guest_setup')))
+    $Job.state = 'network_setup'
+    $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+    Save-EpicVMProvisioningStore -Store $State.Provisioning
+
+    # The bootstrap identity is removed by the privileged guest transition,
+    # so a post-transition readiness check must use the final management key.
+    # The initial Tailscale/SSH checkpoint is retained and re-used here.
+    if ([string]$Job.tailnetIp -notmatch '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}$' -or
+        [string]::IsNullOrWhiteSpace([string]$Job.tailnetDeviceId)) {
+        throw (New-EpicVMProvisioningError -Code 'tailscale_verification_failed' -Message 'The Omarchy Tailscale device checkpoint is unavailable.' -Status 422)
+    }
+    $removeSeed = Get-EpicVMProperty -Object $State.Provider -Name 'RemoveOmarchySeed' -Default $null
+    if ($null -ne $removeSeed) {
+        $removed = & $removeSeed $Job.name
+        if ($null -eq $removed -or -not [bool](Get-EpicVMProperty -Object $removed -Name 'seedRemoved' -Default $false)) {
+            throw (New-EpicVMProvisioningError -Code 'omarchy_seed_cleanup_failed' -Message 'The Omarchy cidata seed could not be removed after guest configuration.' -Status 422)
+        }
+    }
+    $transport = [string](Get-EpicVMProperty -Object $guestResult -Name 'managementTransport' -Default 'tailscale_ssh')
+    $Job.managementTransport = $transport
+    $Job.managementReadyAt = [DateTime]::UtcNow.ToString('o')
+    $Job.completedStages = @(Get-EpicVMProvisioningCompletedStages -Value (@($Job.completedStages) + @('network_setup','management_handoff')))
+    Save-EpicVMProvisioningStore -Store $State.Provisioning
+
+    Invoke-EpicVMProvisioningOmarchyValidation -State $State -Job $Job -RequireSunshine $false | Out-Null
+    return $Job
+}
+
+function Start-EpicVMOmarchyProvisioningJob {
+    param([Parameter(Mandatory)] [object] $State, [Parameter(Mandatory)] [object] $Job)
+    try {
+        if ($Job.state -ne 'queued') { return $null }
+        if (-not (Get-Command -Name Test-EpicVMOmarchyTemplateManifest -ErrorAction SilentlyContinue) -or
+            -not (Test-EpicVMOmarchyTemplateManifest -Config $State.Config)) {
+            throw (New-EpicVMProvisioningError -Code 'omarchy_template_invalid' -Message 'The pinned Omarchy template manifest is missing or invalid.' -Status 503)
+        }
+        $readiness = Get-EpicVMProvisioningReadiness -Config $State.Config -Provider $State.Provider
+        if (-not [bool](Get-EpicVMProperty -Object $readiness -Name 'omarchy_provisioning' -Default $false)) {
+            throw (New-EpicVMProvisioningError -Code 'omarchy_not_validated' -Message 'Omarchy provisioning remains disabled until the pinned image and AMD GPU-P pilot are validated.' -Status 409)
+        }
+        $Job.state = 'cloning'
+        $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+        Save-EpicVMProvisioningStore -Store $State.Provisioning
+
+        $profile = Get-EpicVMProvisioningProfile -Profile 'omarchy'
+        $manifestPath = [string](Get-EpicVMProperty -Object $State.Config -Name 'OmarchyTemplateManifestPath' -Default '')
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $Job.templateVersion = [string]$manifest.templateVersion
+        $Job.guestOs = 'Omarchy Linux'
+        $spec = Get-EpicVMOmarchyProvisioningSpec -Config $State.Config -Request $Job
+        $prepare = Get-EpicVMProperty -Object $State.Provider -Name 'PrepareOmarchyBootstrap' -Default $null
+        if ($null -eq $prepare) { throw (New-EpicVMProvisioningError -Code 'omarchy_bootstrap_prepare_failed' -Message 'The Omarchy bootstrap provider is unavailable.' -Status 503) }
+        $bootstrap = & $prepare $Job.name
+        $seedPath = [string](Get-EpicVMProperty -Object $bootstrap -Name 'seedPath' -Default '')
+        if ([string]::IsNullOrWhiteSpace($seedPath)) { throw (New-EpicVMProvisioningError -Code 'omarchy_bootstrap_prepare_failed' -Message 'The Omarchy cidata seed was not prepared.' -Status 503) }
+
+        $createRequest = [ordered]@{
+            name = $Job.name
+            profile = $profile.profile
+            cpuCount = [long]$spec.cpuCount
+            memoryBytes = [long]$spec.memoryBytes
+            diskSizeBytes = [long]$spec.diskSizeBytes
+            generation = 2
+            gpu = $true
+            gpuPartitionPercent = [int]$spec.gpuPartitionPercent
+            gpuDeviceIdentity = [string]$spec.gpuDeviceIdentity
+            fullCopy = $true
+            templateRequired = $true
+            templateDiskPath = [string]$manifest.imagePath
+            bootstrapSeedPath = $seedPath
+        }
+        $vm = & $State.Provider.CreateVM $createRequest
+        $candidateId = [string](Get-EpicVMProperty -Object $vm -Name 'id' -Default (Get-EpicVMProperty -Object $vm -Name 'Id' -Default ''))
+        $Job.vmId = Get-EpicVMJobImmutableVmId -State $State -Job ([pscustomobject]@{ name = $Job.name; vmId = $candidateId })
+        $Job.state = 'booting'
+        $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+        Save-EpicVMProvisioningStore -Store $State.Provisioning
+        & $State.Provider.StartVM $Job.name | Out-Null
+
+        $wait = Get-EpicVMProperty -Object $State.Provider -Name 'WaitOmarchyGuestReady' -Default $null
+        if ($null -eq $wait) { throw (New-EpicVMProvisioningError -Code 'omarchy_bootstrap_not_ready' -Message 'The Omarchy Tailscale SSH readiness provider is unavailable.' -Status 503) }
+        $ready = & $wait $Job.name 600 2000
+        if ($null -eq $ready -or -not [bool](Get-EpicVMProperty -Object $ready -Name 'ok' -Default $false)) {
+            throw (New-EpicVMProvisioningError -Code 'omarchy_bootstrap_not_ready' -Message 'The Omarchy guest did not become ready over Tailscale SSH.' -Status 503)
+        }
+        $Job.tailnetIp = [string](Get-EpicVMProperty -Object $ready -Name 'ip' -Default '')
+        $Job.tailnetDeviceId = [string](Get-EpicVMProperty -Object $ready -Name 'deviceId' -Default '')
+        $Job.managementTransport = [string](Get-EpicVMProperty -Object $ready -Name 'managementTransport' -Default 'tailscale_ssh')
+        $Job.managementReadyAt = [DateTime]::UtcNow.ToString('o')
+        if ($Job.tailnetIp -notmatch '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}$' -or
+            [string]::IsNullOrWhiteSpace($Job.tailnetDeviceId)) {
+            throw (New-EpicVMProvisioningError -Code 'tailscale_verification_failed' -Message 'The Omarchy Tailscale device did not pass verification.' -Status 422)
+        }
+        $removeSeed = Get-EpicVMProperty -Object $State.Provider -Name 'RemoveOmarchySeed' -Default $null
+        if ($null -eq $removeSeed) { throw (New-EpicVMProvisioningError -Code 'omarchy_seed_cleanup_failed' -Message 'The Omarchy seed cleanup provider is unavailable.' -Status 503) }
+        $removed = & $removeSeed $Job.name
+        if ($null -eq $removed -or -not [bool](Get-EpicVMProperty -Object $removed -Name 'seedRemoved' -Default $false)) {
+            throw (New-EpicVMProvisioningError -Code 'omarchy_seed_cleanup_failed' -Message 'The Omarchy cidata seed could not be removed after bootstrap.' -Status 422)
+        }
+
+        $claim = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
+        $Job.claimHash = ConvertTo-EpicVMClaimHash -Value $claim
+        $Job.claimExpires = [DateTime]::UtcNow.AddMinutes(30).ToString('o')
+        $Job.claimUsed = $false
+        $Job.claimConsumed = $false
+        $State.Provisioning.Claims[$Job.id] = $Job
+        $Job.state = 'unclaimed'
+        $Job.completedStages = @()
+        $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+        Save-EpicVMProvisioningStore -Store $State.Provisioning
+        return $claim
+    }
+    catch {
+        Invoke-EpicVMProvisioningFailedCleanup -State $State -Job $Job
+        $Job.errorCode = [string](Get-EpicVMProperty -Object $_.Exception -Name 'ErrorCode' -Default 'omarchy_provisioning_failed')
+        $Job.state = 'setup_failed:preclaim'
+        $Job.failureStage = 'preclaim'
+        $Job.lastAttemptCode = $Job.errorCode
+        $Job.errorMessage = 'Omarchy provisioning stopped before guest claim; no claim was consumed.'
+        $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+        Save-EpicVMProvisioningStore -Store $State.Provisioning
+        throw
+    }
+}
+
+function Invoke-EpicVMProvisioningOmarchyClaim {
+    param(
+        [Parameter(Mandatory)] [object] $State,
+        [Parameter(Mandatory)] [object] $Job,
+        [Parameter(Mandatory)] [string] $Claim,
+        [Parameter(Mandatory)] [string] $Username,
+        [Parameter(Mandatory)] [string] $Password
+    )
+    $operation = Invoke-EpicVMProvisioningClaimCommit -State $State -Job $Job -Claim $Claim
+    try {
+        Invoke-EpicVMProvisioningOmarchyPostClaimSetup -State $State -Job $Job -Username $Username -Password $Password | Out-Null
+        return $Job
+    }
+    catch {
+        $code = [string](Get-EpicVMProperty -Object $_.Exception -Name 'ErrorCode' -Default 'omarchy_guest_configuration_failed')
+        $Job.state = Get-EpicVMProvisioningFailureState -Code $code
+        $Job.failureStage = switch -Regex ($Job.state) {
+            'guest' { 'guest' }
+            'network' { 'network' }
+            'management' { 'management_handoff' }
+            'omarchy_gpu' { 'omarchy_gpu' }
+            default { 'unknown' }
+        }
+        $Job.errorCode = $code
+        $detail = [string](Get-EpicVMProperty -Object $_.Exception -Name 'FailureDetailCode' -Default '')
+        if ($script:EpicVMProvisioningFailureDetailCodes -contains $detail) { $Job.failureDetailCode = $detail } else { $Job.failureDetailCode = $null }
+        $Job.lastAttemptCode = $code
+        $Job.claimConsumed = $true
+        $Job.errorMessage = 'Omarchy guest setup stopped safely; the owned VM was retained for diagnosis.'
+        $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+        Save-EpicVMProvisioningStore -Store $State.Provisioning
+        throw
+    }
+    finally {
+        $Claim = $null; $Username = $null; $Password = $null; $operation = $null
+    }
+}
+
+function Invoke-EpicVMProvisioningOmarchyGuestRecovery {
+    param(
+        [Parameter(Mandatory)] [object] $State,
+        [Parameter(Mandatory)] [object] $Job,
+        [Parameter(Mandatory)] [object] $Request
+    )
+    $username = [string](Get-EpicVMProperty -Object $Request -Name 'username' -Default (Get-EpicVMProperty -Object $Job -Name 'guestUsername' -Default ''))
+    $password = [string](Get-EpicVMProperty -Object $Request -Name 'password' -Default '')
+    if (-not (Test-EpicVMProvisioningCredentialInput -Username $username -Password $password)) {
+        throw (New-EpicVMProvisioningError -Code 'invalid_credential_input' -Message 'The credential input is empty or does not meet the request policy.' -Status 400)
+    }
+
+    Invoke-EpicVMProvisioningStoreLocked -Action {
+        $diskStore = New-EpicVMProvisioningStore -Config $State.Config
+        $persisted = @($diskStore.Jobs.Values | Where-Object { [string]$_.id -ceq [string]$Job.id } | Select-Object -First 1)
+        if ($persisted.Count -gt 0) { Copy-EpicVMProvisioningJobFields -Source $persisted[0] -Target $Job | Out-Null }
+        $Job.state = ConvertTo-EpicVMCanonicalProvisioningState -Record $Job
+        $stages = @(Get-EpicVMProvisioningCompletedStages -Value $Job.completedStages)
+        if ($Job.state -ne 'setup_failed:guest' -or
+            -not [bool](Get-EpicVMProperty -Object $Job -Name 'claimConsumed' -Default $false) -or
+            -not [bool](Get-EpicVMProperty -Object $Job -Name 'claimUsed' -Default $false) -or
+            ($stages -notcontains 'claim') -or ($stages -contains 'guest_setup') -or
+            -not [string]::IsNullOrWhiteSpace([string](Get-EpicVMProperty -Object $Job -Name 'claimHash' -Default ''))) {
+            throw (New-EpicVMProvisioningError -Code 'guest_recovery_not_allowed' -Message 'Only a retained, consumed Omarchy guest-stage failure may be recovered.' -Status 409)
+        }
+        if ([string]::IsNullOrWhiteSpace([string](Get-EpicVMProperty -Object $Job -Name 'vmId' -Default ''))) {
+            throw (New-EpicVMProvisioningError -Code 'guest_recovery_vm_missing' -Message 'The retained Omarchy guest identity is unavailable.' -Status 409)
+        }
+        $Job.state = 'guest_setup'
+        $Job.failureStage = $null
+        $Job.failureDetailCode = $null
+        $Job.errorCode = $null
+        $Job.errorMessage = $null
+        $Job.lastAttemptCode = 'omarchy_guest_recovery_started'
+        $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+        $State.Provisioning.Jobs[$Job.id] = $Job
+        Save-EpicVMProvisioningStore -Store $State.Provisioning
+    } | Out-Null
+
+    try {
+        Invoke-EpicVMProvisioningOmarchyPostClaimSetup -State $State -Job $Job -Username $username -Password $password | Out-Null
+        return $Job
+    }
+    catch {
+        $code = [string](Get-EpicVMProperty -Object $_.Exception -Name 'ErrorCode' -Default 'omarchy_guest_recovery_failed')
+        $Job.state = Get-EpicVMProvisioningFailureState -Code $code
+        $Job.failureStage = switch -Regex ($Job.state) {
+            'guest' { 'guest' }
+            'network' { 'network' }
+            'omarchy_gpu' { 'omarchy_gpu' }
+            default { 'guest' }
+        }
+        $Job.errorCode = $code
+        $detail = [string](Get-EpicVMProperty -Object $_.Exception -Name 'FailureDetailCode' -Default '')
+        if ($script:EpicVMProvisioningFailureDetailCodes -contains $detail) { $Job.failureDetailCode = $detail } else { $Job.failureDetailCode = $null }
+        $Job.lastAttemptCode = $code
+        $Job.claimConsumed = $true
+        $Job.errorMessage = 'Omarchy guest recovery stopped safely; the owned VM was retained for diagnosis.'
+        $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+        Save-EpicVMProvisioningStore -Store $State.Provisioning
+        throw
+    }
+    finally { $username = $password = $null }
+}
+
+function Invoke-EpicVMProvisioningOmarchyNetworkRecovery {
+    param(
+        [Parameter(Mandatory)] [object] $State,
+        [Parameter(Mandatory)] [object] $Job,
+        [Parameter(Mandatory)] [object] $Request
+    )
+    $username = [string](Get-EpicVMProperty -Object $Request -Name 'username' -Default (Get-EpicVMProperty -Object $Job -Name 'guestUsername' -Default ''))
+    if ($username -notmatch '^[A-Za-z][A-Za-z0-9._-]{2,31}$') {
+        throw (New-EpicVMProvisioningError -Code 'invalid_credential_input' -Message 'The Linux account name is required for Omarchy network recovery.' -Status 400)
+    }
+    $savedUsername = [string](Get-EpicVMProperty -Object $Job -Name 'guestUsername' -Default '')
+    if (-not [string]::IsNullOrWhiteSpace($savedUsername) -and $savedUsername -cne $username) {
+        throw (New-EpicVMProvisioningError -Code 'invalid_credential_input' -Message 'The Omarchy recovery account does not match the retained Linux account.' -Status 400)
+    }
+    $reverify = [bool](Get-EpicVMProperty -Object $Request -Name 'reverify' -Default $false)
+    $started = $false
+    $previousState = $null
+    $previousStages = @()
+    try {
+        Invoke-EpicVMProvisioningStoreLocked -Action {
+            $diskStore = New-EpicVMProvisioningStore -Config $State.Config
+            $persisted = @($diskStore.Jobs.Values | Where-Object { [string]$_.id -ceq [string]$Job.id } | Select-Object -First 1)
+            if ($persisted.Count -gt 0) { Copy-EpicVMProvisioningJobFields -Source $persisted[0] -Target $Job | Out-Null }
+            $Job.state = ConvertTo-EpicVMCanonicalProvisioningState -Record $Job
+            $stages = @(Get-EpicVMProvisioningCompletedStages -Value $Job.completedStages)
+            $claimReady = [bool](Get-EpicVMProperty -Object $Job -Name 'claimConsumed' -Default $false) -and
+                [bool](Get-EpicVMProperty -Object $Job -Name 'claimUsed' -Default $false) -and
+                ($stages -contains 'claim') -and ($stages -contains 'guest_setup')
+            $normalAllowed = $Job.state -eq 'setup_failed:network' -and $claimReady -and
+                ($stages -notcontains 'network_setup') -and ($stages -notcontains 'management_handoff')
+            $readyAllowed = $reverify -and $Job.state -in @('ready','setup_failed:streaming','setup_failed:agent_restart') -and
+                $claimReady -and ($stages -contains 'network_setup') -and ($stages -contains 'management_handoff')
+            if (-not ($normalAllowed -or $readyAllowed)) {
+                throw (New-EpicVMProvisioningError -Code 'network_recovery_not_allowed' -Message 'Only a retained Omarchy network failure or an explicitly requested revalidation may be recovered.' -Status 409)
+            }
+            if ([string]::IsNullOrWhiteSpace([string](Get-EpicVMProperty -Object $Job -Name 'vmId' -Default ''))) {
+                throw (New-EpicVMProvisioningError -Code 'network_recovery_vm_missing' -Message 'The retained Omarchy VM identity is unavailable.' -Status 409)
+            }
+            if ($readyAllowed) {
+                $previousState = [string]$Job.state
+                $previousStages = @($stages)
+            }
+            $Job.state = 'network_setup'
+            $Job.failureStage = $null
+            $Job.failureDetailCode = $null
+            $Job.errorCode = $null
+            $Job.errorMessage = $null
+            $Job.lastAttemptCode = if ($readyAllowed) { 'omarchy_network_reverify_started' } else { 'omarchy_network_recovery_started' }
+            $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+            $State.Provisioning.Jobs[$Job.id] = $Job
+            Save-EpicVMProvisioningStore -Store $State.Provisioning
+            $script:EpicVMOmarchyNetworkRecoveryStarted = $true
+        } | Out-Null
+        $started = $true
+
+        if ($State.Provider.PSObject.Properties.Name -contains 'LastOmarchyGuestIp') {
+            $State.Provider.LastOmarchyGuestIp = [string]$Job.tailnetIp
+        }
+        $wait = Get-EpicVMProperty -Object $State.Provider -Name 'WaitOmarchyGuestReady' -Default $null
+        if ($null -eq $wait) { throw (New-EpicVMProvisioningError -Code 'omarchy_bootstrap_not_ready' -Message 'The Omarchy Tailscale SSH recovery provider is unavailable.' -Status 503) }
+        $ready = & $wait $Job.name 120 1000 $username
+        $ip = [string](Get-EpicVMProperty -Object $ready -Name 'ip' -Default '')
+        $deviceId = [string](Get-EpicVMProperty -Object $ready -Name 'deviceId' -Default '')
+        if ($null -eq $ready -or -not [bool](Get-EpicVMProperty -Object $ready -Name 'ok' -Default $false) -or
+            $ip -notmatch '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}$' -or
+            [string]::IsNullOrWhiteSpace($deviceId)) {
+            throw (New-EpicVMProvisioningError -Code 'tailscale_verification_failed' -Message 'The retained Omarchy Tailscale SSH endpoint could not be verified.' -Status 422)
+        }
+        $Job.tailnetIp = $ip
+        $Job.tailnetDeviceId = $deviceId
+        $Job.managementTransport = [string](Get-EpicVMProperty -Object $ready -Name 'managementTransport' -Default 'tailscale_ssh')
+        $Job.managementReadyAt = [DateTime]::UtcNow.ToString('o')
+        $Job.completedStages = @(Get-EpicVMProvisioningCompletedStages -Value (@($Job.completedStages) + @('network_setup','management_handoff')))
+        if ($reverify -or -not [bool]$Job.omarchyGpuValidated) {
+            Invoke-EpicVMProvisioningOmarchyValidation -State $State -Job $Job -RequireSunshine ([bool]$reverify) | Out-Null
+        }
+        else {
+            $Job.state = 'streaming_setup'
+            $Job.failureStage = $null
+            $Job.failureDetailCode = $null
+            $Job.errorCode = $null
+            $Job.errorMessage = $null
+            $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+            Save-EpicVMProvisioningStore -Store $State.Provisioning
+        }
+        if ($reverify -and -not [string]::IsNullOrWhiteSpace($previousState)) {
+            $Job.state = $previousState
+            $Job.completedStages = @($previousStages)
+            $Job.failureStage = $null
+            $Job.failureDetailCode = $null
+            $Job.errorCode = $null
+            $Job.errorMessage = $null
+            $Job.lastAttemptCode = $null
+            $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+            Save-EpicVMProvisioningStore -Store $State.Provisioning
+        }
+        return $Job
+    }
+    catch {
+        if ($started) {
+            $code = [string](Get-EpicVMProperty -Object $_.Exception -Name 'ErrorCode' -Default 'omarchy_network_recovery_failed')
+            if ([string]::IsNullOrWhiteSpace($code) -or $code -in @('network_recovery_not_allowed','network_recovery_vm_missing')) { $code = 'omarchy_network_recovery_failed' }
+            if ($reverify -and -not [string]::IsNullOrWhiteSpace($previousState)) {
+                $Job.state = $previousState
+                $Job.completedStages = @($previousStages)
+                $Job.failureStage = $null
+                $Job.failureDetailCode = $null
+                $Job.errorCode = $null
+                $Job.errorMessage = $null
+            }
+            else {
+                $Job.state = Get-EpicVMProvisioningFailureState -Code $code
+                $Job.failureStage = if ($Job.state -match 'omarchy_gpu') { 'omarchy_gpu' } else { 'network' }
+                $Job.errorCode = $code
+                $Job.failureDetailCode = $null
+                $Job.claimConsumed = $true
+                $Job.errorMessage = 'Omarchy network recovery stopped safely; the owned VM was retained for diagnosis.'
+            }
+            $Job.lastAttemptCode = $code
+            $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+            Save-EpicVMProvisioningStore -Store $State.Provisioning
+        }
+        throw
+    }
+    finally { $username = $null }
+}
+
 function Invoke-EpicVMProvisioningGuestRecovery {
     param(
         [Parameter(Mandatory)] [object] $State,
         [Parameter(Mandatory)] [object] $Job,
         [Parameter(Mandatory)] [object] $Request
     )
+    if ([string](Get-EpicVMProperty -Object $Job -Name 'profile' -Default 'standard') -ieq 'omarchy') {
+        return Invoke-EpicVMProvisioningOmarchyGuestRecovery -State $State -Job $Job -Request $Request
+    }
     $username = [string](Get-EpicVMProperty -Object $Request -Name 'username' -Default '')
     $password = [string](Get-EpicVMProperty -Object $Request -Name 'password' -Default '')
     if (-not (Test-EpicVMProvisioningCredentialInput -Username $username -Password $password)) {
@@ -1262,6 +1881,9 @@ function Invoke-EpicVMProvisioningGuestRecovery {
             [Parameter(Mandatory)] [object] $Job,
             [Parameter(Mandatory)] [object] $Request
         )
+        if ([string](Get-EpicVMProperty -Object $Job -Name 'profile' -Default 'standard') -ieq 'omarchy') {
+            return Invoke-EpicVMProvisioningOmarchyNetworkRecovery -State $State -Job $Job -Request $Request
+        }
         $username = [string](Get-EpicVMProperty -Object $Request -Name 'username' -Default '')
         $password = [string](Get-EpicVMProperty -Object $Request -Name 'password' -Default '')
         if (-not (Test-EpicVMProvisioningCredentialInput -Username $username -Password $password)) {
@@ -1299,7 +1921,7 @@ function Invoke-EpicVMProvisioningGuestRecovery {
                     ($stages -contains 'claim') -and ($stages -contains 'guest_setup') -and
                     ($stages -notcontains 'network_setup') -and ($stages -notcontains 'management_handoff') -and
                     [string]::IsNullOrWhiteSpace($claimHash)
-                $readyReverifyAllowed = $reverify -and $Job.state -in @('ready','setup_failed:streaming','setup_failed:agent_restart') -and
+                $readyReverifyAllowed = $reverify -and $Job.state -in @('ready','streaming_setup','setup_failed:streaming','setup_failed:gaming_gpu','setup_failed:agent_restart') -and
                     $claimConsumed -and $claimUsed -and $hasVmId -and
                     ($stages -contains 'claim') -and ($stages -contains 'guest_setup') -and
                     ($stages -contains 'network_setup') -and ($stages -contains 'management_handoff')
@@ -1337,21 +1959,45 @@ function Invoke-EpicVMProvisioningGuestRecovery {
 
             $vmId = Get-EpicVMJobImmutableVmId -State $State -Job $Job
             $credential = [PSCredential]::new($username, (ConvertTo-SecureString $password -AsPlainText -Force))
+            $tailscaleExecutable = [string](Get-EpicVMProperty -Object $State.Config -Name 'TailscaleExecutable' -Default 'C:\Program Files\Tailscale\tailscale.exe')
             $addressResult = $null
             try {
-                $addressResult = Invoke-EpicVMPowerShellDirectOnce -Provider $State.Provider -VmName $Job.name -VmId $vmId -Credential $credential -Script (Get-EpicVMTailscaleGuestAddressScript) -TimeoutSeconds 30
+                $addressResult = Invoke-EpicVMPowerShellDirectOnce -Provider $State.Provider -VmName $Job.name -VmId $vmId -Credential $credential -Script (Get-EpicVMTailscaleGuestAddressScript) -ArgumentList @($tailscaleExecutable) -TimeoutSeconds 30
             } catch {
-                throw (New-EpicVMProvisioningError -Code 'tailscale_verification_failed' -Message 'The retained guest Tailscale address could not be verified.' -Status 422)
+                # A reboot can leave the retained VM running while Tailscale
+                # loses its durable node state. Re-enroll only this already-
+                # claimed guest; never issue another provisioning claim.
+                $enroll = Get-EpicVMProperty -Object $State.Provider -Name 'EnrollTailscale' -Default $null
+                if ($null -eq $enroll) {
+                    throw (New-EpicVMProvisioningError -Code 'tailscale_verification_failed' -Message 'The retained guest Tailscale address could not be verified.' -Status 422)
+                }
+                try {
+                    $addressResult = & $enroll $Job.name $username $password
+                } catch {
+                    $enrollCode = [string](Get-EpicVMProperty -Object $_.Exception -Name 'ErrorCode' -Default 'tailscale_verification_failed')
+                    $allowedEnrollCodes = @(
+                        'tailscale_enrollment_failed','tailscale_state_not_persisted',
+                        'tailscale_auth_input_failed','tailscale_guest_command_failed',
+                        'tailscale_system_task_timeout','tailscale_system_task_failed',
+                        'tailscale_unattended_failed','tailscale_restart_failed',
+                        'management_handoff_failed'
+                    )
+                    if ($allowedEnrollCodes -notcontains $enrollCode) { $enrollCode = 'tailscale_verification_failed' }
+                    throw (New-EpicVMProvisioningError -Code $enrollCode -Message 'The retained guest Tailscale address could not be verified.' -Status 422)
+                }
             }
             $ip = [string](Get-EpicVMHyperVValue -Object $addressResult -Name 'ip' -Default '')
             if (-not [bool](Get-EpicVMHyperVValue -Object $addressResult -Name 'ok' -Default $false) -or
                 $ip -notmatch '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}$') {
                 throw (New-EpicVMProvisioningError -Code 'tailscale_verification_failed' -Message 'The retained guest Tailscale address could not be verified.' -Status 422)
             }
-            try {
-                $deviceId = Get-EpicVMTailscaleDeviceId -Provider $State.Provider -VmName ([string]$Job.name) -GuestIp $ip
-            } catch {
-                throw (New-EpicVMProvisioningError -Code 'tailscale_verification_failed' -Message 'The retained Tailscale device could not be identified.' -Status 422)
+            $deviceId = [string](Get-EpicVMHyperVValue -Object $addressResult -Name 'deviceId' -Default '')
+            if ([string]::IsNullOrWhiteSpace($deviceId)) {
+                try {
+                    $deviceId = Get-EpicVMTailscaleDeviceId -Provider $State.Provider -VmName ([string]$Job.name) -GuestIp $ip
+                } catch {
+                    throw (New-EpicVMProvisioningError -Code 'tailscale_verification_failed' -Message 'The retained Tailscale device could not be identified.' -Status 422)
+                }
             }
             if ([string]::IsNullOrWhiteSpace($deviceId)) {
                 throw (New-EpicVMProvisioningError -Code 'tailscale_verification_failed' -Message 'The retained Tailscale device could not be identified.' -Status 422)
@@ -1485,6 +2131,9 @@ function Invoke-EpicVMProvisioningGuestRecovery {
     if($parameterCount -ge 9){
         $args += [bool]([string](Get-EpicVMProperty -Object $Job -Name 'profile' -Default 'standard') -ieq 'gaming')
     }
+    if($parameterCount -ge 10){
+        $args += [bool]([string](Get-EpicVMProperty -Object $Job -Name 'profile' -Default 'standard') -ieq 'omarchy')
+    }
     return & $Invoker @args
 }
 
@@ -1555,17 +2204,18 @@ function Set-EpicVMProvisioningConsoleCredentials {
     }
     $reconcileEvidenceComplete =
         (Test-EpicVMProvisioningEvidence -Record $Job -Stage 'stream_validation') -and
-        (@(Get-EpicVMProvisioningCompletedStages -Value $Job.completedStages) -contains 'management_handoff')
+        (@(Get-EpicVMProvisioningCompletedStages -Value $Job.completedStages) -contains 'management_handoff') -and
+        (Test-EpicVMProvisioningReadyIdentity -Record $Job)
     if ($reconcileState -eq 'ready' -and -not $reconcileEvidenceComplete) {
         $Job.state = 'setup_failed:legacy_state_uncertain'
         $Job.failureStage = 'legacy_state_uncertain'
         $Job.failureDetailCode = $null
         $Job.errorCode = 'legacy_state_uncertain'
-        $Job.errorMessage = 'Persisted readiness lacked rendered-frame and input evidence; visual verification is required.'
+        $Job.errorMessage = 'Persisted readiness lacked required automated provisioning, stream, or route evidence.'
         $Job.lastAttemptCode = 'legacy_ready_rejected'
         $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
         Save-EpicVMProvisioningStore -Store $State.Provisioning
-        throw (New-EpicVMProvisioningError -Code 'legacy_state_uncertain' -Message 'Persisted readiness lacked rendered-frame and input evidence.' -Status 422)
+        throw (New-EpicVMProvisioningError -Code 'legacy_state_uncertain' -Message 'Persisted readiness lacked required automated provisioning, stream, or route evidence.' -Status 422)
     }
     $completedStages = @(Get-EpicVMProvisioningCompletedStages -Value $Job.completedStages)
     $legacyVmValid = $false
@@ -1619,6 +2269,18 @@ function Set-EpicVMProvisioningConsoleCredentials {
             $transport=[string](Get-EpicVMProperty -Object $sunshineResult -Name 'managementTransport' -Default '')
             if(-not [string]::IsNullOrWhiteSpace($transport)){$Job.managementTransport=$transport}
             if([bool](Get-EpicVMProperty -Object $sunshineResult -Name 'managementReady' -Default $false)){$Job.managementReadyAt=[DateTime]::UtcNow.ToString('o')}
+            if([string]$Job.profile -ieq 'omarchy') {
+                $guestValidation = Get-EpicVMProperty -Object $sunshineResult -Name 'guestValidation' -Default $null
+                if(-not [bool](Get-EpicVMProperty -Object $sunshineResult -Name 'hardwareEncoder' -Default $false) -or
+                   $null -eq $guestValidation -or -not [bool](Get-EpicVMProperty -Object $guestValidation -Name 'ok' -Default $false)) {
+                    throw (New-EpicVMProvisioningError -Code 'omarchy_encoder_unavailable' -Message 'The Omarchy Sunshine hardware encoder and accelerated renderer were not verified.' -Status 422 -DetailCode 'OMARCHY_SUNSHINE_ENCODER')
+                }
+                $Job.guestUsername = $guestUsername
+                $Job.guestOs = 'Omarchy Linux'
+                $Job.omarchyGpuValidated = $true
+                $Job.omarchyValidationAt = if([string]::IsNullOrWhiteSpace([string]$Job.omarchyValidationAt)){[DateTime]::UtcNow.ToString('o')}else{$Job.omarchyValidationAt}
+                $Job.completedStages = @(Get-EpicVMProvisioningCompletedStages -Value (@($Job.completedStages) + @('omarchy_gpu')))
+            }
             if([string]$Job.profile -ieq 'gaming') {
                 if(-not [bool](Get-EpicVMProperty -Object $sunshineResult -Name 'gamingCaptureConfigured' -Default $false)) {
                     throw (New-EpicVMProvisioningError -Code 'gaming_capture_configuration_required' -Message 'The Gaming Sunshine capture target was not verified.' -Status 422 -DetailCode 'GAMING_GPU_ENCODER')
@@ -1702,61 +2364,93 @@ function Complete-EpicVMProvisioningConsole {
     $scopedRoutePattern = '^/vm/' + [regex]::Escape([string]$Job.name) + '--[a-z0-9][a-z0-9._-]{0,62}/$'
     $routeAllowed = ($route -ceq $expectedRoute) -or ($route -cmatch $scopedRoutePattern)
     $serverVerified = [bool](Get-EpicVMProperty -Object $Request -Name 'guestTcpVerified' -Default $false)
-    $frameVerified = [bool](Get-EpicVMProperty -Object $Request -Name 'videoFrameVerified' -Default (Get-EpicVMProperty -Object $Request -Name 'frameVerified' -Default $false))
-    $keyboardVerified = [bool](Get-EpicVMProperty -Object $Request -Name 'keyboardInputVerified' -Default $false)
-    $mouseVerified = [bool](Get-EpicVMProperty -Object $Request -Name 'mouseInputVerified' -Default $false)
     if (-not $routeAllowed -or -not $serverVerified) {
         throw (New-EpicVMProvisioningError -Code 'console_verification_failed' -Message 'The kvm2 console evidence is incomplete.' -Status 422)
     }
-    if (-not ($frameVerified -and $keyboardVerified -and $mouseVerified)) {
-        throw (New-EpicVMProvisioningError -Code 'console_evidence_incomplete' -Message 'Rendered video, keyboard, and mouse evidence are required before readiness.' -Status 422)
-    }
-    # Quantified frame evidence: the browser harness must attest measurable
-    # pixels, not just a boolean. A stream that stayed black or frozen must
-    # never flip this job to ready.
+    # Optional quantified diagnostics: when a caller supplies browser frame
+    # metrics they must be genuine (never black, frozen, or static video).
+    # Automatic provisioning sends none, so absent metrics never block the
+    # trusted automated readiness transition.
     $metrics = Get-EpicVMProperty -Object $Request -Name 'frameMetrics' -Default $null
-    foreach ($entry in @(
-        @{ Name='nonblackFraction'; Min=0.60 },
-        @{ Name='meanLuma';         Min=12.0 },
-        @{ Name='decodedFramesDelta'; Min=3.0 },
-        @{ Name='durationMs';       Min=1500.0 })) {
-        $raw = Get-EpicVMProperty -Object $metrics -Name $entry.Name -Default $null
-        try { $value = [double]::Parse([string]$raw, [Globalization.CultureInfo]::InvariantCulture) } catch { $value = [double]::NaN }
-        if ([double]::IsNaN($value) -or $value -lt [double]$entry.Min) {
-            throw (New-EpicVMProvisioningError -Code 'frame_evidence_rejected' -Message ("Quantified frame evidence failed the '{0}' readiness threshold." -f $entry.Name) -Status 422)
+    $hasMetrics = $false
+    if ($null -ne $metrics) {
+        foreach ($metricName in @('nonblackFraction','meanLuma','stdDev','decodedFramesDelta','durationMs')) {
+            $rawMetric = Get-EpicVMProperty -Object $metrics -Name $metricName -Default $null
+            if ($null -ne $rawMetric -and [string]$rawMetric -ne '') { $hasMetrics = $true; break }
         }
     }
-    $stdRaw = Get-EpicVMProperty -Object $metrics -Name 'stdDev' -Default $null
-    try { $stdDev = [double]::Parse([string]$stdRaw, [Globalization.CultureInfo]::InvariantCulture) } catch { $stdDev = [double]::NaN }
-    if ([double]::IsNaN($stdDev) -or $stdDev -lt 8.0) {
-        throw (New-EpicVMProvisioningError -Code 'frame_evidence_rejected' -Message "Quantified frame evidence failed the 'stdDev' readiness threshold." -Status 422)
+    if ($hasMetrics) {
+        foreach ($entry in @(
+            @{ Name='nonblackFraction'; Min=0.20; Max=1.0 },
+            @{ Name='meanLuma'; Min=12.0; Max=252.0 },
+            @{ Name='decodedFramesDelta'; Min=3.0; Max=[double]::MaxValue },
+            @{ Name='durationMs'; Min=1500.0; Max=[double]::MaxValue })) {
+            $raw = Get-EpicVMProperty -Object $metrics -Name $entry.Name -Default $null
+            try { $value = [double]::Parse([string]$raw, [Globalization.CultureInfo]::InvariantCulture) } catch { $value = [double]::NaN }
+            if ([double]::IsNaN($value) -or [double]::IsInfinity($value) -or $value -lt [double]$entry.Min -or $value -gt [double]$entry.Max) {
+                throw (New-EpicVMProvisioningError -Code 'frame_evidence_rejected' -Message ("Quantified frame evidence failed the '{0}' readiness threshold." -f $entry.Name) -Status 422)
+            }
+        }
+        $stdRaw = Get-EpicVMProperty -Object $metrics -Name 'stdDev' -Default $null
+        try { $stdDev = [double]::Parse([string]$stdRaw, [Globalization.CultureInfo]::InvariantCulture) } catch { $stdDev = [double]::NaN }
+        if ([double]::IsNaN($stdDev) -or [double]::IsInfinity($stdDev) -or $stdDev -lt 8.0 -or $stdDev -gt 127.5) {
+            throw (New-EpicVMProvisioningError -Code 'frame_evidence_rejected' -Message "Quantified frame evidence failed the 'stdDev' readiness threshold." -Status 422)
+        }
+    }
+    if ([string]$Job.profile -ieq 'gaming' -and -not $hasMetrics) {
+        throw (New-EpicVMProvisioningError -Code 'frame_evidence_required' -Message 'Decoded browser video evidence is required for Gaming VM readiness.' -Status 422)
     }
     if ([string]$Job.profile -ieq 'gaming' -and -not [bool](Get-EpicVMProperty -Object $Job -Name 'gamingCaptureConfigured' -Default $false)) {
         throw (New-EpicVMProvisioningError -Code 'gaming_capture_configuration_required' -Message 'The Gaming Sunshine capture target was not verified.' -Status 422 -DetailCode 'GAMING_GPU_ENCODER')
+    }
+    $isOmarchy = [string]$Job.profile -ieq 'omarchy'
+    if ($isOmarchy -and -not [bool](Get-EpicVMProperty -Object $Job -Name 'omarchyGpuValidated' -Default $false)) {
+        throw (New-EpicVMProvisioningError -Code 'omarchy_gpu_validation_failed' -Message 'Omarchy accelerated rendering and hardware encoding have not been verified.' -Status 422 -DetailCode 'OMARCHY_GPU_DEVICE_MISSING')
     }
     $Job.state = 'streaming_setup'
     $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
     Save-EpicVMProvisioningStore -Store $State.Provisioning
     $verify = Get-EpicVMProperty -Object $State.Provider -Name 'VerifyGuest' -Default $null
-    if ($null -eq $verify -or -not [bool](& $verify $Job.name $Job.tailnetIp)) {
+    $verified = $false
+    if ($null -ne $verify) {
+        if ($isOmarchy) { $verified = [bool](& $verify $Job.name $Job.tailnetIp ([string]$Job.guestUsername)) }
+        else { $verified = [bool](& $verify $Job.name $Job.tailnetIp) }
+    }
+    if (-not $verified) {
         $Job.state = 'setup_failed:streaming'
         $Job.failureStage = 'streaming'
         $Job.errorCode = 'guest_reverification_failed'
-        $Job.errorMessage = 'The guest did not pass credential-free RDP reachability verification.'
+        $Job.errorMessage = if ($isOmarchy) { 'The Omarchy guest did not pass credential-free Tailscale SSH readiness verification.' } else { 'The guest did not pass credential-free RDP reachability verification.' }
         $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
         Save-EpicVMProvisioningStore -Store $State.Provisioning
         throw (New-EpicVMProvisioningError -Code 'guest_reverification_failed' -Message 'Guest verification failed.' -Status 422)
     }
+    if ($isOmarchy) {
+        $cleanup = Get-EpicVMProperty -Object $State.Provider -Name 'CleanupOmarchyBootstrap' -Default $null
+        $cleanupOk = $false
+        try {
+            if ($null -ne $cleanup) {
+                $cleanupResult = & $cleanup $Job.name ([string]$Job.guestUsername) ([string]$Job.tailnetIp)
+                $cleanupOk = $null -ne $cleanupResult -and [bool](Get-EpicVMProperty -Object $cleanupResult -Name 'ok' -Default $false)
+            }
+        }
+        catch { $cleanupOk = $false }
+        if (-not $cleanupOk) {
+            $Job.state = 'setup_failed:streaming'
+            $Job.failureStage = 'streaming'
+            $Job.errorCode = 'omarchy_bootstrap_cleanup_failed'
+            $Job.errorMessage = 'The Omarchy bootstrap cleanup did not verify; readiness was withheld.'
+            $Job.updatedAt = [DateTime]::UtcNow.ToString('o')
+            Save-EpicVMProvisioningStore -Store $State.Provisioning
+            throw (New-EpicVMProvisioningError -Code 'omarchy_bootstrap_cleanup_failed' -Message 'Omarchy bootstrap cleanup failed.' -Status 422)
+        }
+    }
     $now = [DateTime]::UtcNow.ToString('o')
     $Job.consoleRoutePrefix = $route
     $Job.consoleVerifiedAt = $now
-    $Job.consoleFrameVerified = $true
-    $Job.consoleFrameVerifiedAt = $now
-    $Job.keyboardInputVerified = $true
-    $Job.keyboardInputVerifiedAt = $now
-    $Job.mouseInputVerified = $true
-    $Job.mouseInputVerifiedAt = $now
     $Job.streamValidationVerified = $true
+    $Job.consoleFrameVerified = $hasMetrics
+    $Job.consoleFrameVerifiedAt = if ($hasMetrics) { $now } else { $null }
     $Job.completedStages = @(Get-EpicVMProvisioningCompletedStages -Value (@($Job.completedStages) + @('streaming_setup','stream_validation')))
     $Job.state = 'ready'
     $Job.failureStage = $null

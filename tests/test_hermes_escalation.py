@@ -1,10 +1,12 @@
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
 
-APP_PATH = "/opt/blobe-vm/repo/dashboard/app.py"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+APP_PATH = Path(os.environ.get("EPICVM_APP_PATH") or REPO_ROOT / "dashboard" / "app.py")
 DASHBOARD_DIR = str(Path(APP_PATH).parent)
 
 
@@ -26,23 +28,18 @@ def test_escalation_uses_hermes_and_preserves_local_record(monkeypatch, tmp_path
     module = load_app(monkeypatch, tmp_path)
     calls = []
 
-    class Result:
-        returncode = 0
-        stdout = "Hermes recovery analysis complete"
-        stderr = ""
-
-    monkeypatch.setattr(module, "_vm_status_payload", lambda name: {"running": False, "state": "exited"})
+    monkeypatch.setattr(module, "_vm_status_payload", lambda name, **_kwargs: {"running": False, "state": "exited"})
     monkeypatch.setattr(module, "_tail_vm_logs", lambda name, lines: "docker log excerpt")
-    monkeypatch.setattr(module.subprocess, "run", lambda argv, **kwargs: calls.append((argv, kwargs)) or Result())
+    monkeypatch.setattr(module.subprocess, "run", lambda argv, **kwargs: calls.append((argv, kwargs)))
 
     result = module._escalate_vm_to_hermes("alpha", "VM did not start", {"recovery": {"recovered": False}})
 
     assert result["queued"] is True
-    assert result["cliError"] == ""
-    assert calls[0][0][0] == "hermes"
-    assert calls[0][0][1:4] == ["chat", "-q", calls[0][0][3]]
-    assert "alpha" in calls[0][0][3]
-    assert "terminal" in calls[0][0]
+    assert result["state"] == "queued"
+    assert result["statusPath"].endswith(".status.json")
+    assert calls == []
+    status = json.loads(open(result["statusPath"], encoding="utf-8").read())
+    assert status == {"state": "queued", "hostHandoff": True, "startedAt": result["payload"]["ts"]}
     assert result["path"]
     assert json.loads(open(result["path"], encoding="utf-8").read())["vm"] == "alpha"
 

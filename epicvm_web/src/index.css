@@ -268,7 +268,22 @@ body {
 .evm-stat.s-work { border-color: var(--yellow); } .evm-stat.s-work b { color: var(--yellow); }
 .evm-stat.s-off { border-color: #6b7280; }
 
-.evm-portal-loading { padding: 60px 20px; text-align: center; color: var(--muted); display: flex; gap: 12px; justify-content: center; align-items: center; }
+.evm-refreshing { display: inline-flex; align-items: center; gap: 7px; margin-top: 12px; color: var(--cyan); font-size: 12px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+.evm-loading-shell { max-width: var(--maxw); margin: 0 auto; width: 100%; padding-top: 20px; }
+.evm-loading-copy { margin: 0 clamp(16px, 4vw, 40px); padding: 16px 18px; display: flex; align-items: center; gap: 13px; background: rgba(11,24,32,.92); border: 1px solid #29404a; border-left: 4px solid var(--cyan); border-radius: 8px; color: var(--cream); }
+.evm-loading-copy > div { flex: 1; }
+.evm-loading-copy strong { display: block; font-size: 15px; }
+.evm-loading-copy p { margin: 3px 0 0; color: var(--muted); font-size: 13px; }
+.evm-loading-check { display: grid; place-items: center; width: 26px; height: 26px; flex: 0 0 26px; border-radius: 50%; background: var(--ok); color: #04210f; font-weight: 900; }
+.evm-skeleton-grid { padding-top: 18px; }
+.evm-skeleton-card { min-height: 260px; pointer-events: none; }
+.evm-skeleton-card > * { display: block; border-radius: 5px; background: linear-gradient(90deg, rgba(255,255,255,.06) 20%, rgba(255,255,255,.13) 45%, rgba(255,255,255,.06) 70%); background-size: 240% 100%; animation: evm-shimmer 1.35s ease-in-out infinite; }
+.evm-skeleton-card span { width: 42%; height: 24px; }
+.evm-skeleton-card b { width: 68%; height: 29px; margin-top: 25px; }
+.evm-skeleton-card i { width: 92%; height: 13px; margin-top: 15px; }
+.evm-skeleton-card i + i { width: 75%; margin-top: 9px; }
+.evm-skeleton-card em { width: 100%; height: 43px; margin-top: 48px; }
+@keyframes evm-shimmer { to { background-position: -240% 0; } }
 .evm-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px;
   padding: 24px clamp(16px, 4vw, 40px) 40px; max-width: var(--maxw); margin: 0 auto; width: 100%;
@@ -571,4 +586,488 @@ body {
 .evm-modal input:focus { outline: 2px solid rgba(2, 189, 243, .3); border-color: var(--cyan); }
 .evm-modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
 .evm-modal-actions .evm-btn { width: auto; padding-left: 18px; padding-right: 18px; }
+
+/* ============================================================
+   EPICVM UNIFIED UI
+   Landing and portal now share the restrained management/dashboard
+   language: flat navy surfaces, cyan actions, quiet borders, and a
+   compact operational rhythm.
+   ============================================================ */
+.evm-landing,
+.evm-portal,
+.evm-auth-page {
+  --surface: #0a161e;
+  --surface-raised: #0b1923;
+  --surface-input: #050f16;
+  --surface-hover: #102530;
+  --ui-border: #21323d;
+  --ui-border-strong: #324855;
+  --ui-copy: #e4edf2;
+  --ui-muted: #a7b9c6;
+  --ui-accent: #02bdf3;
+  --ui-accent-hover: #4ad1f5;
+  background: #050d12;
+  color: var(--ui-copy);
+}
+
+.evm-landing::before,
+.evm-portal::before { display: none; }
+
+.evm-landing .evm-nav,
+.evm-portal-head {
+  min-height: 66px;
+  padding: 14px max(24px, calc((100vw - 1200px) / 2 + 32px));
+  border: 0;
+  border-bottom: 1px solid #20303b;
+  background: rgba(5, 13, 18, .94);
+  backdrop-filter: blur(14px);
+}
+
+.evm-landing .evm-brand,
+.evm-portal .evm-brand,
+.evm-auth-page .evm-brand { color: #fff; font-size: 17px; }
+
+.evm-landing .evm-brand-mark,
+.evm-portal .evm-brand-mark,
+.evm-auth-page .evm-brand-mark,
+.evm-landing .evm-footer .evm-brand-mark {
+  width: 30px;
+  height: 30px;
+  border: 2px solid var(--ui-accent);
+  border-radius: 0;
+  background: transparent;
+  color: var(--ui-accent);
+  box-shadow: none;
+}
+
+.evm-landing .evm-brand-mark.sm { width: 26px; height: 26px; }
+.evm-nav-links a { color: #acbecb; font-size: 13px; font-weight: 500; }
+.evm-nav-links a:hover { color: var(--ui-accent); }
+.evm-who { color: var(--ui-muted); font-size: 13px; font-weight: 600; }
+.evm-beta-pill,
+.evm-landing .evm-pill {
+  border: 0;
+  border-radius: 4px;
+  padding: 5px 9px;
+  background: #18313d;
+  color: #8cdff5;
+  box-shadow: none;
+  transform: none;
+  letter-spacing: .12em;
+}
+
+.evm-landing .evm-btn,
+.evm-portal .evm-btn,
+.evm-auth-page .evm-btn {
+  min-height: 40px;
+  border: 1px solid #345362;
+  border-radius: 6px;
+  background: #132833;
+  color: #e0f1f8;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: none;
+  transform: none;
+}
+.evm-landing .evm-btn:hover,
+.evm-portal .evm-btn:hover,
+.evm-auth-page .evm-btn:hover { background: #203c4b; transform: none; }
+.evm-landing .evm-btn-primary,
+.evm-portal .evm-btn-primary,
+.evm-auth-page .evm-btn-primary {
+  border-color: var(--ui-accent);
+  background: var(--ui-accent);
+  color: #011b25;
+}
+.evm-landing .evm-btn-primary:hover,
+.evm-portal .evm-btn-primary:hover,
+.evm-auth-page .evm-btn-primary:hover { background: var(--ui-accent-hover); }
+.evm-landing .evm-btn-lg { padding: 11px 18px; font-size: 14px; }
+
+.evm-auth-page {
+  min-height: 100vh;
+  background: #050d12;
+}
+.evm-auth-page .evm-portal-head {
+  border-bottom: 1px solid #20303b;
+  background: rgba(5, 13, 18, .94);
+}
+.evm-auth-page .evm-brand-btn {
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #fff;
+}
+.evm-auth-page .evm-brand-btn:hover { background: transparent; color: var(--ui-accent); }
+.evm-auth-page .evm-link-btn {
+  color: #acbecb;
+  font-size: 13px;
+  font-weight: 500;
+  opacity: 1;
+}
+.evm-auth-page .evm-link-btn:hover { color: var(--ui-accent); }
+.evm-auth-page .evm-auth-wrap {
+  align-items: flex-start;
+  padding: clamp(44px, 8vh, 82px) 20px 56px;
+}
+.evm-auth-page .evm-auth-card {
+  width: min(500px, 100%);
+  padding: 32px;
+  border: 1px solid var(--ui-border);
+  border-top: 3px solid var(--ui-accent);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 24px 60px rgba(0,0,0,.24);
+}
+.evm-auth-page .evm-auth-card::before {
+  content: 'EPICVM ACCOUNT';
+  display: block;
+  margin-bottom: 10px;
+  color: #29c9ec;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 2px;
+}
+.evm-auth-page .evm-h1.sm {
+  margin: 0 0 10px;
+  color: #fff;
+  font-size: 34px;
+  font-weight: 600;
+  letter-spacing: -.035em;
+}
+.evm-auth-page .evm-body {
+  margin: 0 0 24px;
+  color: var(--ui-muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+.evm-auth-page .evm-form { gap: 17px; margin-top: 0; }
+.evm-auth-page .evm-form label {
+  gap: 8px;
+  color: #d1dee7;
+  font-size: 13px;
+  font-weight: 600;
+}
+.evm-auth-page .evm-opt { color: #78909d; font-weight: 500; }
+.evm-auth-page .evm-input {
+  min-height: 46px;
+  padding: 0 12px;
+  border: 1px solid var(--ui-border-strong);
+  border-radius: 6px;
+  background: var(--surface-input);
+  color: var(--ui-copy);
+}
+.evm-auth-page .evm-input:focus-within {
+  border-color: #34c8f4;
+  box-shadow: 0 0 0 3px rgba(52,200,244,.12);
+}
+.evm-auth-page .evm-input input { color: var(--ui-copy); padding: 12px 0; }
+.evm-auth-page .evm-input input::placeholder { color: #667f8e; }
+.evm-auth-page .evm-input svg { color: #53cdec; }
+.evm-auth-page .evm-form > .evm-btn { width: 100%; margin-top: 2px; }
+.evm-auth-page .evm-error {
+  border: 1px solid #68333e;
+  border-radius: 6px;
+  background: #321922;
+  color: #ffc1c9;
+}
+.evm-auth-page .evm-warn {
+  border: 1px solid #66572d;
+  border-radius: 6px;
+  background: #2a2516;
+  color: #e4c37a;
+}
+.evm-auth-page .evm-switch {
+  margin: 22px 0 0;
+  padding-top: 20px;
+  border-top: 1px solid var(--ui-border);
+  color: var(--ui-muted);
+  font-size: 13px;
+}
+.evm-auth-page .evm-switch a { color: #43c9ee; font-weight: 600; }
+
+.evm-landing .evm-hero {
+  padding: clamp(58px, 8vw, 104px) 32px clamp(44px, 7vw, 80px);
+  border-bottom: 1px solid rgba(32, 48, 59, .65);
+  background: radial-gradient(circle at 75% 20%, rgba(2,189,243,.075), transparent 34%);
+}
+.evm-landing .evm-hero-inner { gap: clamp(36px, 7vw, 88px); }
+.evm-landing .evm-hero-copy { max-width: 560px; }
+.evm-landing .evm-h1 {
+  margin-top: 14px;
+  color: #fff;
+  font-size: clamp(48px, 7.5vw, 82px);
+  font-weight: 600;
+  line-height: .98;
+  letter-spacing: -.055em;
+  text-shadow: none;
+  transform: none;
+}
+.evm-landing .evm-lead { color: var(--ui-muted); line-height: 1.65; }
+.evm-landing .evm-hero-cta { justify-content: flex-start; margin-bottom: 0; }
+.evm-landing .evm-window {
+  width: min(410px, 92vw);
+  border: 1px solid var(--ui-border);
+  border-top: 3px solid var(--ui-accent);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 24px 60px rgba(0,0,0,.28);
+  animation: none;
+}
+.evm-landing .evm-window-bar { background: #08141b; border-color: var(--ui-border); }
+.evm-landing .evm-window-bar i { background: #345362; }
+.evm-landing .evm-window-bar i:first-child { background: var(--ui-accent); }
+.evm-landing .evm-window-body,
+.evm-landing .evm-vm-card { background: var(--surface); }
+.evm-landing .evm-vm-card { border: 1px solid #263b48; border-radius: 8px; color: var(--ui-copy); }
+.evm-landing .evm-vm-state { border-radius: 4px; }
+
+.evm-landing .evm-section { padding: clamp(38px, 5vw, 58px) 32px; }
+.evm-landing .evm-h2 {
+  padding-left: 0;
+  color: #fff;
+  font-size: clamp(28px, 3.5vw, 38px);
+  font-weight: 600;
+  letter-spacing: -.035em;
+}
+.evm-landing .evm-h2::before { display: none; }
+.evm-landing .evm-body,
+.evm-landing .evm-note { color: var(--ui-muted); }
+.evm-landing .evm-step,
+.evm-landing .evm-type,
+.evm-landing .evm-feature,
+.evm-landing .evm-faq-item {
+  border: 1px solid var(--ui-border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ui-copy);
+  box-shadow: none;
+  transform: none;
+}
+.evm-landing .evm-step:hover,
+.evm-landing .evm-type:hover,
+.evm-landing .evm-feature:hover {
+  border-color: #345362;
+  background: var(--surface-raised);
+  box-shadow: none;
+  transform: translateY(-2px);
+}
+.evm-landing .evm-step-n {
+  border-radius: 6px;
+  background: #102c3a;
+  color: var(--ui-accent);
+  box-shadow: none;
+  transform: none;
+}
+.evm-landing .evm-feature-ic {
+  border: 1px solid #28536a;
+  border-radius: 7px;
+  background: #102c3a;
+  color: var(--ui-accent);
+}
+.evm-landing .evm-type-label { border-radius: 4px; }
+.evm-landing .evm-beta,
+.evm-landing .evm-free {
+  border: 1px solid var(--ui-border);
+  border-left: 3px solid var(--ui-accent);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: none;
+}
+.evm-landing .evm-footer {
+  max-width: 1200px;
+  width: 100%;
+  margin: auto auto 0;
+  padding: 24px 32px;
+  border-top: 1px solid #20303b;
+  color: #748e9e;
+}
+
+.evm-portal-head { border-bottom-color: #20303b; }
+.evm-hero2 {
+  align-items: flex-end;
+  padding: 48px 32px 26px;
+}
+.evm-hero2-main::before {
+  content: 'YOUR WORKSPACE';
+  display: block;
+  margin-bottom: 10px;
+  color: #29c9ec;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 2px;
+}
+.evm-hero2-title {
+  color: #fff;
+  font-size: clamp(34px, 5vw, 48px);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -.045em;
+  text-shadow: none;
+  transform: none;
+}
+.evm-hero2-title br { display: none; }
+.evm-hero2-sub { color: var(--ui-muted); font-size: 15px; }
+.evm-summary { gap: 10px; }
+.evm-stat {
+  min-width: 88px;
+  padding: 12px 14px;
+  border: 1px solid var(--ui-border);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: none;
+  transform: none;
+}
+.evm-stat b { color: var(--ui-copy); font-size: 24px; font-weight: 600; }
+.evm-stat span { color: #8da8b7; font-size: 10px; }
+.evm-stat.s-ready { border-color: #285c48; }
+.evm-stat.s-work { border-color: #66572d; }
+
+.evm-portal .evm-grid { gap: 16px; padding: 18px 32px 48px; }
+.evm-portal .evm-shared-games {
+  width: calc(100% - 64px);
+  max-width: var(--maxw);
+  border-color: var(--ui-border);
+  background: var(--surface);
+}
+.evm-portal .evm-shared-games > summary { gap: 12px; }
+.evm-portal .evm-shared-games > summary small { color: #8da8b7; font-weight: 500; }
+.evm-portal .evm-shared-games { padding: 0; overflow: hidden; }
+.evm-portal .evm-shared-games > summary { padding: 19px 22px; color: #fff; cursor: pointer; font-size: 19px; font-weight: 600; list-style: none; }
+.evm-portal .evm-shared-games > summary::-webkit-details-marker { display: none; }
+.evm-portal .evm-shared-games > summary::after { content: '+'; color: #43c9ee; font-size: 24px; line-height: 1; }
+.evm-portal .evm-shared-games[open] > summary::after { content: '−'; }
+.evm-portal .evm-shared-games[open] > summary { border-bottom: 1px solid #21323d; }
+.evm-library-body { padding: 22px; }
+.evm-library-group { margin-bottom: 22px; }
+.evm-library-group > h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
+.evm-library-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.evm-library-card { min-width: 0; display: flex; flex-direction: column; padding: 20px; border: 1px solid #263b48; border-radius: 9px; background: #08151d; }
+.evm-library-desktop { border-color: #285166; background: linear-gradient(145deg, #102a38, #0a1b25 70%); }
+.evm-library-card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 18px; }
+.evm-library-icon { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 9px; background: #18313d; color: #8cdff5; }
+.evm-library-status { padding: 5px 8px; border-radius: 4px; background: #402029; color: #ffc1c9; font-size: 11px; font-weight: 700; letter-spacing: .04em; white-space: nowrap; }
+.evm-library-status.is-ready { background: #16362e; color: #98edbd; }
+.evm-library-status.is-empty { background: #1a2831; color: #9fb0b8; }
+.evm-library-card h3, .evm-library-card h4 { margin: 0; color: #fff; font-size: 19px; font-weight: 600; line-height: 1.25; overflow-wrap: anywhere; }
+.evm-library-card p { margin: 9px 0 18px; color: #a7b9c6; font-size: 13px; line-height: 1.5; }
+.evm-library-technical { margin-top: 5px; color: #7893a2; font-size: 11px; overflow-wrap: anywhere; }
+.evm-library-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: auto; }
+.evm-library-button, .evm-library-button-secondary { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; padding: 9px 14px; border-radius: 6px; font: inherit; font-size: 13px; font-weight: 600; text-decoration: none; cursor: pointer; }
+.evm-library-button { width: fit-content; margin-top: auto; border: 1px solid #03b4e5; background: #03b4e5; color: #011b25; }
+.evm-library-button:hover { background: #4ad1f5; color: #011b25; }
+.evm-library-button-secondary { border: 1px solid #345362; background: #132833; color: #e0f1f8; }
+.evm-library-button-secondary:hover { background: #203c4b; }
+.evm-library-button:disabled, .evm-library-button-secondary:disabled { opacity: .5; cursor: not-allowed; }
+.evm-library-games { margin-top: auto; border-top: 1px solid #263b48; }
+.evm-library-game { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; font-size: 13px; }
+.evm-library-game + .evm-library-game { border-top: 1px solid #20303b; }
+.evm-library-game a { display: inline-flex; align-items: center; gap: 5px; color: #43c9ee; white-space: nowrap; }
+.evm-library-note { margin-top: auto !important; color: #8da8b7 !important; }
+.evm-library-empty { color: #8da8b7; margin: 0; }
+.evm-library-error { color: #ffc1c9; margin: 0 0 16px; }
+@media (max-width: 760px) { .evm-library-grid { grid-template-columns: 1fr; } .evm-library-body { padding: 16px; } .evm-portal .evm-shared-games > summary { padding: 16px; font-size: 16px; } .evm-portal .evm-shared-games > summary small { font-size: 11px; } }
+.evm-portal .evm-card {
+  min-height: 0;
+  padding: 22px;
+  border: 1px solid var(--ui-border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: none;
+  clip-path: none;
+}
+.evm-portal .evm-card:hover {
+  border-color: #345362;
+  background: var(--surface-raised);
+  box-shadow: none;
+  transform: translateY(-2px);
+}
+.evm-portal .evm-type-tag,
+.evm-portal .evm-rbadge {
+  border: 0;
+  border-radius: 4px;
+  padding: 5px 8px;
+  box-shadow: none;
+  transform: none;
+  letter-spacing: .08em;
+}
+.evm-portal .evm-type-tag { background: #18313d; color: #8cdff5; }
+.evm-portal .evm-type-tag.t-windows { background: #102c3a; color: #8cdff5; }
+.evm-portal .evm-type-tag.t-gaming,
+.evm-portal .evm-type-tag.t-cloudpc { background: #342d1c; color: #e4c37a; }
+.evm-portal .rb-ready { background: #16362e; color: #98edbd; }
+.evm-portal .rb-work { background: #342d1c; color: #e4c37a; }
+.evm-portal .rb-off { background: #1a2831; color: #9fb0b8; }
+.evm-portal .rb-bad { background: #402029; color: #ffc1c9; }
+.evm-portal .evm-card-name { color: #fff; font-size: 22px; font-weight: 600; }
+.evm-portal .evm-card-os,
+.evm-portal .evm-card-desc { color: var(--ui-muted); }
+.evm-portal .evm-card-meta span {
+  border: 1px solid #263b48;
+  border-radius: 5px;
+  background: #08151d;
+  color: #cddfe9;
+}
+.evm-portal .evm-add-card {
+  border: 1px dashed #345362;
+  border-radius: 10px;
+  background: #08151d;
+}
+.evm-portal .evm-add-card:hover { border-color: var(--ui-accent); box-shadow: none; }
+.evm-portal .evm-empty { border: 1px dashed #2a414f; border-radius: 8px; }
+.evm-portal .evm-loading-copy {
+  border: 1px solid #285c48;
+  border-left: 3px solid #37d67a;
+  background: #102f26;
+  color: #b8efce;
+}
+.evm-portal .evm-modal {
+  border: 1px solid var(--ui-border);
+  border-top: 3px solid var(--ui-accent);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.evm-portal .evm-modal input {
+  border-color: var(--ui-border-strong);
+  border-radius: 6px;
+  background: var(--surface-input);
+}
+.evm-portal-foot {
+  max-width: 1200px;
+  width: 100%;
+  margin: auto auto 0;
+  padding: 24px 32px;
+  border-top: 1px solid #20303b;
+  color: #748e9e;
+}
+.evm-portal-foot a { color: #43c9ee; }
+
+@media (max-width: 760px) {
+  .evm-landing .evm-nav,
+  .evm-portal-head { padding: 14px 20px; }
+  .evm-auth-page .evm-portal-head { align-items: center; flex-wrap: nowrap; }
+  .evm-auth-page .evm-ph-right { width: auto; margin-left: auto; }
+  .evm-auth-page .evm-auth-wrap { padding: 28px 16px 40px; }
+  .evm-auth-page .evm-auth-card { padding: 24px 20px; }
+  .evm-landing .evm-nav { flex-wrap: wrap; }
+  .evm-landing .evm-nav-actions { width: 100%; margin-left: 0; }
+  .evm-landing .evm-nav-actions .evm-btn { flex: 1 1 0; min-width: 0; padding-inline: 8px; }
+  .evm-landing .evm-hero { padding: 48px 20px 42px; }
+  .evm-landing .evm-hero-inner { align-items: stretch; }
+  .evm-landing .evm-hero-copy { min-width: 0; text-align: left; }
+  .evm-landing .evm-h1 { font-size: clamp(46px, 15vw, 64px); }
+  .evm-landing .evm-lead { margin-left: 0; }
+  .evm-landing .evm-hero-cta { justify-content: flex-start; }
+  .evm-landing .evm-section { padding: 34px 20px; }
+  .evm-hero2 { padding: 34px 20px 22px; }
+  .evm-hero2-title { font-size: 38px; }
+  .evm-summary { display: grid; grid-template-columns: repeat(2, 1fr); }
+  .evm-stat { min-width: 0; }
+  .evm-portal .evm-grid { padding: 16px 20px 38px; }
+  .evm-portal .evm-shared-games { width: calc(100% - 40px); }
+  .evm-ph-right { width: 100%; flex-wrap: wrap; }
+  .evm-who { margin-right: auto; }
+}
 

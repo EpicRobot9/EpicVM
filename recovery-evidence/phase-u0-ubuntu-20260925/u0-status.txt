@@ -1,0 +1,59 @@
+PHASE U0 - UBUNTU TEMPLATE BUILDER - 2026-09-25
+==============================================
+
+CONTEXT
+  Phase A (Windows repair) produced a fully diagnosed but intentionally deferred
+  defect: the host stores one secret (bootstrap.dpapi) that must match a secret
+  baked into the published template, and the two have drifted apart. Epic elected
+  to hold Windows and make the first agent pass Linux. The Windows diagnosis is
+  preserved in recovery-evidence/phase-a-preflight-20260925/ and the legacy
+  win11-25h2 template has been restored to E:\EpicVM\templates\win11-25h2 so
+  provisioning is not left with an empty template directory.
+
+ROADMAP CHANGE
+  docs/plans/2026-09-25-epicvm-phased-roadmap.md phase map re-sequenced to
+  U0, U1, 2..8 with the rationale recorded in-document.
+
+DELIVERABLE: scripts/Build-EpicVMUbuntuTemplate.ps1 (426 lines, parses clean)
+  Plan-only unless -Execute, mirroring scripts/Build-EpicVMOmarchyTemplate.ps1.
+
+  Design decisions, and why they matter:
+  - No host-side shared password. bootstrap = 'per-vm-ssh-keypair'. This is the
+    whole point: it removes the credential-drift class that broke Windows.
+  - cloud-init NoCloud autoinstall, not a DISM+unattend flow. No OOBE, no
+    unattend passes, no sysprep, no 'Install Windows' abort dialog.
+  - agent user 'epicvm', NOPASSWD sudo, lock_passwd true, key-only SSH.
+  - PasswordAuthentication no, PermitRootLogin no, verified with 'sshd -t' inside
+    late-commands so the install FAILS rather than publishing a weak sshd config.
+  - Tailscale installed from the pinned pk.tailscale.com repo; NodeSource 22.x.
+  - No Docker in v1. No GPU partition. consoleBackend = 'none'.
+  - SecureBoot ON (Ubuntu supports it; the Omarchy profile requires it off).
+  - Gen2 UEFI, vTPM off, dynamic VHD, fullCopy, immutable, noGuestSecrets.
+  - Reuses the cidata seed-disk shape already proven in the codebase
+    (New-EpicVMOmarchySeedDisk, OmarchyProvider.ps1:447).
+  - The Omarchy seed was found to be archinstall-shaped, NOT cloud-init, so a real
+    cloud-init generator was written rather than reusing it.
+
+PINNED
+  Ubuntu Server 24.04.3 live-server-amd64.iso
+  sha256 c3514bf0056180d09376462a7a1b4f213c1d6e8ea67fae5c25099c6fd3d8274b
+  (fetched live from https://releases.ubuntu.com/24.04.3/SHA256SUMS)
+
+VERIFIED SO FAR
+  - All three PowerShell files parse clean.
+  - Plan-only run produces a correct report and correctly REFUSES to build while
+    the ISO is absent (isoPresent False, isoHashMatches False, error plan_only).
+  - One real strict-mode bug was found by running it and fixed:
+    .isoActualSha256 threw 'property cannot be found' under
+    Set-StrictMode -Version Latest when the ISO is absent. Now uses
+    .Contains(...) / indexer.
+  - [int] vs [long] overflow class of bug was already learned from the Windows
+    clean-source run; MemoryBytes/DiskSizeBytes are declared [long] here.
+
+NOT YET DONE
+  - ISO download + hash verification.
+  - -Execute build (disposable Gen2 builder, unattended install, sanitize, export).
+  - Sanitize/export/publish stages are NOT implemented yet. The builder currently
+    stops deliberately after the install starts and reports
+    install_started_manual_sanitization_required. Completing the builder is the
+    next piece of work; publishing is deliberately gated on a proven install.

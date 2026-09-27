@@ -30,6 +30,12 @@ NEW = 'for(;r=this.controlStream.pollPacket();){if(!this.channel||"open"!=this.c
 # call is inserted at the start of the method body (valid class-body syntax).
 WATCHDOG_ANCHOR = 'onUserInteraction(){this.videoElement.paused&&this.videoElement.play()'
 WATCHDOG_PATCHED = 'onUserInteraction(){epicvmArmFrameWatchdog(this);this.videoElement.paused&&this.videoElement.play()'
+WATCHDOG_RETRY = (
+    'if(window.__epicvmStreamReloaded)return;window.__epicvmStreamReloaded=!0;'
+    'const epicvmRetry=window.parent&&window.parent.__epicvmCancelAndRetry;'
+    'if(epicvmRetry){epicvmRetry().then(ok=>{if(ok)window.location.reload()}).catch(()=>{})}'
+    'else window.location.reload();'
+)
 WATCHDOG_SOURCE = (
     'function epicvmArmFrameWatchdog(sink){'
     'if(sink.__epicvmWatchdog)return;sink.__epicvmWatchdog=!0;'
@@ -42,10 +48,9 @@ WATCHDOG_SOURCE = (
     'if(Date.now()-started<20000)return;'
     'clearInterval(timer);'
     'if(window.__epicvmStreamReloaded){console.warn("epicvm stream watchdog: first frame still missing after one reload; leaving session for orchestrator recovery");return}'
-    'window.__epicvmStreamReloaded=!0;'
     'console.warn("epicvm stream watchdog: no first video frame; reloading once for a fresh stream");'
-    'window.location.reload();'
-    '}catch(e){clearInterval(timer)}'
+    + WATCHDOG_RETRY
+    + '}catch(e){clearInterval(timer)}'
     '},1000);'
     '};'
 )
@@ -65,16 +70,19 @@ AUTO_WATCHDOG_SOURCE = (
     'setInterval(()=>{'
     'try{'
     'const v=document.querySelector("video");'
-    'if(!v||!v.videoWidth){lastChange=Date.now();return}'
+    'let retry=false;'
+    'if(!v||!v.videoWidth){if(Date.now()-lastChange<20000)return;lastChange=Date.now();console.warn("epicvm auto-watchdog: no video element; retrying fresh session");retry=true'
+    + '}else{'
     'const q=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():null;'
     'const f=q?q.totalVideoFrames:(v.webkitDecodedFrameCount||0);'
     'if(f!==lastFrames){lastFrames=f;lastChange=Date.now();return}'
     'if(Date.now()-lastChange<20000)return;'
-    'if(window.__epicvmStreamReloaded){console.warn("epicvm auto-watchdog: still stalled after reload; leaving session for orchestrator recovery");return}'
-    'window.__epicvmStreamReloaded=!0;'
-    'console.warn("epicvm auto-watchdog: stream stalled; reloading once for a fresh session");'
-    'window.location.reload();'
-    '}catch(e){}'
+    'console.warn("epicvm auto-watchdog: stream stalled; reloading once for a fresh session");retry=true'
+    '}'
+    'if(retry){'
+    + WATCHDOG_RETRY
+    + '}'
+    + '}catch(e){}'
     '},1000);'
     '};'
     'window.epicvmInstallAutoWatchdog();'

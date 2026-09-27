@@ -1,0 +1,94 @@
+CLEAN SOURCE REBUILD - STATUS 2026-09-25 16:20
+==============================================
+
+GOAL: build a clean source with a KNOWN EpicVMBootstrap password so the template
+and bootstrap.dpapi stop drifting apart.
+
+LEGACY TEMPLATE RESTORED (unblocks provisioning)
+  E:\EpicVM\templates\win11-25h2-prev-phasea-20260925-151006
+    -> moved back to E:\EpicVM\templates\win11-25h2
+  manifest name=win11-25h2 templateVersion=1.2.0 build=win11-25h2-20260826
+  image exists=True size=17.47GB
+  sha256 expected=e1d11c8af5c387cc3d1f0475681a2a4bac9f661e68313a42d307ff678c4670cc
+  (hash not recomputed this pass; unchanged on disk since it was verified
+   byte-identical after the earlier Option B attempt)
+  NOTE: this template still carries the ORIGINAL defect. It is restored so
+  provisioning is not left with an empty template directory, NOT because it works.
+
+CLEAN SOURCE: BUILT TWICE, ACCOUNT STILL NOT PROVEN
+  Build 1 (15:14-15:19): created, registered. Bug found and fixed during the run:
+    '[int] = 8583934592' overflowed Int32 -> changed to [long].
+  Build 1 auth test: 'The credential is invalid.' (x4 username variants)
+    CAUSE: my own script deleted Panther\unattend.xml in stage 4 BEFORE the VM ever
+    booted. Setup had nothing to read. My comment said 'first boot applies the
+    unattend' while the file it needed was already gone.
+
+  Build 2 (15:31-15:35): rebuilt with the unattend RETAINED and a specialize
+    Microsoft-Windows-Deployment RunSynchronous block added:
+      net user <user> <password> /add
+      net localgroup Administrators <user> /add
+    (a duplicate of that block was accidentally inserted into oobeSystem and was
+     removed before the rebuild; verified by parse + grep)
+
+  Build 2 boot: Windows Setup DID run and succeeded:
+    InstallWindows:Exiting with return code [0x0]
+    InstallWindows:First boot phase of setup done!!!!
+    Callback_Specialize: Specialize return: [0]
+    UnattendSearchExplicitPath: Found usable unattend file for pass [specialize]
+  Console showed: 'Install Windows - Windows could not complete the installation.
+  To install Windows on this computer, restart the installation.'
+  setuperr.log contained exactly one line: '[setup.exe] System disks found'
+    (a known benign entry; the pass returned 0x0)
+
+  Build 2 auth test: 'A remote session might have ended' (session opened, dropped)
+    Heartbeat='No Contact' and never recovered across 13+ minutes.
+
+WHY THE RunSynchronous ACCOUNT WAS NOT CREATED (proven from the image)
+  Windows\Panther\actionqueue\specialize.uaq was generated and processed, but its
+  contents are ONLY two actions:
+     SETUPUGC.EXE  (identity Microsoft-Windows-Deployment)
+     RUNDLL32.EXE shsetup.dll,SHUnattendedSetup
+  A direct string search of that queue for 'net user' returns: DOES NOT CONTAIN.
+  The log shows SETUPUGC.EXE was 'Executing', but no RunSynchronousCommand
+  execution line exists anywhere in setupact.log, and the oobeSystem pass never
+  appears in the log at all.
+  => the specialize pass consumed the unattend file but the RunSynchronous
+     commands were never expanded or executed. The account was never created.
+  The 'session might have ended' error is consistent with PowerShell Direct
+  reaching a guest that is still in Setup (Heartbeat 'No Contact'), not a
+  working OS with a bad password.
+
+SUPPORTING FACT: a DISM-applied image has no SetupComplete marker, so Windows
+Setup re-runs on EVERY boot until something marks installation complete. The
+leftover unattend.xml on the OS volume is re-read on each boot, which is why the
+'Install Windows' dialog reappeared. Removing the unattend after first boot is
+necessary but was NOT sufficient, because the account is still missing.
+
+CONCLUSION
+  The unattend-only approach has now failed twice for two different reasons
+  (file deleted too early; RunSynchronous never expanded). The gap is that a
+  DISM-applied image still needs a normal first-boot OOBE completion before it is
+  a usable, credential-reachable OS. A DISM+unattend build cannot skip that by
+  itself.
+
+NEXT STEP (NOT YET DONE - needs Epic's go-ahead)
+  The reliable sequence is:
+    1. Boot the applied image and complete first-boot OOBE once, creating a
+       known Administrator password (this is the interactive step).
+    2. Over PowerShell Direct as that Administrator, create EpicVMBootstrap with
+       the chosen password and add it to Administrators.
+    3. Remove Panther\unattend.xml, run sysprep /generalize /shutdown.
+    4. Re-apply the known password to the template via TemplateBuilder's
+       sanitizer so bootstrap.dpapi and the image agree.
+  Step 1 needs a human at the VM console, which is why it was not attempted
+  unattended.
+
+STATE
+  EpicVM provisioning: template directory restored, so creation is not blocked
+    by a missing template. It still cannot succeed, because the restored
+    template has the original bootstrap-credential defect.
+  bootstrap.dpapi: UNCHANGED (still the 4-char value).
+  Observability fix: in repo, parse-verified, NOT deployed.
+  Preserved for rollback:
+    clean source v1 : E:\EpicVM\clean-template-source-QUARANTINED-20260925-151006
+    clean source v2 : E:\EpicVM\clean-template-source (new, account not created)

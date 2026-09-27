@@ -799,37 +799,76 @@ function Get-EpicVMGuestBootstrapReadinessScript {
 }
 
 function Test-EpicVMGuestBootstrapReady {
+    <#
+        Returns $true only when PowerShell Direct authenticates with the stored
+        bootstrap credential and the guest answers the readiness script.
+
+        A failure is classified, not swallowed. A rejected credential, an unhealthy
+        guest, and a slow boot are different operator problems, and collapsing them
+        into a bare $false made a template/credential mismatch indistinguishable from
+        a normal first boot. The classified code travels back to the caller so the
+        job record and the API surface can name the actual cause.
+
+        $Classification may be supplied by the caller to receive the code without
+        handling an exception.
+    #>
     param(
         [Parameter(Mandatory)][object]$Provider,
         [Parameter(Mandatory)][object]$Config,
-        [Parameter(Mandatory)][string]$VmName
+        [Parameter(Mandatory)][string]$VmName,
+        [AllowNull()][ref]$Classification
     )
     $credential=$null
-    $directCredential=$null
     try {
         $loader=Get-EpicVMHyperVValue -Object $Provider -Name 'BootstrapCredentialLoader' -Default $null
         $path=[string](Get-EpicVMHyperVValue -Object $Config -Name 'BootstrapCredentialPath' -Default 'C:\ProgramData\EpicVM\agent\bootstrap.dpapi')
         $user=[string](Get-EpicVMHyperVValue -Object $Config -Name 'BootstrapUser' -Default 'EpicVMBootstrap')
-        $credential=if($null -ne $loader){& $loader $path $user}else{Get-EpicVMBootstrapCredential -Path $path -Username $user}
+        try {
+            $credential=if($null -ne $loader){& $loader $path $user}else{Get-EpicVMBootstrapCredential -Path $path -Username $user}
+        } catch {
+            # The stored secret itself is unreadable. Never a boot-timing problem.
+            if($null -ne $Classification){$Classification.Value='bootstrap_credential_unavailable'}
+            return $false
+        }
         $result=Invoke-EpicVMPowerShellDirect -Provider $Provider -VmName $VmName -Credential $credential -Script (Get-EpicVMGuestBootstrapReadinessScript)
-        return [bool](Get-EpicVMHyperVValue -Object $result -Name 'ok' -Default $false)
-    } catch { return $false }
+        $ok=[bool](Get-EpicVMHyperVValue -Object $result -Name 'ok' -Default $false)
+        if($null -ne $Classification){$Classification.Value=$(if($ok){'ready'}else{'guest_readiness_script_incomplete'})}
+        return $ok
+    }
+    catch {
+        $code=Get-EpicVMPowerShellDirectFailureCode -ErrorRecord $_ -Phase 'open' -SessionCreated $false
+        if($null -ne $Classification){$Classification.Value=[string]$code}
+        return $false
+    }
     finally { $credential=$null }
 }
 
 function Wait-EpicVMGuestBootstrapReady {
+    <#
+        Polls the bootstrap gate until it passes or the window closes. The last
+        observed classification is returned in $Classification so the caller can
+        report why the guest never became ready, instead of a bare false.
+    #>
     param(
         [Parameter(Mandatory)][object]$Provider,
         [Parameter(Mandatory)][object]$Config,
         [Parameter(Mandatory)][string]$VmName,
         [int]$TimeoutSeconds=180,
-        [int]$PollMilliseconds=1000
+        [int]$PollMilliseconds=1000,
+        [AllowNull()][ref]$Classification
     )
     $deadline=[DateTime]::UtcNow.AddSeconds([Math]::Max(1,$TimeoutSeconds))
+    $last='bootstrap_not_attempted'
     do {
-        if(Test-EpicVMGuestBootstrapReady -Provider $Provider -Config $Config -VmName $VmName){ return $true }
+        $probe=$null
+        if(Test-EpicVMGuestBootstrapReady -Provider $Provider -Config $Config -VmName $VmName -Classification ([ref]$probe)){
+            if($null -ne $Classification){$Classification.Value='ready'}
+            return $true
+        }
+        if(-not [string]::IsNullOrWhiteSpace([string]$probe)){ $last=[string]$probe }
         if([DateTime]::UtcNow -lt $deadline){ Start-Sleep -Milliseconds ([Math]::Max(100,$PollMilliseconds)) }
     } while([DateTime]::UtcNow -lt $deadline)
+    if($null -ne $Classification){$Classification.Value=$last}
     return $false
 }
 
@@ -1287,7 +1326,10 @@ function Get-EpicVMGamingSunshineCaptureScript {
         # persistent virtual display instead of waiting for a hardware match.
         $nefconc=@(Get-ChildItem -LiteralPath $nefconHome -Recurse -Filter 'nefconc.exe' | Where-Object { $_.DirectoryName -match 'x64' } | Select-Object -First 1)
         if($nefconc.Count -eq 0){$nefconc=@(Get-ChildItem -LiteralPath $nefconHome -Recurse -Filter 'nefconc.exe' | Select-Object -First 1)}
-        if($nefconc.Count -gt 0){
+        $existingVdd=@(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object {
+            $_.InstanceId -like 'ROOT\MTTVDD*' -or ($_.InstanceId -like 'ROOT\DISPLAY\*' -and $_.FriendlyName -match 'Virtual Display')
+        })
+        if($nefconc.Count -gt 0 -and $existingVdd.Count -eq 0){
             & $nefconc[0].FullName --create-device-node --hardware-id 'Root\MttVDD' --class-name Display --class-guid '{4d36e968-e325-11ce-bfc1-08002be10318}' 2>&1 | Out-Null
         }
         $pnputilExit=-1
@@ -1320,7 +1362,7 @@ function Get-EpicVMGamingSunshineCaptureScript {
         } while([DateTime]::UtcNow -lt $vddDeadline)
         if(-not $deviceOk){ throw 'EPICVM_CAPTURE_VDD_DEVICE_NOT_OK' }
 
-        # Sunshine must capture the virtual output by name; otherwise it falls
+        # Sunshine must capture the virtual output by device ID; otherwise it falls
         # back to whatever default output exists and can pick a black target.
         $captureStage=Set-EpicVMGamingCaptureStage 'CAPTURE_SUNSHINE_CONF'
         $sunshineServiceCim=Get-CimInstance Win32_Service -Filter ("Name='" + ([string]$ServiceName).Replace("'","''") + "'") -ErrorAction SilentlyContinue
@@ -1339,11 +1381,42 @@ function Get-EpicVMGamingSunshineCaptureScript {
         $configDir=Join-Path $sunshineRoot 'config'
         if(-not (Test-Path -LiteralPath $configDir)){New-Item -ItemType Directory -Path $configDir -Force | Out-Null}
         $confPath=Join-Path $configDir 'sunshine.conf'
+        # Sunshine identifies Windows outputs by device GUID, not their
+        # friendly label. Refresh its enumeration after installing the VDD.
+        Set-Content -LiteralPath $confPath -Value @('capture = ddx','encoder = amdvce','min_log_level = 2') -Encoding ASCII
+        $logPath=Join-Path $configDir 'sunshine.log'
+        $enumerationStarted=[DateTime]::UtcNow
+        Restart-Service -Name $ServiceName -Force -ErrorAction Stop
+        $displayId=''
+        $enumerationDeadline=[DateTime]::UtcNow.AddSeconds(30)
+        do {
+            Start-Sleep -Milliseconds 500
+            if(-not (Test-Path -LiteralPath $logPath)){continue}
+            if((Get-Item -LiteralPath $logPath).LastWriteTimeUtc -lt $enumerationStarted){continue}
+            $lists=[regex]::Matches((Get-Content -LiteralPath $logPath -Raw),'(?s)Currently available display devices:\s*(\[.*?\r?\n\])')
+            if($lists.Count -eq 0){continue}
+            try {
+                # Windows PowerShell 5.1 emits the JSON array as one pipeline
+                # item. Assign it directly to avoid an extra nested array.
+                $displays=$lists[$lists.Count-1].Groups[1].Value|ConvertFrom-Json
+                $targets=@($displays|Where-Object {[string]$_.friendly_name -eq 'VDD by MTT'})
+                # Older retries could create duplicate VDD nodes. Reuse the
+                # primary virtual output, with a stable ID ordering fallback.
+                $target=$targets | Sort-Object @{Expression={[bool]$_.info.primary};Descending=$true},device_id | Select-Object -First 1
+                if($null -ne $target -and [string]$target.device_id -match '^\{[0-9a-f-]{36}\}$'){$displayId=[string]$target.device_id}
+            }catch{}
+        }while(-not $displayId -and [DateTime]::UtcNow -lt $enumerationDeadline)
+        if(-not $displayId){throw 'EPICVM_CAPTURE_DISPLAY_NOT_FOUND'}
         $confLines=@(
-            'output_name = Virtual Display',
+            ('output_name = ' + $displayId),
             'capture = ddx',
-            'encoder = nvenc amf enc qsv software',
-            'min_log_level = 1'
+            'encoder = amdvce',
+            'dd_configuration_option = ensure_primary',
+            'dd_resolution_option = manual',
+            'dd_manual_resolution = 1920x1080',
+            'dd_refresh_rate_option = manual',
+            'dd_manual_refresh_rate = 60',
+            'min_log_level = 2'
         )
         Set-Content -LiteralPath $confPath -Value $confLines -Encoding ASCII
 
@@ -1391,6 +1464,10 @@ function Get-EpicVMGamingSunshineCaptureScript {
         } finally { [Array]::Clear($saltBytes,0,$saltBytes.Length) }
 
         # A real desktop session requires a logged-in interactive user.
+        # Reapply the template policy for retained or older templates before
+        # the claimed account's first login, so its desktop is usable.
+        $oobePolicy=New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' -Force
+        Set-ItemProperty -LiteralPath $oobePolicy.PSPath -Name 'DisablePrivacyExperience' -Value 1 -Type DWord
         $lsaPath='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
         Set-ItemProperty -Path $lsaPath -Name 'AutoAdminLogon' -Value '1' -Type String
         Set-ItemProperty -Path $lsaPath -Name 'DefaultUserName' -Value ([string]$GuestUsername) -Type String
@@ -1417,7 +1494,9 @@ function Get-EpicVMGamingSunshineCaptureScript {
         }
         if(-not $running -or -not $listener){throw 'EPICVM_SUNSHINE_LISTENER_FAILED'}
         Remove-Item -LiteralPath $vddZip,$nefconZip -Force -ErrorAction SilentlyContinue
-        [ordered]@{ok=$true;vddInstalled=$deviceOk;captureConfWritten=(Test-Path -LiteralPath $confPath);autoLogonConfigured=$true;serviceRunning=$running;listener=$listener}
+        $interactiveUser=[string](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
+        $expectedUser=$env:COMPUTERNAME + '\' + $GuestUsername
+        [ordered]@{ok=$true;vddInstalled=$deviceOk;captureConfWritten=(Test-Path -LiteralPath $confPath);autoLogonConfigured=$true;serviceRunning=$running;listener=$listener;desktopRestartRequired=($interactiveUser -ine $expectedUser);bootTime=([DateTime](Get-CimInstance Win32_OperatingSystem).LastBootUpTime).ToUniversalTime().ToString('o')}
         } catch {
             $message=@([string]$_.Exception.Message,[string]$_.ToString()) -join ' '
             $safeMarkers=@(
@@ -1425,6 +1504,7 @@ function Get-EpicVMGamingSunshineCaptureScript {
                 'EPICVM_CAPTURE_STAGING_FAILED',
                 'EPICVM_CAPTURE_VDD_INSTALL_FAILED','EPICVM_CAPTURE_VDD_DEVICE_NOT_OK',
                 'EPICVM_CAPTURE_NEFCON_MISSING','EPICVM_SUNSHINE_SERVICE_MISSING',
+                'EPICVM_CAPTURE_DISPLAY_NOT_FOUND',
                 'EPICVM_SUNSHINE_EXECUTABLE_MISSING','EPICVM_SUNSHINE_VERSION_MISMATCH',
                 'EPICVM_SUNSHINE_SERVICE_RESTART_FAILED','EPICVM_SUNSHINE_LISTENER_FAILED'
             )
@@ -1433,6 +1513,80 @@ function Get-EpicVMGamingSunshineCaptureScript {
             [ordered]@{ok=$false;failureDetailCode=$captureStage;safeMarker=$reportedMarker}
         }
     }
+}
+
+function Get-EpicVMGamingAudioConfigurationScript {
+    return {
+        param($SunshineServiceName)
+        $ErrorActionPreference='Stop'
+        try {
+            $stageRoot=Join-Path $env:ProgramData 'EpicVM\capture'
+            $device=Get-PnpDevice -PresentOnly -Class MEDIA -ErrorAction SilentlyContinue | Where-Object {$_.FriendlyName -eq 'VB-Audio Virtual Cable' -and $_.Status -eq 'OK'} | Select-Object -First 1
+            if($null -eq $device){
+                # The administrator stages the Microsoft-signed driver in the
+                # private VM template. EpicVM activates that approved driver
+                # without bundling or downloading a third-party installer.
+                $nefcon=Get-ChildItem -LiteralPath (Join-Path $stageRoot 'nefcon') -Recurse -Filter 'nefconc.exe' -ErrorAction SilentlyContinue | Where-Object {$_.DirectoryName -match 'x64'} | Select-Object -First 1
+                if($null -eq $nefcon){throw 'Audio device activation tool missing'}
+                & $nefcon.FullName --create-device-node --hardware-id 'VBAudioVACWDM' --class-name MEDIA --class-guid '{4d36e96c-e325-11ce-bfc1-08002be10318}' 2>&1 | Out-Null
+                if($LASTEXITCODE -ne 0){throw 'Audio device creation failed'}
+                & pnputil.exe /scan-devices 2>&1 | Out-Null
+            }
+            Set-Service AudioEndpointBuilder -StartupType Automatic
+            Set-Service Audiosrv -StartupType Automatic
+            Start-Service AudioEndpointBuilder
+            Start-Service Audiosrv
+            $deadline=[DateTime]::UtcNow.AddSeconds(30)
+            do {
+                $device=Get-PnpDevice -PresentOnly -Class MEDIA -ErrorAction SilentlyContinue | Where-Object {$_.FriendlyName -eq 'VB-Audio Virtual Cable' -and $_.Status -eq 'OK'} | Select-Object -First 1
+                $speaker=Get-PnpDevice -PresentOnly -Class AudioEndpoint -ErrorAction SilentlyContinue | Where-Object {$_.FriendlyName -match '^(Speakers|CABLE In 16 Ch).*VB-Audio Virtual Cable' -and $_.Status -eq 'OK'} | Select-Object -First 1
+                if($null -ne $device -and $null -ne $speaker){
+                    Restart-Service -Name ([string]$SunshineServiceName) -Force -ErrorAction Stop
+                    $listenerDeadline=[DateTime]::UtcNow.AddSeconds(30)
+                    while(-not (Get-NetTCPConnection -LocalPort 47990 -State Listen -ErrorAction SilentlyContinue)){
+                        if([DateTime]::UtcNow -ge $listenerDeadline){throw 'Sunshine listener unavailable after audio activation'}
+                        Start-Sleep -Milliseconds 500
+                    }
+                    return @{ok=$true;audioEndpointVerified=$true}
+                }
+                Start-Sleep -Milliseconds 500
+            }while([DateTime]::UtcNow -lt $deadline)
+            throw 'Audio endpoint unavailable'
+        }catch{return @{ok=$false;failureDetailCode='CAPTURE_AUDIO_DEVICE'}}
+    }
+}
+
+function Get-EpicVMGamingDesktopSessionScript {
+    return {
+        param($GuestUser,$PreviousBoot)
+        $ErrorActionPreference='Stop'
+        $user=[string](Get-CimInstance Win32_ComputerSystem).UserName
+        $boot=([DateTime](Get-CimInstance Win32_OperatingSystem).LastBootUpTime).ToUniversalTime().ToString('o')
+        $desktop=@(Get-Process -Name explorer -ErrorAction SilentlyContinue|Where-Object {$_.SessionId -gt 0})
+        [ordered]@{ok=($user -ieq ($env:COMPUTERNAME+'\'+$GuestUser) -and $desktop.Count -gt 0 -and $boot -ne $PreviousBoot)}
+    }
+}
+
+function Wait-EpicVMGamingDesktopAfterRestart {
+    param($Provider,[string]$VmName,[string]$VmId,[string]$GuestAddress,$Credential,$DirectCredential,[string]$GuestUser,[string]$PreviousBoot,[int]$TimeoutSeconds=240)
+    # Setting AutoAdminLogon alone leaves a fresh clone on the sign-in screen.
+    # Reboot only the guest being configured, then require its new interactive
+    # desktop over the verified management path before pairing Sunshine.
+    $restart=Invoke-EpicVMPowerShellDirectOnce -Provider $Provider -VmName $VmName -VmId $VmId -Credential $DirectCredential -Script {
+        & "$env:SystemRoot\System32\shutdown.exe" /r /t 3 /f /d p:4:1 | Out-Null
+        if($LASTEXITCODE -ne 0){throw 'EPICVM_CAPTURE_DESKTOP_RESTART_FAILED'}
+        @{ok=$true}
+    } -TimeoutSeconds 15
+    if(-not [bool](Get-EpicVMHyperVValue -Object $restart -Name 'ok' -Default $false)){throw 'EPICVM_CAPTURE_DESKTOP_RESTART_FAILED'}
+    $deadline=[DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        Start-Sleep -Seconds 3
+        try {
+            $session=Invoke-EpicVMManagementTransport -Provider $Provider -Address $GuestAddress -Credential $Credential -Script (Get-EpicVMGamingDesktopSessionScript) -ArgumentList @($GuestUser,$PreviousBoot) -TimeoutSeconds 10 -RetryCount 0
+            if([bool](Get-EpicVMHyperVValue -Object $session -Name 'ok' -Default $false)){return}
+        }catch{}
+    }while([DateTime]::UtcNow -lt $deadline)
+    throw 'EPICVM_CAPTURE_DESKTOP_NOT_READY'
 }
 
 function Get-EpicVMSunshineReadinessScript {
@@ -1608,18 +1762,20 @@ function Invoke-EpicVMSunshineConfiguration {
         $credential=New-EpicVMWinRMLocalCredential -Credential $directCredential
         if([string]::IsNullOrWhiteSpace($GuestAddress)){$GuestAddress=[string](Get-EpicVMHyperVValue -Object (Get-EpicVMHyperVValue -Object $Provider -Name 'LastTailscaleEnrollment' -Default $null) -Name 'ip' -Default '')}
         if([string]::IsNullOrWhiteSpace($GuestAddress)){throw 'EPICVM_MANAGEMENT_UNAVAILABLE'}
-        # Tailscale and WinRM are separate gates. RDP reachability proves the
-        # selected 100.64/10 address is reachable; it does not prove WinRM.
+        $managementPort=[int](Get-EpicVMHyperVValue -Object $Provider -Name 'ManagementPort' -Default 5985)
+        $managementUseSsl=[bool](Get-EpicVMHyperVValue -Object $Provider -Name 'ManagementUseSsl' -Default $false)
+        if($managementPort -lt 1 -or $managementPort -gt 65535){$managementPort=if($managementUseSsl){5986}else{5985}}
+        # Tailscale and WinRM are separate gates. The selected 100.64/10
+        # address must be reachable before the management transport is used.
         $transport=$null
         $managementInvoker=Get-EpicVMHyperVValue -Object $Provider -Name 'ManagementInvoker' -Default $null
         if($null -eq $managementInvoker){
             if($ManagementHandoffAlreadyVerified){
                 # A restart can briefly withdraw the guest's Tailscale-facing
-                # RDP listener even while the VM is already Running. Treat it
-                # as a bounded read-only recovery race, not a permanent guest
-                # failure, before checking WinRM.
+                # WinRM listener even while the VM is already Running. Test the
+                # actual management transport, not optional RDP availability.
                 $tailscaleDeadline=[DateTime]::UtcNow.AddSeconds(30)
-                while(-not (Test-EpicVMGuestRdpReachability -Address $GuestAddress -Port 3389 -TimeoutMilliseconds 2000)){
+                while(-not (Test-EpicVMManagementPort -Address $GuestAddress -Port $managementPort -TimeoutMilliseconds 2000)){
                     if([DateTime]::UtcNow -ge $tailscaleDeadline){throw (New-EpicVMHyperVError -Code 'tailscale_unreachable' -Message 'The guest Tailscale address is not reachable.')}
                     Start-Sleep -Seconds 2
                 }
@@ -1629,9 +1785,6 @@ function Invoke-EpicVMSunshineConfiguration {
         }
         $managementInitialTimeout=if($null -eq $managementInvoker){20}else{30}
         $managementRecoveryTimeout=if($null -eq $managementInvoker){20}else{30}
-        $managementPort=[int](Get-EpicVMHyperVValue -Object $Provider -Name 'ManagementPort' -Default 5985)
-        $managementUseSsl=[bool](Get-EpicVMHyperVValue -Object $Provider -Name 'ManagementUseSsl' -Default $false)
-        if($managementPort -lt 1 -or $managementPort -gt 65535){$managementPort=if($managementUseSsl){5986}else{5985}}
         $vmId=''
         try{$vmId=[string](@(& $Provider.GetVMs | Where-Object {[string](Get-EpicVMHyperVValue -Object $_ -Name 'name' -Default '') -ceq $VmName} | Select-Object -First 1 | ForEach-Object {Get-EpicVMHyperVValue -Object $_ -Name 'id' -Default ''}))}catch{}
 
@@ -1800,6 +1953,10 @@ function Invoke-EpicVMSunshineConfiguration {
         if(-not [bool](Get-EpicVMHyperVValue -Object $result -Name 'ok' -Default $false) -or -not [bool](Get-EpicVMHyperVValue -Object $result -Name 'listener' -Default $false)){
             throw 'EPICVM_SUNSHINE_VERIFICATION_FAILED'
         }
+        if($IsGaming -and [bool](Get-EpicVMHyperVValue -Object $result -Name 'desktopRestartRequired' -Default $false)){
+            $sunshineStage='CAPTURE_DESKTOP_LOGON'
+            Wait-EpicVMGamingDesktopAfterRestart -Provider $Provider -VmName $VmName -VmId $vmId -GuestAddress $GuestAddress -Credential $credential -DirectCredential $directCredential -GuestUser $GuestUsername -PreviousBoot ([string](Get-EpicVMHyperVValue -Object $result -Name 'bootTime' -Default ''))
+        }
         # Recheck only read-only service/listener state. This is the sole
         # bounded retry permitted after the credential-bearing operation.
         $sunshineStage='SUNSHINE_STATUS_VERIFY'
@@ -1810,6 +1967,11 @@ function Invoke-EpicVMSunshineConfiguration {
         $gamingCaptureConfigured=$false
         $gamingCaptureAt=$null
         if($IsGaming){
+            $sunshineStage='CAPTURE_AUDIO_DEVICE'
+            $audioResult=Invoke-EpicVMManagementTransport -Provider $Provider -Address $GuestAddress -Credential $credential -Script (Get-EpicVMGamingAudioConfigurationScript) -ArgumentList @($serviceName) -TimeoutSeconds 75 -RetryCount 0
+            if(-not [bool](Get-EpicVMHyperVValue -Object $audioResult -Name 'audioEndpointVerified' -Default $false)){
+                throw 'EPICVM_CAPTURE_AUDIO_DEVICE'
+            }
             $gamingValidation=Invoke-EpicVMHyperVGamingGuestValidation -Provider $Provider -Name $VmName -GuestUsername $GuestUsername -GuestPassword $GuestPassword -GuestAddress $GuestAddress
             $gamingPayload=Get-EpicVMHyperVValue -Object $gamingValidation -Name 'validation' -Default $gamingValidation
             $renderFrameOk=[bool](Get-EpicVMHyperVValue -Object $gamingPayload -Name 'renderFrameOk' -Default $false)
@@ -1861,6 +2023,10 @@ function Invoke-EpicVMSunshineConfiguration {
             'EPICVM_CAPTURE_VDD_DEVICE_NOT_OK'='gaming_capture_vdd_failed'
             'EPICVM_CAPTURE_NEFCON_MISSING'='gaming_capture_vdd_failed'
             'EPICVM_CAPTURE_STAGING_FAILED'='gaming_capture_vdd_failed'
+            'EPICVM_CAPTURE_DISPLAY_NOT_FOUND'='sunshine_verification_failed'
+            'EPICVM_CAPTURE_DESKTOP_RESTART_FAILED'='sunshine_verification_failed'
+            'EPICVM_CAPTURE_DESKTOP_NOT_READY'='sunshine_verification_failed'
+            'EPICVM_CAPTURE_AUDIO_DEVICE'='gaming_audio_device_failed'
             'EPICVM_SUNSHINE_VERIFICATION_FAILED'='sunshine_verification_failed'
             'EPICVM_POWERSHELL_DIRECT_READINESS_FAILED'='powershell_direct_failed'
             'EPICVM_POWERSHELL_DIRECT_TIMEOUT'='powershell_direct_failed'

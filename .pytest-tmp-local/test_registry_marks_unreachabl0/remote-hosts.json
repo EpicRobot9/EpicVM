@@ -1,1 +1,0 @@
-{"version": 1, "hosts": [{"id": "offline-pc", "display_name": "Offline PC", "agent_url": "http://100.64.0.2:8765", "token": "secret-token", "enabled": true}]}

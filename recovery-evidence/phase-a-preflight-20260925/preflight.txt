@@ -1,0 +1,58 @@
+Phase A preflight - 2026-09-25
+Host: DESKTOP-VG5E7UC (100.72.220.117)  Source: elevated session via kvm2 reverse SSH
+
+TEMPLATE MANIFEST  E:\EpicVM\templates\win11-25h2\manifest.json
+  templateVersion = 1.2.0      (NOT 1.4.0 as the repo TemplateBuilder.ps1 source states)
+  build           = win11-25h2-20260826
+  imagePath       = E:\EpicVM\templates\win11-25h2\win11-25h2.vhdx
+  sha256 expected = e1d11c8af5c387cc3d1f0475681a2a4bac9f661e68313a42d307ff678c4670cc
+  sha256 actual   = e1d11c8af5c387cc3d1f0475681a2a4bac9f661e68313a42d307ff678c4670cc
+  HASH MATCH      = True
+  size            = 17.47 GB
+  fullCopy=True immutable=True network=private-switch
+  sunshine installed / 2026.516.143833
+  bootstrap machine-dpapi-encrypted-system-admin
+
+DISK
+  E: free=2465.8GB used=1260.2GB     C: free=219.7GB
+
+AGENT CONFIG (non-secret)
+  SwitchName=Default Switch  VmRoot=E:\EpicVM\vms  Generation=2
+  TemplateManifestPath=E:\EpicVM\templates\win11-25h2\manifest.json
+  ManagementPort=5985 useSsl=False required=True
+  EnableGamingProvisioning=True
+  BindAddress=100.72.220.117 Port=8765
+  EnableOmarchyProvisioning=(unset)  OmarchyPilotValidated=(unset)
+  EnableUbuntuProvisioning=(unset)
+  bootstrap.dpapi present = True
+
+HYPER-V SWITCHES
+  EpicVM-Template-Private   Private
+  EpicVM NAT                Internal   vNIC=192.168.251.1/24
+  EpicVM-Template-Isolated  Private
+  Default Switch            Internal   vNIC=172.31.128.1/20
+  FSE Switch                Internal
+
+NETWORK / EGRESS  ** FINDING **
+  Get-NetNat 'EpicVM-NAT': InternalIPInterfaceAddressPrefix=192.168.251.0/24
+                            ExternalIPInterfaceAddressPrefix= (EMPTY -> no uplink)
+  Host default route 0.0.0.0/0 -> 192.168.1.1 via 'Ethernet' ifIndex 17 metric 0
+  Services: SharedAccess=Running(Manual)  Winnat=Running(Automatic)
+  Host internet baseline: Test-NetConnection 1.1.1.1:443 = True
+  Host DNS: resolves github.com -> 140.82.113.4
+
+AGENT SERVICE
+  EpicVMRemoteAgent status=Running start=Automatic
+
+HYPER-V FUNCTIONAL PROBE (temporary, fully removed)
+  Created a throwaway Gen2 VM on Default Switch, 2GB, 20GB dynamic VHD
+  New-VM OK / Start-VM OK / state=Running status='Operating normally'
+  Heartbeat integration service: enabled=True
+  Probe VM + VHD + directory all removed; E:\EpicVM\vms back to only 'quarantine'
+
+SUMMARY
+  PASS  template hash, service, Hyper-V create/start, heartbeat, disk
+  NOTE  manifest is 1.2.0, repo builder source says 1.4.0 -> doc drift, not a runtime fault
+  RISK  EpicVM-NAT has no ExternalIPInterfaceAddressPrefix; Default Switch is
+        'Internal' with no bound uplink adapter. Guest internet egress is UNVERIFIED
+        and is the prime suspect for Tailscale enrollment failure at network_setup.

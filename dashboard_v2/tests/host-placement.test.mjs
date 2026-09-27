@@ -7,6 +7,7 @@ import {
   getPlacementValidationReason,
   hostOptionLabel,
   normalizeHostInventory,
+  provisioningProfileDisabledReason,
   remotePlacementDisabledReason
 } from '../src/lib/hostPlacement.js'
 
@@ -85,4 +86,21 @@ test('remote create payload and validation require an eligible selected host', (
   })
   assert.equal(getPlacementValidationReason({ placement: 'remote', hostId: 'offline-pc', hosts }), 'Selected remote host is no longer available')
   assert.equal(getPlacementValidationReason({ placement: 'remote', hostId: 'epic-pc', hosts }), '')
+})
+
+test('Omarchy host placement is independent from the Windows provisioning gate', () => {
+  const omarchyOnly = [{
+    id: 'linux-pilot',
+    display_name: 'Linux Pilot',
+    platform: 'windows',
+    provider: 'hyperv',
+    online: true,
+    capabilities: { create_vm: true, provisioning: false, omarchy_provisioning: true }
+  }]
+
+  assert.equal(canUseRemotePlacement(omarchyOnly), true)
+  assert.equal(getPlacementValidationReason({ placement: 'remote', hostId: 'linux-pilot', hosts: omarchyOnly, profile: 'standard' }), 'Selected remote host is no longer available')
+  assert.equal(getPlacementValidationReason({ placement: 'remote', hostId: 'linux-pilot', hosts: omarchyOnly, profile: 'omarchy' }), '')
+  assert.equal(provisioningProfileDisabledReason(omarchyOnly[0], 'omarchy'), '')
+  assert.match(provisioningProfileDisabledReason(omarchyOnly[0], 'standard'), /Standard provisioning unavailable/)
 })

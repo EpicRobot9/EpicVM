@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import Button from '../components/Button'
 import apiFetch from '../lib/fetchWrapper'
 import Modal from '../components/Modal'
-import VmExec from '../components/VmExec'
+import { completeAutomatedConsole } from '../lib/consoleVerification'
 import { useToasts } from '../components/ToastProvider'
 import { instanceNamesKey, pollDelayMs } from '../lib/polling'
 import { canCacheVmSettingsResponse, clearRemovedVmState, createLoadInFlightRunner, createLogSelectionTracker } from '../lib/vmManagerRaces'
@@ -68,7 +68,8 @@ function StatMeter({ label, value, tone='cpu' }){
 function VmCard({ vm, host, onAction, onDetails, onProfileChange, onManage, onTeardown, onGamingPartitionChange, gamingPartitionDraft, gamingPartitionBusy, profileBusy, busyAction, refreshing }){
   const tone = toneFor(vm.status)
   const profile = vm._profile || vm._optimizer?.profile || vm.profile || 'desktop'
-  const isGaming = profile === 'gaming' || String(vm.profile || '').toLowerCase() === 'gaming' || vm.gpuPartitionPercent !== undefined
+  const isOmarchy = profile === 'omarchy' || String(vm.profile || '').toLowerCase() === 'omarchy'
+  const isGaming = profile === 'gaming' || String(vm.profile || '').toLowerCase() === 'gaming' || isOmarchy || vm.gpuPartitionPercent !== undefined
   const isRemote = vm.placement === 'remote'
   const consoleReady = canOpenInventoryVm(vm) && (!isRemote || (vm.running === true && vm.consoleReady === true && vm.consoleRouteReady !== false))
   const consoleLaunchable = isRemote ? (vm.running === true && !!vm.url) : consoleReady
@@ -109,11 +110,12 @@ function VmCard({ vm, host, onAction, onDetails, onProfileChange, onManage, onTe
         <div className="vm-meta-chip">Name: {vm.name}</div>
         <label className="vm-meta-chip" style={{ gap:8 }}>
           <span>Type</span>
-          <select value={profile} disabled={profileBusy} onChange={e=>onProfileChange(vm.name, e.target.value)} style={{ background:'rgba(2,6,23,.8)', color:'#fff', border:'1px solid rgba(255,255,255,.12)', borderRadius:8, padding:'4px 8px' }}>
+          <select value={profile} disabled={profileBusy || (isRemote && isOmarchy)} onChange={e=>onProfileChange(vm.name, e.target.value)} style={{ background:'rgba(2,6,23,.8)', color:'#fff', border:'1px solid rgba(255,255,255,.12)', borderRadius:8, padding:'4px 8px' }}>
             <option value="light">light</option>
             <option value="desktop">desktop</option>
             <option value="interactive">interactive</option>
             <option value="gaming">gaming</option>
+            {isOmarchy ? <option value="omarchy" disabled>omarchy Linux</option> : null}
             <option value="background">background</option>
             <option value="disposable">disposable</option>
           </select>
@@ -122,7 +124,7 @@ function VmCard({ vm, host, onAction, onDetails, onProfileChange, onManage, onTe
 
       {isRemote && isGaming ? (
         <div className="vm-placement-notice" style={{display:'flex', alignItems:'center', gap:8, flexWrap:'wrap', marginTop:10}}>
-          <span style={{fontSize:13, color:'var(--muted)'}}>GPU-P partition</span>
+          <span style={{fontSize:13, color:'var(--muted)'}}>{isOmarchy ? 'Omarchy AMD GPU-P partition' : 'GPU-P partition'}</span>
           <input
             aria-label={`GPU-P partition percent for ${vm.name}`}
             type="number"
@@ -185,6 +187,9 @@ export default function VMManager(){
   const [pendingProvisioningJobs, setPendingProvisioningJobs] = useState([])
   const [sunshineDefaultConfigured, setSunshineDefaultConfigured] = useState(false)
   const [provisioningBusy, setProvisioningBusy] = useState(false)
+  const [jevHostAdvice, setJevHostAdvice] = useState(null)
+  const [jevDiagnosis, setJevDiagnosis] = useState(null)
+  const [jevBusy, setJevBusy] = useState('')
   const consoleRetryOutcomeRef = useRef('')
   const [createBusy, setCreateBusy] = useState(false)
   const [manageVm, setManageVm] = useState(null)
@@ -648,7 +653,7 @@ export default function VMManager(){
     if(!name) return
     const placementReason = placement === 'remote' && !canUseRemotePlacement(hosts)
       ? remotePlacementDisabledReason(hosts)
-      : getPlacementValidationReason({ placement, hostId: selectedHostId, hosts })
+      : getPlacementValidationReason({ placement, hostId: selectedHostId, hosts, profile: provisioningProfile })
     if(placementReason) return
     const payload = createPlacementPayload({ name, placement, hostId: selectedHostId })
     setCreateBusy(true)
@@ -675,7 +680,8 @@ export default function VMManager(){
         setProvisioningHostId(selectedHostId)
         setProvisioningClaimToken(provisioningMode === 'claim' ? nextToken : '')
         clearClaimDraft()
-        addToast({ title:provisioningMode === 'claim' ? 'Claim job created' : 'Automatic provisioning started', message:provisioningMode === 'claim' ? `${name} is waiting for the Windows account details.` : `${name} is moving through the EpicVM setup gates without further input.`, type:'success', timeout:7000 })
+        const guestLabel = provisioningProfile === 'omarchy' ? 'Linux' : 'Windows'
+        addToast({ title:provisioningMode === 'claim' ? 'Claim job created' : 'Automatic provisioning started', message:provisioningMode === 'claim' ? `${name} is waiting for the ${guestLabel} account details.` : `${name} is moving through the EpicVM setup gates without further input.`, type:'success', timeout:7000 })
         setCreateName('')
         setCreateBusy(false)
         void loadPendingProvisioningJobs()
@@ -693,7 +699,7 @@ export default function VMManager(){
       if(placement === 'remote' && provisioningMode === 'claim'){
         try{ recovered = await recoverPendingClaim(selectedHostId, name) }catch(_recoveryError){}
       }
-      if(recovered) addToast({ title:'Pending claim recovered', message:'The claim job is still available below; enter the Windows account details when ready.', type:'success', timeout:7000 })
+      if(recovered) addToast({ title:'Pending claim recovered', message:`The claim job is still available below; enter the ${provisioningProfile === 'omarchy' ? 'Linux' : 'Windows'} account details when ready.`, type:'success', timeout:7000 })
       else addToast({ title:'Create failed', message:String(err), type:'error', timeout:8000 })
     }
     setCreateBusy(false)
@@ -720,6 +726,12 @@ export default function VMManager(){
   }, [provisioningJob?.id, provisioningJob?.state, provisioningHostId])
 
   useEffect(()=>{
+    if(provisioningMode !== 'claim' || provisioningClaimToken || !canClaimProvisioningJob(provisioningJob) || !provisioningHostId) return
+    recoverPendingClaim(provisioningHostId, provisioningJob.name, provisioningJob.id)
+      .catch(err=>addToast({title:'Claim recovery failed',message:String(err),type:'error',timeout:7000}))
+  }, [provisioningMode, provisioningClaimToken, provisioningJob?.id, provisioningJob?.state, provisioningHostId])
+
+  useEffect(()=>{
     const outcome = String(provisioningJob?.consoleRetryOutcome || '')
     const operation = String(provisioningJob?.consoleOperationId || provisioningJob?.operationId || '')
     const key = outcome && operation ? `${operation}:${outcome}:${provisioningJob?.errorCode || ''}` : ''
@@ -736,7 +748,7 @@ export default function VMManager(){
   async function claimProvisioningJob(e){
     e?.preventDefault?.()
     if(!provisioningJob || !canClaimProvisioningJob(provisioningJob) || !provisioningClaimToken) return
-    if(claimDraft.password !== claimDraft.confirm) { addToast({title:'Claim rejected', message:'Windows passwords do not match.', type:'error', timeout:6000}); return }
+    if(claimDraft.password !== claimDraft.confirm) { addToast({title:'Claim rejected', message:`${String(provisioningJob?.profile || '').toLowerCase() === 'omarchy' ? 'Linux' : 'Windows'} passwords do not match.`, type:'error', timeout:6000}); return }
     setProvisioningBusy(true)
     try{
       const res = await apiFetch(`/provisioning-jobs/${encodeURIComponent(provisioningJob.id)}/claim`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(provisioningClaimPayload({hostId:provisioningHostId, username:claimDraft.username, password:claimDraft.password, claimToken:provisioningClaimToken})) })
@@ -748,6 +760,27 @@ export default function VMManager(){
       setClaimDraft({ username:'', password:'', confirm:'' })
       setProvisioningJob(body.job || provisioningJob)
       addToast({title:'Guest claimed', message:'Continuing Tailscale, console, and readiness verification.', type:'success', timeout:7000})
+      // The dashboard already measured guest TCP reachability server-side.
+      // Finish console readiness from that trusted result without opening any
+      // verification dialog or collecting browser evidence.
+      if(body.guestTcpVerified === true){
+        try{
+          const completion = await completeAutomatedConsole({
+            jobId:provisioningJob.id,
+            hostId:provisioningHostId,
+            routePrefix:String(body.consoleRoutePrefix || body.job?.consoleRoutePrefix || ''),
+            guestTcpVerified:true,
+          }, (url, payload)=>{
+            return apiFetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+          })
+          setProvisioningJob(completion.job || body.job || provisioningJob)
+          addToast({title:'Setup complete', message:'The console passed its automated route and guest transport checks. The VM is ready.', type:'success', timeout:8000})
+          void load({silent:true})
+        }catch(completionErr){
+          await refreshProvisioningJob().catch(()=>null)
+          addToast({title:'Console completion failed', message:String(completionErr), type:'error', timeout:8000})
+        }
+      }
     }catch(err){
       if(err.safeCode !== 'invalid_credential_input') setProvisioningClaimToken('')
       clearProvisioningRecovery()
@@ -764,7 +797,7 @@ export default function VMManager(){
   async function retryProvisioningConsole(e){
     e?.preventDefault?.()
     if(!provisioningJob || !canRetryProvisioningConsole(provisioningJob)) return
-    if(claimDraft.password !== claimDraft.confirm) { addToast({title:'Retry rejected', message:'Windows passwords do not match.', type:'error', timeout:6000}); return }
+    if(claimDraft.password !== claimDraft.confirm) { addToast({title:'Retry rejected', message:`${String(provisioningJob?.profile || '').toLowerCase() === 'omarchy' ? 'Linux' : 'Windows'} passwords do not match.`, type:'error', timeout:6000}); return }
     setProvisioningBusy(true)
     try{
       const res = await apiFetch(`/provisioning-jobs/${encodeURIComponent(provisioningJob.id)}/retry-console`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(provisioningConsoleRetryPayload({hostId:provisioningHostId, username:claimDraft.username, password:claimDraft.password})) })
@@ -1072,9 +1105,44 @@ export default function VMManager(){
   const remotePlacementAvailable = canUseRemotePlacement(hosts)
   const hostsById = useMemo(() => Object.fromEntries(hosts.map(host => [host.id, host])), [hosts])
   const selectedRemoteHost = eligibleRemoteHosts.find(host => host.id === selectedHostId)
+
+  async function requestJev(task, state){
+    const response = await apiFetch('/jev/analyze', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task, state})})
+    const body = await response.json().catch(()=>({}))
+    if(!response.ok || !body.ok) throw new Error(body.error || 'Jev advisory unavailable')
+    return body.advisory
+  }
+
+  async function rankEligibleHosts(){
+    setJevBusy('host'); setJevHostAdvice(null)
+    try{
+      const eligible = eligibleRemoteHosts.map(host => ({id:host.id, display_name:host.display_name, platform:host.platform, provider:host.provider, resources:host.resources, capabilities:host.capabilities}))
+      const advice = await requestJev('host_ranking', {workload:{profile:provisioningProfile, mode:provisioningMode}, hosts:eligible})
+      setJevHostAdvice(advice)
+      const recommendation = advice?.answers?.host?.choice
+      if(recommendation && recommendation !== 'no_recommendation' && eligible.some(host => host.id === recommendation)) chooseRemoteHost(recommendation)
+    }catch(error){ setJevHostAdvice({error:String(error)}) }
+    setJevBusy('')
+  }
+
+  async function diagnoseProvisioning(){
+    setJevBusy('diagnosis'); setJevDiagnosis(null)
+    try{
+      setJevDiagnosis(await requestJev('provisioning_diagnosis', {job:provisioningJob, host:hostsById[provisioningHostId] || null, deterministicFailure:provisioningFailureReason(provisioningJob)}))
+    }catch(error){ setJevDiagnosis({error:String(error)}) }
+    setJevBusy('')
+  }
   const gamingProfileReason = selectedRemoteHost ? provisioningProfileDisabledReason(selectedRemoteHost, 'gaming') : 'Select an eligible remote host first.'
   const gamingProfileAvailable = !gamingProfileReason
+  const omarchyProfileReason = selectedRemoteHost ? provisioningProfileDisabledReason(selectedRemoteHost, 'omarchy') : 'Select an eligible remote host first.'
+  const omarchyProfileAvailable = !omarchyProfileReason
   const standardProfileReason = selectedRemoteHost ? provisioningProfileDisabledReason(selectedRemoteHost, 'standard') : ''
+  const selectedProfileReason = provisioningProfile === 'gaming'
+    ? gamingProfileReason
+    : provisioningProfile === 'omarchy'
+      ? omarchyProfileReason
+      : standardProfileReason
+  const claimGuestLabel = String(provisioningJob?.profile || provisioningProfile).toLowerCase() === 'omarchy' ? 'Linux' : 'Windows'
   const placementReason = placement !== 'remote'
     ? ''
     : invalidatedHostId && !selectedHostId
@@ -1083,7 +1151,7 @@ export default function VMManager(){
         ? 'Checking remote host availability…'
       : !remotePlacementAvailable
         ? remotePlacementDisabledReason(hosts)
-        : getPlacementValidationReason({ placement, hostId: selectedHostId, hosts })
+        : getPlacementValidationReason({ placement, hostId: selectedHostId, hosts, profile: provisioningProfile })
   const destinationSummary = placement === 'remote'
     ? selectedRemoteHost
       ? `This RemoteVM will be created on ${selectedRemoteHost.display_name} over Tailscale.`
@@ -1110,7 +1178,8 @@ export default function VMManager(){
 
   useEffect(()=>{
     if(provisioningProfile === 'gaming' && !gamingProfileAvailable) setProvisioningProfile('standard')
-  }, [gamingProfileAvailable, provisioningProfile])
+    if(provisioningProfile === 'omarchy' && !omarchyProfileAvailable) setProvisioningProfile('standard')
+  }, [gamingProfileAvailable, omarchyProfileAvailable, provisioningProfile])
 
   function choosePlacement(nextPlacement){
     setPlacement(nextPlacement)
@@ -1201,7 +1270,7 @@ export default function VMManager(){
                 return (
                   <button key={`${entry.host_id}:${job.id}`} type="button" onClick={()=>selectPendingProvisioningJob(entry)} aria-pressed={selectedJob} style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:12,textAlign:'left',width:'100%',padding:'11px 13px',borderRadius:12,border:selectedJob ? '1px solid rgba(59,130,246,.75)' : '1px solid rgba(255,255,255,.1)',background:selectedJob ? 'rgba(30,64,175,.25)' : 'rgba(2,6,23,.45)',color:'#fff',cursor:'pointer'}}>
                     <span style={{display:'grid',gap:3}}><strong>{job.name || 'Unnamed VM'}</strong><span style={{fontSize:12,color:'var(--muted)'}}>{entry.host_name || entry.host_id} · {automatic ? 'Automatic' : 'Claim mode'}</span></span>
-                    <span style={{fontSize:12,color:job.claimAvailable ? '#fbbf24' : 'var(--muted)'}}>{job.claimAvailable ? 'Awaiting Windows account' : (job.autonomousStage || job.state || 'In progress')}</span>
+                    <span style={{fontSize:12,color:job.claimAvailable ? '#fbbf24' : 'var(--muted)'}}>{job.claimAvailable ? `Awaiting ${String(job.profile || '').toLowerCase() === 'omarchy' ? 'Linux' : 'Windows'} account` : (job.autonomousStage || job.state || 'In progress')}</span>
                   </button>
                 )
               })}
@@ -1231,12 +1300,18 @@ export default function VMManager(){
                 </select>
               </label>
             ) : null}
+            {placement === 'remote' ? <div className="vm-placement-notice" style={{display:'flex',gap:9,alignItems:'center',flexWrap:'wrap'}}>
+              <Button type="button" disabled={jevBusy === 'host' || !eligibleRemoteHosts.length} onClick={rankEligibleHosts}>{jevBusy === 'host' ? 'Comparing…' : 'Recommend eligible host with Jev'}</Button>
+              <span style={{fontSize:12,color:'var(--muted)'}}>Ranks only hosts that already passed EpicVM eligibility checks.</span>
+              {jevHostAdvice?.error ? <span role="status">{jevHostAdvice.error}</span> : jevHostAdvice?.answers?.host ? <strong>Recommendation: {hostsById[jevHostAdvice.answers.host.choice]?.display_name || jevHostAdvice.answers.host.choice}</strong> : null}
+            </div> : null}
             {placement === 'remote' ? (
               <label className="vm-placement-field">
                 <span>Provisioning profile</span>
                 <select value={provisioningProfile} onChange={e=>setProvisioningProfile(e.target.value)} disabled={createBusy}>
                   <option value="standard">Standard · 4 vCPU · 8 GB · 96 GB</option>
                   <option value="gaming" disabled={!gamingProfileAvailable}>Gaming · 6 vCPU · 12 GB · 128 GB · 50% GPU-P</option>
+                  <option value="omarchy" disabled={!omarchyProfileAvailable}>Omarchy Linux · 6 vCPU · 12 GB · 128 GB · AMD GPU-P · Experimental</option>
                 </select>
               </label>
             ) : null}
@@ -1245,14 +1320,14 @@ export default function VMManager(){
                 <span>Provisioning mode</span>
                 <select value={provisioningMode} onChange={e=>setProvisioningMode(e.target.value)} disabled={createBusy}>
                   <option value="automatic">Automatic · use protected defaults</option>
-                  <option value="claim">Claim · choose the Windows account</option>
+                  <option value="claim">Claim · choose the guest account</option>
                 </select>
               </label>
             ) : null}
-            {placement === 'remote' && provisioningProfile === 'gaming' ? (
+            {placement === 'remote' && ['gaming','omarchy'].includes(provisioningProfile) ? (
               <div className="vm-placement-notice" style={{gridColumn:'1 / -1', display:'grid', gap:10}}>
-                <strong>Gaming VM resources</strong>
-                <span style={{color:'var(--muted)', fontSize:13}}>Choose vCPU, memory, storage, and the starting GPU-P share now. vCPU, memory, and storage are initialization-only; the GPU-P percentage can be changed later from the VM card.</span>
+                <strong>{provisioningProfile === 'omarchy' ? 'Omarchy Linux resources' : 'Gaming VM resources'}</strong>
+                <span style={{color:'var(--muted)', fontSize:13}}>{provisioningProfile === 'omarchy' ? 'Experimental profile: AMD GPU-P is required. Choose vCPU, memory, storage, and the starting partition share; accelerated rendering and Sunshine hardware encoding must pass the guest pilot before readiness.' : 'Choose vCPU, memory, storage, and the starting GPU-P share now. vCPU, memory, and storage are initialization-only; the GPU-P percentage can be changed later from the VM card.'}</span>
                 <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))', gap:10}}>
                   <label style={{display:'grid', gap:5}}>
                     <span>vCPU</span>
@@ -1273,7 +1348,7 @@ export default function VMManager(){
                 </div>
               </div>
             ) : null}
-            <Button type="submit" disabled={createBusy || !!placementReason || !!standardProfileReason}>{createBusy ? 'Creating…' : 'Create VM'}</Button>
+            <Button type="submit" disabled={createBusy || !!placementReason || !!selectedProfileReason}>{createBusy ? 'Creating…' : 'Create VM'}</Button>
           </div>
           <div className="vm-placement-summary">
             <span>Destination</span>
@@ -1282,9 +1357,10 @@ export default function VMManager(){
           {hostsLoading ? <div className="vm-placement-notice">Checking remote host connection… VM status can continue loading.</div> : !remotePlacementAvailable ? <div className="vm-placement-notice">Remote VM unavailable: No remote hosts connected.</div> : null}
           {placementReason ? <div id="vm-placement-reason" className="vm-placement-error" role="alert">{placementReason}</div> : null}
           {placement === 'remote' && provisioningProfile === 'gaming' && gamingProfileReason ? <div className="vm-placement-error" role="alert">{gamingProfileReason}</div> : null}
+          {placement === 'remote' && provisioningProfile === 'omarchy' && omarchyProfileReason ? <div className="vm-placement-error" role="alert">{omarchyProfileReason}</div> : null}
           {placement === 'remote' && provisioningProfile === 'standard' && standardProfileReason ? <div className="vm-placement-error" role="alert">{standardProfileReason}</div> : null}
-          {placement === 'remote' && provisioningMode === 'automatic' ? <div className="vm-placement-notice">{sunshineDefaultConfigured ? 'Automatic mode uses the protected dashboard Windows and Sunshine defaults. Nothing else is requested from you.' : 'Automatic mode uses protected defaults. The dashboard is still checking the protected Sunshine configuration.'}</div> : null}
-          {placement === 'remote' && provisioningMode === 'claim' ? <div className="vm-placement-notice">Claim mode asks only for the Windows username and password you want. Sunshine pairing continues with the protected dashboard default.</div> : null}
+          {placement === 'remote' && provisioningMode === 'automatic' ? <div className="vm-placement-notice">{sunshineDefaultConfigured ? `Automatic mode uses the protected dashboard ${provisioningProfile === 'omarchy' ? 'Linux' : 'Windows'} and Sunshine defaults. Nothing else is requested from you.` : 'Automatic mode uses protected defaults. The dashboard is still checking the protected Sunshine configuration.'}</div> : null}
+          {placement === 'remote' && provisioningMode === 'claim' ? <div className="vm-placement-notice">Claim mode asks only for the {provisioningProfile === 'omarchy' ? 'Linux' : 'Windows'} username and password you want. Sunshine pairing continues with the protected dashboard default.</div> : null}
           {provisioningJob ? (
             <div className="vm-placement-notice" style={{marginTop:12}}>
               <div style={{display:'flex',justifyContent:'space-between',gap:12,flexWrap:'wrap'}}>
@@ -1292,30 +1368,30 @@ export default function VMManager(){
                 <span>{provisioningJob.state}</span>
               </div>
               <div style={{height:8,background:'rgba(255,255,255,.1)',borderRadius:999,marginTop:10,overflow:'hidden'}}><div style={{height:'100%',width:`${provisioningProgress(provisioningJob)}%`,background:'#22c55e',transition:'width .25s'}} /></div>
-              {provisioningJob.autonomousPending ? <div style={{color:'var(--muted)',fontSize:13,marginTop:10}}>Automatic setup is running with protected defaults. Current stage: {provisioningJob.autonomousStage || 'claim'}.</div> : null}
+              {provisioningJob.autonomousPending ? <div style={{color:'var(--muted)',fontSize:13,marginTop:10}}>Automatic setup is running with protected defaults. Current stage: {provisioningJob.state || provisioningJob.autonomousStage || 'claim'}.</div> : null}
               {provisioningJob.autonomousOutcome === 'failed' ? <div role="alert" style={{color:'#fca5a5',marginTop:10}}>Automatic setup stopped safely. The VM was retained for diagnosis.</div> : null}
               {canClaimProvisioningJob(provisioningJob) && provisioningClaimToken ? (
                 <div style={{display:'grid',gap:8,marginTop:12}}>
-                  <strong>Choose the Windows account</strong>
-                  <span style={{color:'var(--muted)',fontSize:13}}>Enter only the Windows username and password you want on this VM. Sunshine pairing uses the protected dashboard default automatically.</span>
-                  <input value={claimDraft.username} onChange={e=>setClaimDraft(s=>({...s,username:e.target.value}))} placeholder="Windows username" autoComplete="username" required />
-                  <input value={claimDraft.password} onChange={e=>setClaimDraft(s=>({...s,password:e.target.value}))} placeholder="Windows password" type="password" autoComplete="new-password" required />
-                  <input value={claimDraft.confirm} onChange={e=>setClaimDraft(s=>({...s,confirm:e.target.value}))} placeholder="Repeat Windows password" type="password" autoComplete="new-password" required />
+                  <strong>Choose the {claimGuestLabel} account</strong>
+                  <span style={{color:'var(--muted)',fontSize:13}}>Enter only the {claimGuestLabel} username and password you want on this VM. Sunshine pairing uses the protected dashboard default automatically.</span>
+                  <input value={claimDraft.username} onChange={e=>setClaimDraft(s=>({...s,username:e.target.value}))} placeholder={`${claimGuestLabel} username`} autoComplete="username" required />
+                  <input value={claimDraft.password} onChange={e=>setClaimDraft(s=>({...s,password:e.target.value}))} placeholder={`${claimGuestLabel} password`} type="password" autoComplete="new-password" required />
+                  <input value={claimDraft.confirm} onChange={e=>setClaimDraft(s=>({...s,confirm:e.target.value}))} placeholder={`Repeat ${claimGuestLabel} password`} type="password" autoComplete="new-password" required />
                   <Button type="button" onClick={claimProvisioningJob} disabled={provisioningBusy}>{provisioningBusy ? 'Claiming…' : 'Claim guest securely'}</Button>
                 </div>
               ) : null}
               {canRetryProvisioningConsole(provisioningJob) ? (
                 <div style={{display:'grid',gap:8,marginTop:12}}>
                   <strong>Retry retained console</strong>
-                  <span style={{color:'var(--muted)',fontSize:13}}>The VM was retained. Re-enter only the Windows credentials to rebuild the stopped console bundle; Sunshine uses the protected dashboard default.</span>
-                  <input value={claimDraft.username} onChange={e=>setClaimDraft(s=>({...s,username:e.target.value}))} placeholder="Windows username" autoComplete="username" required />
-                  <input value={claimDraft.password} onChange={e=>setClaimDraft(s=>({...s,password:e.target.value}))} placeholder="Windows password" type="password" autoComplete="current-password" required />
-                  <input value={claimDraft.confirm} onChange={e=>setClaimDraft(s=>({...s,confirm:e.target.value}))} placeholder="Repeat Windows password" type="password" autoComplete="current-password" required />
+                  <span style={{color:'var(--muted)',fontSize:13}}>The VM was retained. Re-enter only the {claimGuestLabel} credentials to rebuild the stopped console bundle; Sunshine uses the protected dashboard default.</span>
+                  <input value={claimDraft.username} onChange={e=>setClaimDraft(s=>({...s,username:e.target.value}))} placeholder={`${claimGuestLabel} username`} autoComplete="username" required />
+                  <input value={claimDraft.password} onChange={e=>setClaimDraft(s=>({...s,password:e.target.value}))} placeholder={`${claimGuestLabel} password`} type="password" autoComplete="current-password" required />
+                  <input value={claimDraft.confirm} onChange={e=>setClaimDraft(s=>({...s,confirm:e.target.value}))} placeholder={`Repeat ${claimGuestLabel} password`} type="password" autoComplete="current-password" required />
                   <Button type="button" onClick={retryProvisioningConsole} disabled={provisioningBusy}>{provisioningBusy ? 'Retrying…' : 'Retry console securely'}</Button>
                 </div>
               ) : null}
               {canOpenProvisionedVm(provisioningJob) ? <div style={{color:'#86efac',marginTop:10}}>Ready. The VM will appear in the fleet after the next refresh.</div> : null}
-      {String(provisioningJob.state || '').startsWith('setup_failed:') ? <div role="alert" style={{color:'#fca5a5',marginTop:10}}>Setup stopped safely.{provisioningFailureReason(provisioningJob) ? ` ${provisioningFailureReason(provisioningJob)}` : ''} The VM was retained for diagnosis.{provisioningJob.operationId ? ` Operation ${provisioningJob.operationId}.` : ''}</div> : null}
+      {String(provisioningJob.state || '').startsWith('setup_failed:') ? <><div role="alert" style={{color:'#fca5a5',marginTop:10}}>Setup stopped safely.{provisioningFailureReason(provisioningJob) ? ` ${provisioningFailureReason(provisioningJob)}` : ''} The VM was retained for diagnosis.{provisioningJob.operationId ? ` Operation ${provisioningJob.operationId}.` : ''}</div><div style={{marginTop:10}}><Button type="button" disabled={jevBusy === 'diagnosis'} onClick={diagnoseProvisioning}>{jevBusy === 'diagnosis' ? 'Reviewing…' : 'Suggest investigation with Jev'}</Button>{jevDiagnosis?.error ? <p>{jevDiagnosis.error}</p> : jevDiagnosis?.answers?.next_step ? <p><strong>Suggested direction:</strong> {String(jevDiagnosis.answers.next_step.choice || '').replaceAll('_',' ')}. This does not authorize recovery or establish readiness.</p> : null}</div></> : null}
               {provisioningJob.state === 'setup_failed:streaming' ? <div role="alert" style={{color:'#fca5a5',marginTop:10}}>Streaming setup stopped safely. Its route is down and diagnostic data was retained.</div> : null}
             </div>
           ) : null}
@@ -1343,9 +1419,7 @@ export default function VMManager(){
         <div style={{display:'flex',gap:12, flexWrap:'wrap'}}>
           <div style={{flex:'1 1 620px'}}>
             <iframe title={`VM ${selected}`} src={selectedVmUrl || `/EpicVM/vm/${encodeURIComponent(selected)}/`} style={{width:'100%',height:360,border:'1px solid rgba(255,255,255,0.04)', background:'#020617'}} />
-            {selectedVmHostId === 'local' ? <div style={{marginTop:12}}>
-              <VmExec vmName={selected} />
-            </div> : <div className="vm-placement-notice" style={{marginTop:12}}>Remote console is served by the selected host URL.</div>}
+            <div className="vm-placement-notice" style={{marginTop:12}}>Use the VM console for interactive maintenance. Dashboard actions and logs remain available here.</div>
           </div>
           <div style={{width:420,maxWidth:'100%',display:'flex',flexDirection:'column',gap:8}}>
             <div style={{fontSize:13,color:'var(--muted)'}}>Console / Logs</div>

@@ -1,0 +1,18 @@
+[
+    {
+        "Path":  "E:\\EpicVM\\vms\\gaming-gpup-pilot-01",
+        "Status":  "removed"
+    },
+    {
+        "Path":  "E:\\EpicVM\\vms\\oobe-smoke-1",
+        "Status":  "removed"
+    },
+    {
+        "Path":  "E:\\EpicVM\\vms\\testprov",
+        "Status":  "removed"
+    },
+    {
+        "Path":  "E:\\EpicVM\\vms\\quarantine\\gaming-e2e-0913-1789831093",
+        "Status":  "removed"
+    }
+]

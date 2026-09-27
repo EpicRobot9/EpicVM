@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 import time
+import pytest
 from types import SimpleNamespace
 
 
@@ -27,7 +28,7 @@ class FakeRemoteHost:
     host_name = "Epic PC"
 
     def public_record(self):
-        return {"online": True, "capabilities": {"provisioning": True}}
+        return {"online": True, "capabilities": {"provisioning": True, "gaming_provisioning": True}}
 
     def provision(self, name, profile, spec=None, idempotency_key=None):
         self.provision_calls = getattr(self, "provision_calls", [])
@@ -91,6 +92,25 @@ class FakeRemoteHost:
 
     def deprovisioning_status(self, job_id):
         return {"job": {"id": job_id, "state": "ready"}}
+
+
+def test_agent_handoff_retries_only_explicit_busy(monkeypatch, tmp_path):
+    module = load_app(monkeypatch, tmp_path)
+    monkeypatch.setattr(module.time, 'sleep', lambda _: None)
+    calls = []
+    def operation():
+        calls.append(True)
+        if len(calls) == 1:
+            raise module.VmHostUnavailable('busy', status=409, code='agent_busy')
+        return 'accepted'
+    assert module._await_agent_handoff(operation) == 'accepted'
+    assert len(calls) == 2
+    def uncertain():
+        calls.append(True)
+        raise module.VmHostUnavailable('timeout', status=504, code='timeout')
+    with pytest.raises(module.VmHostUnavailable):
+        module._await_agent_handoff(uncertain)
+    assert len(calls) == 3
 
 
 def attach_host(module):
@@ -333,7 +353,7 @@ def test_console_retry_ready_is_idempotent(monkeypatch, tmp_path):
     assert response.get_json()["job"]["state"] == "ready"
 
 
-def test_ready_console_repair_is_async_read_only_and_does_not_expose_password(monkeypatch, tmp_path):
+def test_ready_console_repair_is_async_and_completes_ready_without_password_reflection(monkeypatch, tmp_path):
     module = load_app(monkeypatch, tmp_path)
     started = threading.Event()
 
@@ -400,21 +420,23 @@ def test_ready_console_repair_is_async_read_only_and_does_not_expose_password(mo
     deadline = time.time() + 2
     while time.time() < deadline:
         task = module._CONSOLE_RETRY_TASKS.get(("epic-pc", "job-1"))
-        if task and task.get("status") == "pending_visual":
+        if task and task.get("status") == "ready":
             break
         time.sleep(0.01)
-    assert task["status"] == "pending_visual"
+    assert task["status"] == "ready"
     assert task["routeReady"] is True
-    assert task["visualValidationRequired"] is True
+    assert task["visualValidationRequired"] is False
     assert task["kind"] == "repair"
     assert host.failed_codes == []
+    assert set(host.console_complete_calls[-1]) == {"job_id", "route_prefix", "guest_tcp_verified"}
+    assert host.console_complete_calls[-1]["guest_tcp_verified"] is True
 
     status = client.get("/dashboard/api/provisioning-jobs/job-1?host_id=epic-pc")
     assert status.status_code == 200
     status_job = status.get_json()["job"]
     assert status_job["state"] == "ready"
-    assert status_job["consoleRepairOutcome"] == "pending_visual"
-    assert status_job["consoleVisualValidationPending"] is True
+    assert status_job["consoleRepairOutcome"] == "ready"
+    assert status_job.get("consoleVisualValidationPending") is not True
 
 
 def test_remote_console_worker_rechecks_ready_state_before_credentials(monkeypatch, tmp_path):
@@ -459,6 +481,62 @@ def test_remote_console_worker_rechecks_ready_state_before_credentials(monkeypat
     assert task["status"] == "ready"
     assert task["routeReady"] is True
     assert task["failureCode"] == ""
+
+
+def test_remote_network_recovery_completes_ready_without_visual_gate(monkeypatch, tmp_path):
+    module = load_app(monkeypatch, tmp_path)
+    module._default_guest_credentials = lambda: ('operator', 'guest-secret')
+    module._default_sunshine_credentials = lambda: ('sun', 'sun-secret')
+
+    class RecoveryHost(FakeRemoteHost):
+        def provisioning_status(self, job_id):
+            return {"job": {"id": job_id, "name": "alpha", "state": "setup_failed:streaming", "tailnetIp": "100.111.82.1"}}
+
+        def network_recovery(self, job_id, *, guest_username, guest_password, reverify=False):
+            assert guest_username == "operator"
+            assert reverify is True
+            return {"job": {"id": job_id, "name": "alpha", "state": "streaming_setup", "tailnetIp": "100.111.82.4"}}
+
+        def console_credentials(self, job_id, **kwargs):
+            assert kwargs["reconcile_only"] is True
+            return {"ok": True}
+
+    class MoonlightRecovery:
+        backend = "moonlight"
+
+        def repair_staged(self, name, **kwargs):
+            assert kwargs["guest_ip"] == "100.111.82.4"
+            assert kwargs["route_name"] == "alpha--epic-pc"
+            return {"ok": True, "routePrefix": "/vm/alpha--epic-pc/", "guestTcpVerified": True}
+
+        def stop_staged(self, name):
+            return None
+
+    host = RecoveryHost()
+    module.VM_HOST_REGISTRY.get = lambda host_id="local": host
+    module._CONSOLE_ORCHESTRATOR = MoonlightRecovery()
+    key = ("epic-pc", "job-1")
+    module._start_remote_guest_network_recovery(
+        host=host,
+        host_id="epic-pc",
+        job_id="job-1",
+        name="alpha",
+        route_name="alpha--epic-pc",
+        guest_username="operator",
+        guest_password="guest-secret",
+        sunshine_username="sun",
+        sunshine_password="sun-secret",
+        orchestrator=module._CONSOLE_ORCHESTRATOR,
+        operation_id="op-netrec",
+    )
+
+    task = module._CONSOLE_RETRY_TASKS[key]
+    assert task["status"] == "ready"
+    assert task["routeReady"] is True
+    assert task["visualValidationRequired"] is False
+    assert task["failureCode"] == ""
+    assert set(host.console_complete_calls[-1]) == {"job_id", "route_prefix", "guest_tcp_verified"}
+    assert host.console_complete_calls[-1]["guest_tcp_verified"] is True
 
 
 def test_remote_moonlight_retry_returns_pending_and_deduplicates(monkeypatch, tmp_path):
@@ -529,10 +607,12 @@ def test_remote_moonlight_retry_returns_pending_and_deduplicates(monkeypatch, tm
     while time.time() < deadline and module._CONSOLE_RETRY_TASKS.get(('epic-pc', 'job-1'), {}).get('status') == 'pending':
         time.sleep(0.01)
     task = module._CONSOLE_RETRY_TASKS[('epic-pc', 'job-1')]
-    assert task['status'] == 'pending_visual'
+    assert task['status'] == 'ready'
     assert task['routeReady'] is True
-    assert task['visualValidationRequired'] is True
+    assert task['visualValidationRequired'] is False
     assert task['failureCode'] == ''
+    assert set(host.console_complete_calls[-1]) == {'job_id', 'route_prefix', 'guest_tcp_verified'}
+    assert host.console_complete_calls[-1]['guest_tcp_verified'] is True
 
 
 def test_remote_moonlight_retry_publishes_safe_terminal_failure(monkeypatch, tmp_path):
@@ -606,6 +686,53 @@ def test_admin_can_enable_and_launch_automatic_console_without_password_reflecti
     assert 'localStorage.setItem("GUAC_AUTH_TOKEN",JSON.stringify(result.authToken))' in body
     assert '/vm/alpha/?data=' not in body
     assert launch.headers['Cache-Control'] == 'no-store'
+
+
+@pytest.mark.parametrize('state', ['queued', 'cloning', 'booting'])
+def test_pending_queue_retains_creates_before_the_claim(monkeypatch, tmp_path, state):
+    module = load_app(monkeypatch, tmp_path)
+    attach_host(module)
+    host = module.VM_HOST_REGISTRY.get('epic-pc')
+    host.provisioning_jobs = lambda: [{
+        'id': 'job-1', 'name': 'alpha', 'state': state, 'claimConsumed': False,
+    }]
+    jobs = authenticated_client(module).get('/dashboard/api/provisioning-jobs/pending').get_json()['jobs']
+    assert len(jobs) == 1
+    assert jobs[0]['job']['state'] == state
+    assert jobs[0]['job']['claimAvailable'] is False
+
+
+def test_repaired_failed_job_remains_selectable_for_visual_verification(monkeypatch, tmp_path):
+    module = load_app(monkeypatch, tmp_path)
+    attach_host(module)
+    host = module.VM_HOST_REGISTRY.get('epic-pc')
+    host.provisioning_jobs = lambda: [{
+        'id': 'job-1', 'name': 'alpha', 'state': 'setup_failed:streaming', 'claimConsumed': True,
+    }]
+    module._CONSOLE_RETRY_TASKS[('epic-pc', 'job-1')] = {
+        'status': 'pending_visual', 'routePrefix': '/vm/alpha--epic-pc/',
+    }
+    jobs = authenticated_client(module).get('/dashboard/api/provisioning-jobs/pending').get_json()['jobs']
+    assert len(jobs) == 1
+    assert jobs[0]['job']['consoleVisualValidationPending'] is True
+    assert jobs[0]['job']['consoleRoutePrefix'] == '/vm/alpha--epic-pc/'
+
+
+@pytest.mark.parametrize('kind,returncode,expected_stops', [('remote', 0, ['alpha']), ('remote', 1, []), ('local', 0, [])])
+def test_stopping_vm_releases_only_its_remote_console_after_success(monkeypatch, tmp_path, kind, returncode, expected_stops):
+    module = load_app(monkeypatch, tmp_path)
+    attach_host(module)
+    host = module.VM_HOST_REGISTRY.get('epic-pc')
+    host.kind = kind
+    host.run_manager = lambda *args, **kwargs: SimpleNamespace(returncode=returncode, stdout='', stderr='')
+    stopped = []
+    module._CONSOLE_ORCHESTRATOR.stop_staged = stopped.append
+    monkeypatch.setattr(module, '_moonlight_console', lambda orchestrator: True)
+    client = authenticated_client(module)
+    csrf = client.get('/dashboard/api/auth/csrf').get_json()['csrfToken']
+    response = client.post('/dashboard/api/stop/alpha?host_id=epic-pc', headers={'Origin': 'http://localhost', 'X-CSRF-Token': csrf})
+    assert response.status_code == (502 if returncode else 200)
+    assert stopped == expected_stops
 
 
 def test_pending_remote_jobs_are_safe_and_survive_inventory_refresh(monkeypatch, tmp_path):
@@ -701,7 +828,7 @@ def test_claim_uses_protected_default_sunshine_credentials(monkeypatch, tmp_path
     assert 'sun-default-password' not in response.get_data(as_text=True)
 
 
-def test_console_verify_requires_browser_visual_and_input_evidence(monkeypatch, tmp_path):
+def test_console_verify_requires_transport_and_decoded_video_evidence(monkeypatch, tmp_path):
     module = load_app(monkeypatch, tmp_path)
     attach_host(module)
     host = module.VM_HOST_REGISTRY.get('epic-pc')
@@ -731,12 +858,18 @@ def test_console_verify_requires_browser_visual_and_input_evidence(monkeypatch, 
         'host_id': 'epic-pc',
         'routePrefix': '/vm/alpha--epic-pc/',
         'guestTcpVerified': True,
-        'evidenceSource': 'browser_kvm',
+        'frameMetrics': {
+            'nonblackFraction': .75,
+            'meanLuma': 40,
+            'stdDev': 41,
+            'decodedFramesDelta': 10,
+            'durationMs': 2000,
+        },
     }
 
     incomplete = client.post(
         '/dashboard/api/provisioning-jobs/job-1/console-verify',
-        json=base,
+        json={**base, 'guestTcpVerified': False},
         headers=headers,
     )
     assert incomplete.status_code == 422
@@ -744,31 +877,19 @@ def test_console_verify_requires_browser_visual_and_input_evidence(monkeypatch, 
 
     complete = client.post(
         '/dashboard/api/provisioning-jobs/job-1/console-verify',
-        json={
-            **base,
-            'videoFrameVerified': True,
-            'keyboardInputVerified': True,
-            'mouseInputVerified': True,
-            'frameMetrics': {
-                'nonblackFraction': 0.74,
-                'meanLuma': 40.5,
-                'stdDev': 41.2,
-                'decodedFramesDelta': 150,
-                'durationMs': 5000,
-            },
-        },
+        json=base,
         headers=headers,
     )
     assert complete.status_code == 200
     body = complete.get_json()
     assert body['visualValidationComplete'] is True
     assert body['job']['consoleVisualValidationPending'] is False
-    assert host.console_complete_calls[-1]['video_frame_verified'] is True
-    assert host.console_complete_calls[-1]['keyboard_input_verified'] is True
-    assert host.console_complete_calls[-1]['mouse_input_verified'] is True
+    assert set(host.console_complete_calls[-1]) == {'job_id', 'route_prefix', 'guest_tcp_verified', 'frame_metrics'}
+    assert host.console_complete_calls[-1]['guest_tcp_verified'] is True
 
 
-def test_automatic_mode_claims_with_protected_defaults_and_returns_no_claim_secret(monkeypatch, tmp_path):
+@pytest.mark.parametrize('deferred', [False, True])
+def test_automatic_mode_claims_with_protected_defaults_and_returns_no_claim_secret(monkeypatch, tmp_path, deferred):
     module = load_app(monkeypatch, tmp_path)
     attach_host(module)
     host = module.VM_HOST_REGISTRY.get('epic-pc')
@@ -778,6 +899,8 @@ def test_automatic_mode_claims_with_protected_defaults_and_returns_no_claim_secr
     started = threading.Event()
 
     def provision(name, profile, idempotency_key=None):
+        if deferred:
+            return {'job': {'id': 'job-auto', 'name': name, 'profile': profile, 'state': 'queued'}}
         return {
             'job': {'id': 'job-auto', 'name': name, 'profile': profile, 'state': 'unclaimed'},
             'claimToken': 'auto-one-use',
@@ -786,7 +909,7 @@ def test_automatic_mode_claims_with_protected_defaults_and_returns_no_claim_secr
     def claim(job_id, username, password, claim_token):
         assert username == 'default-user'
         assert password == 'default-password'
-        assert claim_token == 'auto-one-use'
+        assert claim_token == ('reissued-once' if deferred else 'auto-one-use')
         host.claimed = True
         return {'job': {'id': job_id, 'name': 'alpha', 'state': 'streaming_setup', 'tailnetIp': '100.111.82.1'}}
 
@@ -856,12 +979,14 @@ def test_automatic_mode_claims_with_protected_defaults_and_returns_no_claim_secr
     deadline = time.time() + 2
     while time.time() < deadline:
         task = module._CONSOLE_RETRY_TASKS.get(('epic-pc', 'job-auto'))
-        if task and task.get('status') == 'pending_visual':
+        if task and task.get('status') == 'ready':
             break
         time.sleep(0.01)
-    assert task['status'] == 'pending_visual'
+    assert task['status'] == 'ready'
     assert task['routeReady'] is True
-    assert task['visualValidationRequired'] is True
+    assert task['visualValidationRequired'] is False
+    assert host.console_complete_calls[-1]['job_id'] == 'job-auto'
+    assert host.console_complete_calls[-1]['guest_tcp_verified'] is True
     assert host.last_console_credentials == {
         'job_id': 'job-auto',
         'guest_username': 'default-user',
@@ -927,3 +1052,96 @@ def test_gaming_partition_endpoint_updates_only_percent(monkeypatch, tmp_path):
     )
     assert invalid.status_code == 400
     assert host.gpu_partition_calls[-1]['percent'] == 72
+
+
+def test_omarchy_provisioning_uses_its_own_capability_and_resource_payload(monkeypatch, tmp_path):
+    module = load_app(monkeypatch, tmp_path)
+    attach_host(module)
+    host = module.VM_HOST_REGISTRY.get('epic-pc')
+    host.public_record = lambda: {
+        'online': True,
+        'capabilities': {
+            'provisioning': True,
+            'omarchy_provisioning': True,
+            'omarchyProvisioningChecks': {'pilotValidated': True},
+        },
+    }
+    client = authenticated_client(module)
+    csrf = client.get('/dashboard/api/auth/csrf').get_json()['csrfToken']
+    response = client.post(
+        '/dashboard/api/provisioning-jobs',
+        json={
+            'host_id': 'epic-pc',
+            'name': 'omarchy-alpha',
+            'profile': 'omarchy',
+            'mode': 'claim',
+            'cpuCount': 8,
+            'memoryGiB': 16,
+            'diskSizeGiB': 256,
+            'gpuPartitionPercent': 65,
+            'password': 'must-not-forward',
+        },
+        headers={'Origin': 'http://localhost', 'X-CSRF-Token': csrf},
+    )
+
+    assert response.status_code == 202
+    call = host.provision_calls[-1]
+    assert call['profile'] == 'omarchy'
+    assert call['spec'] == {
+        'cpuCount': 8,
+        'memoryGiB': 16,
+        'diskSizeGiB': 256,
+        'gpuPartitionPercent': 65,
+    }
+    assert 'must-not-forward' not in response.get_data(as_text=True)
+
+
+def test_omarchy_provisioning_rejects_hosts_without_the_experimental_capability(monkeypatch, tmp_path):
+    module = load_app(monkeypatch, tmp_path)
+    attach_host(module)
+    host = module.VM_HOST_REGISTRY.get('epic-pc')
+    host.public_record = lambda: {
+        'online': True,
+        'capabilities': {
+            'provisioning': True,
+            'omarchy_provisioning': False,
+            'omarchyProvisioningChecks': {'pilotValidated': False},
+        },
+    }
+    client = authenticated_client(module)
+    csrf = client.get('/dashboard/api/auth/csrf').get_json()['csrfToken']
+    response = client.post(
+        '/dashboard/api/provisioning-jobs',
+        json={'host_id': 'epic-pc', 'name': 'omarchy-alpha', 'profile': 'omarchy'},
+        headers={'Origin': 'http://localhost', 'X-CSRF-Token': csrf},
+    )
+
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body['code'] == 'omarchy_provisioning_unavailable'
+    assert 'experimental AMD GPU-P pilot' in body['error']
+    assert not getattr(host, 'provision_calls', [])
+
+
+def test_omarchy_inventory_and_job_serialization_identify_linux_without_claim_material(monkeypatch, tmp_path):
+    module = load_app(monkeypatch, tmp_path)
+    safe = module._safe_provisioning_job({
+        'id': 'job-omarchy',
+        'name': 'omarchy-alpha',
+        'profile': 'omarchy',
+        'guestOs': 'Omarchy Linux',
+        'guestUsername': 'operator',
+        'claimHash': 'secret-hash',
+        'claimToken': 'secret-token',
+        'password': 'secret-password',
+    })
+
+    assert safe['profile'] == 'omarchy'
+    assert safe['guestOs'] == 'Omarchy Linux'
+    assert safe['guestUsername'] == 'operator'
+    assert 'claimHash' not in safe
+    assert 'claimToken' not in safe
+    assert 'password' not in safe
+    source = open(module.__file__, encoding='utf-8').read()
+    assert "vm_type = 'omarchy'" in source
+    assert "'Omarchy Linux' if vm_type == 'omarchy'" in source

@@ -228,7 +228,7 @@ def test_remote_network_recovery_forwards_reverify_without_logging_credentials()
         "password": "transient-password",
         "reverify": True,
     }
-    assert timeout == 120
+    assert timeout == 600
 
 
 def test_remote_gaming_provision_forwards_initial_resources_and_partition_percent():
@@ -400,6 +400,7 @@ def test_remote_capability_features_make_agent_eligible():
         "delete": True,
         "console": False,
         "provisioning": True,
+        "omarchy_provisioning": False,
     }
 
 
@@ -478,6 +479,33 @@ def test_remote_console_retry_accepts_legacy_top_level_safe_code():
     assert caught.value.code == "sunshine_setup_failed"
     assert "secret" not in str(caught.value)
     assert "do not reflect" not in str(caught.value)
+
+
+def test_console_frame_evidence_reaches_the_agent_payload(monkeypatch):
+    host = RemoteAgentHost({
+        "id": "epic-pc", "display_name": "Epic PC",
+        "agent_url": "http://100.64.0.2:8765", "token": "test-token",
+    })
+    calls = []
+
+    def request(method, path, payload=None, **kwargs):
+        calls.append((method, path, payload))
+        return {"ok": True, "job": {"state": "ready"}}
+
+    monkeypatch.setattr(host.client, "_request", request)
+    metrics = {"nonblackFraction": 0.9, "meanLuma": 70, "stdDev": 42,
+               "decodedFramesDelta": 120, "durationMs": 2000}
+    result = host.console_complete(
+        "job-1", route_prefix="/vm/alpha--epic-pc/", guest_tcp_verified=True,
+        video_frame_verified=True, keyboard_input_verified=True,
+        mouse_input_verified=True, frame_metrics=metrics,
+    )
+    assert result["job"]["state"] == "ready"
+    assert calls == [("POST", "/v1/provisioning-jobs/job-1/console-complete", {
+        "routePrefix": "/vm/alpha--epic-pc/", "guestTcpVerified": True,
+        "videoFrameVerified": True, "keyboardInputVerified": True,
+        "mouseInputVerified": True, "frameMetrics": metrics,
+    })]
 
 
 def test_remote_vm_url_includes_public_origin_and_host_id(monkeypatch):
@@ -1108,7 +1136,7 @@ def test_remote_ownership_check_does_not_probe_other_hosts_live(monkeypatch, tmp
     module._ensure_remote_vm_exists(Registry.providers["epic-pc"], "alpha")
 
 
-def test_remote_manage_settings_cannot_write_local_presentation_state(monkeypatch, tmp_path):
+def test_remote_manage_settings_stays_out_of_local_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setenv("BLOBEVM_ALLOW_INSECURE_DASHBOARD", "1")
     monkeypatch.setenv("BLOBEDASH_STATE", str(tmp_path))
     import importlib
@@ -1130,9 +1158,13 @@ def test_remote_manage_settings_cannot_write_local_presentation_state(monkeypatc
             return FakeHost()
 
     monkeypatch.setattr(module, "VM_HOST_REGISTRY", FakeRegistry())
+    monkeypatch.setattr(module, "_set_instance_meta", lambda *args, **kwargs: pytest.fail("remote settings touched local instance metadata"))
+    monkeypatch.setattr(module, "_run_manager", lambda *args, **kwargs: pytest.fail("remote settings triggered a local runtime action"))
     response = module.app.test_client().post(
         "/dashboard/api/vm-settings/alpha?host_id=epic-pc",
         json={"host_id": "epic-pc", "title": "should-not-write"},
     )
-    assert response.status_code == 409
-    assert response.get_json()["code"] == "remote_settings_read_only"
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["host_id"] == "epic-pc"
+    assert payload["title"] == "should-not-write"

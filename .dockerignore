@@ -1,0 +1,16 @@
+.git
+.gitignore
+.agents
+.hermes
+**/.pytest_cache
+**/.pytest-*
+**/node_modules
+**/dist
+**/build
+**/coverage
+**/*.log
+**/*.sqlite3
+**/*.pyc
+recovery-evidence
+tmp
+opt

@@ -15,6 +15,13 @@
   "MaxDiskSizeBytes": 549755813888,
   "Generation": 2,
   "TemplateManifestPath": "E:\\EpicVM\\templates\\win11-25h2\\manifest.json",
+  "OmarchyTemplateManifestPath": "E:\\EpicVM\\templates\\omarchy-3.8.3\\manifest.json",
+  "OmarchyVersion": "3.8.3",
+  "OmarchyIsoUrl": "https://iso.omarchy.org/omarchy-3.8.3.iso",
+  "OmarchyIsoSha256": "40c9368eeb7e021a13d0899b379517843b4839f6e7721473169369fbd0fe61ac",
+  "OmarchyGpuDeviceIdentity": "VEN_1002&DEV_73BF",
+  "OmarchyGpuPartitionPercent": 50,
+  "OmarchyPilotValidated": false,
   "ProvisioningStatePath": "E:\\EpicVM\\provisioning-jobs.json",
   "GamingVMNames": ["testre"],
   "BootstrapUser": "EpicVMBootstrap",
@@ -30,5 +37,6 @@
     "C:\\Program Files\\Sunshine\\config\\sunshine_state.json",
     "C:\\ProgramData\\Sunshine\\config\\sunshine_state.json"
   ],
-  "EnableGamingProvisioning": false
+  "EnableGamingProvisioning": false,
+  "EnableOmarchyProvisioning": false
 }

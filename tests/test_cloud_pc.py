@@ -43,9 +43,12 @@ def test_upsert_and_load(tmp_path):
     assert len(loaded) == 1
     assert loaded[0]["owner"] == "epic"
     assert loaded[0]["tailnet_ip"] == "100.72.10.5"
-    # Registry must be 0600.
-    mode = stat.S_IMODE(os.stat(path).st_mode)
-    assert mode == 0o600
+    if os.name != "nt":
+        # Registry must be 0600 on POSIX systems. Windows does not expose the
+        # same group/world mode bits through stat, so the same chmod call is
+        # still exercised but cannot be asserted portably.
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600
 
 
 def test_upsert_is_idempotent_on_id(tmp_path):

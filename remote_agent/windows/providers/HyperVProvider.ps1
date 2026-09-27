@@ -16,6 +16,8 @@ $tailscaleProviderPath = Join-Path $PSScriptRoot 'TailscaleProvider.ps1'
 if (Test-Path -LiteralPath $tailscaleProviderPath) { . $tailscaleProviderPath }
 $gamingGpuProviderPath = Join-Path $PSScriptRoot 'GamingGpuPProvider.ps1'
 if (Test-Path -LiteralPath $gamingGpuProviderPath) { . $gamingGpuProviderPath }
+$omarchyProviderPath = Join-Path $PSScriptRoot 'OmarchyProvider.ps1'
+if (Test-Path -LiteralPath $omarchyProviderPath) { . $omarchyProviderPath }
 
 $script:EpicVMHyperVOwnershipMarker = 'EpicVM-Managed: true'
 
@@ -231,7 +233,9 @@ function ConvertTo-EpicVMHyperVVMInfo {
         try { $uptimeSeconds = [long]([System.TimeSpan]$uptime).TotalSeconds } catch { $uptimeSeconds = $null }
     }
     $notes = [string](Get-EpicVMHyperVValue -Object $VM -Name 'Notes' -Default '')
-    $profile = if ($notes -match '(?m)^EpicVM-Profile:\s*gaming\s*$') { 'gaming' } else { 'standard' }
+    $profile = if ($notes -match '(?m)^EpicVM-Profile:\s*omarchy\s*$') { 'omarchy' }
+        elseif ($notes -match '(?m)^EpicVM-Profile:\s*gaming\s*$') { 'gaming' }
+        else { 'standard' }
     $path = [string](Get-EpicVMHyperVValue -Object $VM -Name 'Path' -Default '')
 
     return [ordered]@{
@@ -333,16 +337,28 @@ function Get-EpicVMHyperVCreateOptions {
 
     $switchName = [string](Get-EpicVMHyperVValue -Object $Request -Name 'SwitchName' -Default (Get-EpicVMHyperVOption -Config $config -Name 'SwitchName' -Default ''))
     $profile = [string](Get-EpicVMHyperVValue -Object $Request -Name 'Profile' -Default 'standard').ToLowerInvariant()
-    $gpu = [bool](Get-EpicVMHyperVValue -Object $Request -Name 'Gpu' -Default ($profile -eq 'gaming'))
-    if ($profile -notin @('standard','gaming')) { throw (New-EpicVMHyperVError -Code 'InvalidInput' -Message 'The VM profile is invalid.') }
-    if ($profile -eq 'gaming' -and -not $gpu) { throw (New-EpicVMHyperVError -Code 'InvalidInput' -Message 'Gaming VMs require GPU-P.') }
-    $gpuPercentRaw = Get-EpicVMHyperVValue -Object $Request -Name 'GpuPartitionPercent' -Default (Get-EpicVMHyperVOption -Config $config -Name 'GamingGpuPartitionPercent' -Default 50)
+    $gpu = [bool](Get-EpicVMHyperVValue -Object $Request -Name 'Gpu' -Default ($profile -in @('gaming','omarchy')))
+    if ($profile -notin @('standard','gaming','omarchy')) { throw (New-EpicVMHyperVError -Code 'InvalidInput' -Message 'The VM profile is invalid.') }
+    if ($profile -in @('gaming','omarchy') -and -not $gpu) { throw (New-EpicVMHyperVError -Code 'InvalidInput' -Message 'GPU-P profiles require GPU-P.') }
+    if ($profile -eq 'omarchy' -and $generation -ne 2) {
+        throw (New-EpicVMHyperVError -Code 'InvalidInput' -Message 'Omarchy VMs require Hyper-V generation 2.')
+    }
+    $gpuPercentDefault = if ($profile -eq 'omarchy') {
+        Get-EpicVMHyperVOption -Config $config -Name 'OmarchyGpuPartitionPercent' -Default 50
+    } else {
+        Get-EpicVMHyperVOption -Config $config -Name 'GamingGpuPartitionPercent' -Default 50
+    }
+    $gpuPercentRaw = Get-EpicVMHyperVValue -Object $Request -Name 'GpuPartitionPercent' -Default $gpuPercentDefault
     try { $gpuPercent = [int][System.Convert]::ToInt32($gpuPercentRaw) }
     catch { throw (New-EpicVMHyperVError -Code 'InvalidInput' -Message 'The GPU-P partition percentage is invalid.') }
     if ($gpu -and ($gpuPercent -lt 1 -or $gpuPercent -gt 100)) {
         throw (New-EpicVMHyperVError -Code 'InvalidInput' -Message 'The GPU-P partition percentage must be between 1 and 100.')
     }
-    $gpuDeviceIdentity = [string](Get-EpicVMHyperVOption -Config $config -Name 'GamingGpuDeviceIdentity' -Default 'VEN_1002&DEV_73BF')
+    $gpuDeviceIdentity = if ($profile -eq 'omarchy') {
+        [string](Get-EpicVMHyperVOption -Config $config -Name 'OmarchyGpuDeviceIdentity' -Default 'VEN_1002&DEV_73BF')
+    } else {
+        [string](Get-EpicVMHyperVOption -Config $config -Name 'GamingGpuDeviceIdentity' -Default 'VEN_1002&DEV_73BF')
+    }
     $vmRoot = [string](Get-EpicVMHyperVOption -Config $config -Name 'VmRoot' -Default 'E:\EpicVM\vms')
     if ([string]::IsNullOrWhiteSpace($vmRoot)) {
         throw (New-EpicVMHyperVError -Code 'InvalidInput' -Message 'The Hyper-V VM root is not configured.')
@@ -360,6 +376,7 @@ function Get-EpicVMHyperVCreateOptions {
         gpu = $gpu
         gpuPartitionPercent = $gpuPercent
         gpuDeviceIdentity = $gpuDeviceIdentity
+        bootstrapSeedPath = [string](Get-EpicVMHyperVValue -Object $Request -Name 'BootstrapSeedPath' -Default '')
         templateRequired = [bool](Get-EpicVMHyperVValue -Object $Request -Name 'TemplateRequired' -Default $false)
     }
 }
@@ -394,6 +411,7 @@ function Get-EpicVMHyperVCapabilities {
     $readiness = [ordered]@{
         provisioning = $false
         gaming_provisioning = $false
+        omarchy_provisioning = $false
         provisioningChecks = [ordered]@{
             template = $false
             bootstrapCredential = $false
@@ -402,10 +420,19 @@ function Get-EpicVMHyperVCapabilities {
             tailscaleOAuthSecret = $false
             gpuPartitionable = $false
         }
+        omarchyProvisioningChecks = [ordered]@{}
     }
     if ($available -and (Get-Command -Name Test-EpicVMProvisioningPrerequisites -ErrorAction SilentlyContinue)) {
         try {
             $readiness = Test-EpicVMProvisioningPrerequisites -Config (Get-EpicVMHyperVValue -Object $Provider -Name 'Config') -Provider $Provider -Detailed
+        }
+        catch { }
+    }
+    if ($available -and (Get-Command -Name Get-EpicVMOmarchyProvisioningReadiness -ErrorAction SilentlyContinue)) {
+        try {
+            $omarchyReadiness = Get-EpicVMOmarchyProvisioningReadiness -Config (Get-EpicVMHyperVValue -Object $Provider -Name 'Config') -Provider $Provider
+            $readiness.omarchy_provisioning = [bool]$omarchyReadiness.omarchy_provisioning
+            $readiness.omarchyProvisioningChecks = $omarchyReadiness.omarchyProvisioningChecks
         }
         catch { }
     }
@@ -426,8 +453,10 @@ function Get-EpicVMHyperVCapabilities {
         console = $false
         provisioning = [bool]$readiness.provisioning
         gaming_provisioning = [bool]$readiness.gaming_provisioning
+        omarchy_provisioning = [bool]$readiness.omarchy_provisioning
         provisioningChecks = $readiness.provisioningChecks
-        features = @('capabilities', 'list', 'create', 'lifecycle', 'delete-owned', 'full-copy-template', 'powershell-direct', 'tailscale-enrollment')
+        omarchyProvisioningChecks = $readiness.omarchyProvisioningChecks
+        features = @('capabilities', 'list', 'create', 'lifecycle', 'delete-owned', 'full-copy-template', 'powershell-direct', 'tailscale-enrollment', 'omarchy-linux', 'tailscale-ssh')
         resources = [ordered]@{
             logicalProcessorCount = $logicalProcessors
             memoryCapacityBytes = $memoryCapacity
@@ -445,7 +474,10 @@ function Get-EpicVMHyperVCapabilities {
 }
 
 function Test-EpicVMHyperVGpuPartitionable {
-    param([Parameter(Mandatory)] [object] $Provider)
+    param(
+        [Parameter(Mandatory)] [object] $Provider,
+        [string] $DeviceIdentity = ''
+    )
 
     if (-not [bool](Get-EpicVMHyperVValue -Object $Provider -Name 'Available' -Default $false)) { return $false }
     try {
@@ -453,29 +485,38 @@ function Test-EpicVMHyperVGpuPartitionable {
         # invoker that cannot resolve it is a clean "not ready", never a reason
         # to expose GPU provisioning.
         $items = @(Invoke-EpicVMHyperVCmdlet -Provider $Provider -CommandName 'Get-VMHostPartitionableGpu' -Parameters @{ ErrorAction = 'Stop' })
-        $identity = [string](Get-EpicVMHyperVOption -Config (Get-EpicVMHyperVValue -Object $Provider -Name 'Config') -Name 'GamingGpuDeviceIdentity' -Default 'VEN_1002&DEV_73BF')
+        if ([string]::IsNullOrWhiteSpace($DeviceIdentity)) {
+            $DeviceIdentity = [string](Get-EpicVMHyperVOption -Config (Get-EpicVMHyperVValue -Object $Provider -Name 'Config') -Name 'GamingGpuDeviceIdentity' -Default 'VEN_1002&DEV_73BF')
+        }
         if ($items.Count -eq 0) { return $false }
-        Resolve-EpicVMGamingPartitionableGpu -PartitionableGpus $items -DeviceIdentity $identity | Out-Null
+        Resolve-EpicVMGamingPartitionableGpu -PartitionableGpus $items -DeviceIdentity $DeviceIdentity | Out-Null
         return $true
     }
     catch { return $false }
 }
 
 function Get-EpicVMHyperVGamingGpu {
-    param([Parameter(Mandatory)] [object] $Provider)
+    param(
+        [Parameter(Mandatory)] [object] $Provider,
+        [string] $DeviceIdentity = '',
+        [string] $ProfileName = 'gaming'
+    )
 
-    $identity = [string](Get-EpicVMHyperVOption -Config (Get-EpicVMHyperVValue -Object $Provider -Name 'Config') -Name 'GamingGpuDeviceIdentity' -Default 'VEN_1002&DEV_73BF')
+    if ([string]::IsNullOrWhiteSpace($DeviceIdentity)) {
+        $identityConfigName = if ($ProfileName -ieq 'omarchy') { 'OmarchyGpuDeviceIdentity' } else { 'GamingGpuDeviceIdentity' }
+        $DeviceIdentity = [string](Get-EpicVMHyperVOption -Config (Get-EpicVMHyperVValue -Object $Provider -Name 'Config') -Name $identityConfigName -Default 'VEN_1002&DEV_73BF')
+    }
     try {
         $items = @(Invoke-EpicVMHyperVCmdlet -Provider $Provider -CommandName 'Get-VMHostPartitionableGpu' -Parameters @{ ErrorAction = 'Stop' })
     }
     catch {
-        throw (New-EpicVMHyperVError -Code 'GpuUnavailable' -Message 'GPU-P support is unavailable for the Gaming profile.')
+        throw (New-EpicVMHyperVError -Code 'GpuUnavailable' -Message ("GPU-P support is unavailable for the {0} profile." -f $ProfileName))
     }
     if ($items.Count -eq 0) {
-        throw (New-EpicVMHyperVError -Code 'GpuUnavailable' -Message 'No partitionable GPU is available.')
+        throw (New-EpicVMHyperVError -Code 'GpuUnavailable' -Message ("No partitionable GPU is available for the {0} profile." -f $ProfileName))
     }
     try {
-        return Resolve-EpicVMGamingPartitionableGpu -PartitionableGpus $items -DeviceIdentity $identity
+        return Resolve-EpicVMGamingPartitionableGpu -PartitionableGpus $items -DeviceIdentity $DeviceIdentity
     }
     catch {
         if ($_.Exception.PSObject.Properties['ErrorCode']) {
@@ -538,26 +579,32 @@ function Set-EpicVMHyperVGamingGpuPartitionAdapter {
     param(
         [Parameter(Mandatory)] [object] $Provider,
         [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $Name,
-        [Parameter(Mandatory)] [ValidateRange(1, 100)] [int] $Percent
+        [Parameter(Mandatory)] [ValidateRange(1, 100)] [int] $Percent,
+        [string] $DeviceIdentity = '',
+        [ValidateSet('gaming','omarchy')] [string] $ProfileName = 'gaming'
     )
 
     foreach ($commandName in @('Get-VMHostPartitionableGpu','Get-VMGpuPartitionAdapter','Add-VMGpuPartitionAdapter','Set-VMGpuPartitionAdapter')) {
         if ($null -eq (Get-EpicVMHyperVValue -Object $Provider -Name 'CommandInvoker' -Default $null) -and
             $null -eq (Get-Command -Name $commandName -ErrorAction SilentlyContinue)) {
-            throw (New-EpicVMHyperVError -Code 'GpuUnavailable' -Message 'GPU-P support is unavailable for the Gaming profile.')
+            throw (New-EpicVMHyperVError -Code 'GpuUnavailable' -Message ("GPU-P support is unavailable for the {0} profile." -f $ProfileName))
         }
     }
 
-    $gpu = Get-EpicVMHyperVGamingGpu -Provider $Provider
     $config = Get-EpicVMHyperVValue -Object $Provider -Name 'Config'
-    $identity = [string](Get-EpicVMHyperVOption -Config $config -Name 'GamingGpuDeviceIdentity' -Default 'VEN_1002&DEV_73BF')
+    if ([string]::IsNullOrWhiteSpace($DeviceIdentity)) {
+        $identityConfigName = if ($ProfileName -ieq 'omarchy') { 'OmarchyGpuDeviceIdentity' } else { 'GamingGpuDeviceIdentity' }
+        $DeviceIdentity = [string](Get-EpicVMHyperVOption -Config $config -Name $identityConfigName -Default 'VEN_1002&DEV_73BF')
+    }
+    $gpu = Get-EpicVMHyperVGamingGpu -Provider $Provider -DeviceIdentity $DeviceIdentity -ProfileName $ProfileName
+    $identity = $DeviceIdentity
     $plan = Get-EpicVMGamingGpuPartitionPlan -PartitionableGpu $gpu -Percent $Percent
     $adapters = @(Invoke-EpicVMHyperVCmdlet -Provider $Provider -CommandName 'Get-VMGpuPartitionAdapter' -Parameters @{ VMName=$Name; ErrorAction='Stop' })
     if ($adapters.Count -gt 1) {
-        throw (New-EpicVMHyperVError -Code 'GpuAdapterCountInvalid' -Message 'Gaming VMs must have exactly one GPU partition adapter.')
+        throw (New-EpicVMHyperVError -Code 'GpuAdapterCountInvalid' -Message ("{0} VMs must have exactly one GPU partition adapter." -f $ProfileName))
     }
     if ($adapters.Count -eq 1 -and -not (Test-EpicVMHyperVGamingAdapterIdentity -Adapter $adapters[0] -DeviceIdentity $identity)) {
-        throw (New-EpicVMHyperVError -Code 'GpuIdentityMismatch' -Message 'The existing GPU partition adapter does not match the configured AMD device identity.')
+        throw (New-EpicVMHyperVError -Code 'GpuIdentityMismatch' -Message ("The existing {0} GPU partition adapter does not match the configured AMD device identity." -f $ProfileName))
     }
     if ($adapters.Count -eq 0) {
         Invoke-EpicVMHyperVCmdlet -Provider $Provider -CommandName 'Add-VMGpuPartitionAdapter' -Parameters @{
@@ -579,7 +626,7 @@ function Set-EpicVMHyperVGamingGpuPartitionAdapter {
 
     $finalAdapters = @(Invoke-EpicVMHyperVCmdlet -Provider $Provider -CommandName 'Get-VMGpuPartitionAdapter' -Parameters @{ VMName=$Name; ErrorAction='Stop' })
     if ($finalAdapters.Count -ne 1 -or -not (Test-EpicVMHyperVGamingAdapterIdentity -Adapter $finalAdapters[0] -DeviceIdentity $identity)) {
-        throw (New-EpicVMHyperVError -Code 'GpuAdapterVerificationFailed' -Message 'GPU-P adapter verification did not produce exactly one matching AMD adapter.')
+        throw (New-EpicVMHyperVError -Code 'GpuAdapterVerificationFailed' -Message ("GPU-P adapter verification did not produce exactly one matching AMD adapter for {0}." -f $ProfileName))
     }
     $adapterPath = [string](Get-EpicVMGamingProperty -Object $finalAdapters[0] -Name 'InstancePath' -Default (Get-EpicVMGamingProperty -Object $finalAdapters[0] -Name 'Name' -Default ''))
     return [ordered]@{
@@ -592,11 +639,14 @@ function Set-EpicVMHyperVGamingGpuPartitionAdapter {
 }
 
 function Test-EpicVMHyperVGamingProfile {
-    param([AllowNull()] [object] $VM)
+    param(
+        [AllowNull()] [object] $VM,
+        [ValidateSet('gaming','omarchy')] [string] $ProfileName = 'gaming'
+    )
 
     $notes = [string](Get-EpicVMHyperVValue -Object $VM -Name 'Notes' -Default '')
     foreach ($line in ($notes -split [char]10)) {
-        if ($line.Trim() -ceq 'EpicVM-Profile: gaming') { return $true }
+        if ($line.Trim() -ceq ('EpicVM-Profile: ' + $ProfileName)) { return $true }
     }
     return $false
 }
@@ -635,8 +685,11 @@ function Set-EpicVMHyperVGamingGpuPartitionPercent {
     if (-not (Test-EpicVMHyperVOwned -VM $vm) -or -not (Test-EpicVMHyperVManagedRoot -Provider $Provider -VM $vm)) {
         throw (New-EpicVMHyperVError -Code 'UnmanagedVM' -Message ("VM '{0}' is not an EpicVM-managed Gaming VM." -f $Name))
     }
-    if (-not (Test-EpicVMHyperVGamingProfile -VM $vm)) {
-        throw (New-EpicVMHyperVError -Code 'InvalidInput' -Message 'GPU-P partition changes are available only for Gaming VMs.')
+    $profileName = if (Test-EpicVMHyperVGamingProfile -VM $vm -ProfileName 'gaming') { 'gaming' }
+        elseif (Test-EpicVMHyperVGamingProfile -VM $vm -ProfileName 'omarchy') { 'omarchy' }
+        else { '' }
+    if ([string]::IsNullOrWhiteSpace($profileName)) {
+        throw (New-EpicVMHyperVError -Code 'InvalidInput' -Message 'GPU-P partition changes are available only for GPU-P profiles.')
     }
 
     $wasRunning = [string](Get-EpicVMHyperVValue -Object $vm -Name 'State' -Default 'Unknown') -ieq 'Running'
@@ -649,7 +702,10 @@ function Set-EpicVMHyperVGamingGpuPartitionPercent {
             Invoke-EpicVMHyperVCmdlet -Provider $Provider -CommandName 'Stop-VM' -Parameters @{ Name=$Name; ErrorAction='Stop' } | Out-Null
             Wait-EpicVMHyperVState -Provider $Provider -Name $Name -DesiredState 'Off' | Out-Null
         }
-        $result = Set-EpicVMHyperVGamingGpuPartitionAdapter -Provider $Provider -Name $Name -Percent $Percent
+        $config = Get-EpicVMHyperVValue -Object $Provider -Name 'Config'
+        $identityName = if ($profileName -eq 'omarchy') { 'OmarchyGpuDeviceIdentity' } else { 'GamingGpuDeviceIdentity' }
+        $identity = [string](Get-EpicVMHyperVOption -Config $config -Name $identityName -Default 'VEN_1002&DEV_73BF')
+        $result = Set-EpicVMHyperVGamingGpuPartitionAdapter -Provider $Provider -Name $Name -Percent $Percent -DeviceIdentity $identity -ProfileName $profileName
     }
     finally {
         if ($wasRunning) {
@@ -678,7 +734,8 @@ function Invoke-EpicVMHyperVGamingGuestValidation {
         [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $Name,
         [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $GuestUsername,
         [Parameter(Mandatory)] [string] $GuestPassword,
-        [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $GuestAddress
+        [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $GuestAddress,
+        [bool] $RequireEncoder = $true
     )
 
     if ($GuestAddress -notmatch '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}$') {
@@ -690,7 +747,7 @@ function Invoke-EpicVMHyperVGamingGuestValidation {
         $config = Get-EpicVMHyperVValue -Object $Provider -Name 'Config'
         $serviceName = [string](Get-EpicVMHyperVOption -Config $config -Name 'SunshineServiceName' -Default 'SunshineService')
         $statePaths = @(Get-EpicVMHyperVOption -Config $config -Name 'SunshineStatePaths' -Default @())
-        $result = Invoke-EpicVMManagementTransport -Provider $Provider -Address $GuestAddress -Credential (New-EpicVMWinRMLocalCredential -Credential $credential) -Script (Get-EpicVMGamingGuestValidationScript) -ArgumentList @([string](Get-EpicVMHyperVOption -Config $config -Name 'GamingGpuDeviceIdentity' -Default 'VEN_1002&DEV_73BF'), $serviceName, $statePaths) -TimeoutSeconds 240 -RetryCount 1
+        $result = Invoke-EpicVMManagementTransport -Provider $Provider -Address $GuestAddress -Credential (New-EpicVMWinRMLocalCredential -Credential $credential) -Script (Get-EpicVMGamingGuestValidationScript) -ArgumentList @([string](Get-EpicVMHyperVOption -Config $config -Name 'GamingGpuDeviceIdentity' -Default 'VEN_1002&DEV_73BF'), $serviceName, $statePaths, $RequireEncoder) -TimeoutSeconds 240 -RetryCount 1
         $payload = Get-EpicVMHyperVValue -Object $result -Name 'result' -Default $result
         $safeMarker = [string](Get-EpicVMHyperVValue -Object $result -Name 'safeMarker' -Default (Get-EpicVMHyperVValue -Object $payload -Name 'safeMarker' -Default ''))
         if ($safeMarker -eq 'EPICVM_GAMING_ENCODER_UNAVAILABLE') {
@@ -807,9 +864,20 @@ function New-EpicVMHyperVVM {
         }
         $createdDisk = $true
 
-        if ($options.gpu) {
+        if ($options.gpu -and $options.profile -eq 'gaming') {
             $driverSources = Resolve-EpicVMGamingGpuDriverSourcePaths -Config $config -DeviceIdentity $options.gpuDeviceIdentity
             Invoke-EpicVMGamingGpuDriverInjection -DiskPath $diskPath -DriverSourcePaths $driverSources -DeviceIdentity $options.gpuDeviceIdentity | Out-Null
+        }
+        if ($options.profile -eq 'omarchy') {
+            $seedPath = [string]$options.bootstrapSeedPath
+            if ([string]::IsNullOrWhiteSpace($seedPath) -or -not (Test-Path -LiteralPath $seedPath -PathType Leaf)) {
+                throw (New-EpicVMHyperVError -Code 'InvalidInput' -Message 'The Omarchy cidata bootstrap seed is unavailable.')
+            }
+            $vmRootFull = [IO.Path]::GetFullPath($vmPath).TrimEnd([char[]]@([char]92, [char]47))
+            $seedFull = [IO.Path]::GetFullPath($seedPath)
+            if (-not $seedFull.StartsWith($vmRootFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                throw (New-EpicVMHyperVError -Code 'InvalidInput' -Message 'The Omarchy cidata bootstrap seed is outside the managed VM root.')
+            }
         }
 
         $newVmParameters = @{
@@ -825,6 +893,16 @@ function New-EpicVMHyperVVM {
         }
         Invoke-EpicVMHyperVCmdlet -Provider $Provider -CommandName 'New-VM' -Parameters $newVmParameters | Out-Null
         $createdVm = $true
+        if ($options.profile -eq 'omarchy') {
+            Invoke-EpicVMHyperVCmdlet -Provider $Provider -CommandName 'Add-VMHardDiskDrive' -Parameters @{
+                VMName = $name
+                Path = [string]$options.bootstrapSeedPath
+                ControllerType = 'SCSI'
+                ControllerNumber = 0
+                ControllerLocation = 1
+                ErrorAction = 'Stop'
+            } | Out-Null
+        }
 
         if ($options.profile -eq 'gaming') {
             Set-EpicVMHyperVStaticMemory -Provider $Provider -Name $name -MemoryBytes ([long]$options.memoryBytes) | Out-Null
@@ -832,6 +910,7 @@ function New-EpicVMHyperVVM {
 
         $notes = $script:EpicVMHyperVOwnershipMarker
         if ($options.profile -eq 'gaming') { $notes = $notes + "`r`nEpicVM-Profile: gaming" }
+        if ($options.profile -eq 'omarchy') { $notes = $notes + [Environment]::NewLine + 'EpicVM-Profile: omarchy' }
         Invoke-EpicVMHyperVCmdlet -Provider $Provider -CommandName 'Set-VM' -Parameters @{
             Name = $name
             Notes = $notes
@@ -856,11 +935,20 @@ function New-EpicVMHyperVVM {
         } | Out-Null
 
         if ($options.gpu) {
-            Set-EpicVMHyperVGamingVmProperties -Provider $Provider -Name $name | Out-Null
-            Set-EpicVMHyperVGamingGpuPartitionAdapter -Provider $Provider -Name $name -Percent ([int]$options.gpuPartitionPercent) | Out-Null
+            if ($options.profile -eq 'gaming') {
+                Set-EpicVMHyperVGamingVmProperties -Provider $Provider -Name $name | Out-Null
+            }
+            Set-EpicVMHyperVGamingGpuPartitionAdapter -Provider $Provider -Name $name -Percent ([int]$options.gpuPartitionPercent) -DeviceIdentity ([string]$options.gpuDeviceIdentity) -ProfileName ([string]$options.profile) | Out-Null
         }
 
-        if ($options.templateRequired) {
+        if ($options.profile -eq 'omarchy') {
+            $secureBoot = Get-Command -Name 'Set-VMFirmware' -ErrorAction SilentlyContinue
+            if ($null -eq (Get-EpicVMHyperVValue -Object $Provider -Name 'CommandInvoker' -Default $null) -and $null -eq $secureBoot) {
+                throw (New-EpicVMHyperVError -Code 'SecurityUnavailable' -Message 'Explicit Omarchy UEFI/Secure Boot control is unavailable.')
+            }
+            Invoke-EpicVMHyperVCmdlet -Provider $Provider -CommandName 'Set-VMFirmware' -Parameters @{ VMName=$name; EnableSecureBoot='Off'; ErrorAction='Stop' } | Out-Null
+        }
+        elseif ($options.templateRequired) {
             $keyProtector = Get-Command -Name 'Set-VMKeyProtector' -ErrorAction SilentlyContinue
             $enableTpm = Get-Command -Name 'Enable-VMTPM' -ErrorAction SilentlyContinue
             $secureBoot = Get-Command -Name 'Set-VMFirmware' -ErrorAction SilentlyContinue
@@ -1041,6 +1129,7 @@ function New-EpicVMHyperVProvider {
         TailscaleGuestTag = [string](Get-EpicVMHyperVValue -Object $Config -Name 'TailscaleGuestTag' -Default 'tag:epicvm-guest')
         TailscaleApiBaseUrl = [string](Get-EpicVMHyperVValue -Object $Config -Name 'TailscaleApiBaseUrl' -Default 'https://api.tailscale.com/api/v2')
         LastTailscaleEnrollment = $null
+        LastOmarchyGuestIp = $null
         GetCapabilities = $null
         GetVMs = $null
         CreateVM = $null
@@ -1050,6 +1139,13 @@ function New-EpicVMHyperVProvider {
         DeleteVM = $null
         SetGamingGpuPercent = $null
         ValidateGamingGuest = $null
+        PrepareOmarchyBootstrap = $null
+        WaitOmarchyGuestReady = $null
+        ConfigureOmarchyGuest = $null
+        ValidateOmarchyGuest = $null
+        CleanupOmarchyBootstrap = $null
+        RemoveOmarchySeed = $null
+        DiscardOmarchyBootstrap = $null
         ConfigureGuest = $null
         TestBootstrapGuest = $null
         ConfigureSunshine = $null
@@ -1079,16 +1175,47 @@ function New-EpicVMHyperVProvider {
     $provider.DeleteVM = ({ param($Name) & $deleteVM -Provider $provider -Name $Name }.GetNewClosure())
     $provider.SetGamingGpuPercent = ({ param($Name,$Percent) & $setGamingGpuPercent -Provider $provider -Name $Name -Percent ([int]$Percent) }.GetNewClosure())
     $provider.ValidateGamingGuest = ({ param($Name,$Username,$Password,$Address)
-            & $validateGamingGuest -Provider $provider -Name $Name -GuestUsername $Username -GuestPassword $Password -GuestAddress $Address
+            # The pre-console gate verifies GPU rendering. Hardware encoding
+            # is required after Sunshine and the desktop are configured.
+            & $validateGamingGuest -Provider $provider -Name $Name -GuestUsername $Username -GuestPassword $Password -GuestAddress $Address -RequireEncoder $false
+        }.GetNewClosure())
+    $provider.PrepareOmarchyBootstrap = ({ param($Name)
+            Prepare-EpicVMOmarchyBootstrap -Provider $provider -VmName $Name
+        }.GetNewClosure())
+    $provider.WaitOmarchyGuestReady = ({ param($Name,$TimeoutSeconds,$PollMilliseconds,$ProbeUsername)
+            Wait-EpicVMOmarchyGuestReady -Provider $provider -VmName $Name -TimeoutSeconds ([int]$TimeoutSeconds) -PollMilliseconds ([int]$PollMilliseconds) -ProbeUsername $ProbeUsername
+        }.GetNewClosure())
+    $provider.ConfigureOmarchyGuest = ({ param($Name,$Username,$Password)
+            Invoke-EpicVMOmarchyGuestConfiguration -Provider $provider -VmName $Name -DesiredUser $Username -DesiredPassword $Password
+        }.GetNewClosure())
+    $provider.ValidateOmarchyGuest = ({ param($Name,$Username,$Address,$RequireSunshine)
+            $require = if ($null -eq $RequireSunshine) { $true } else { [bool]$RequireSunshine }
+            Invoke-EpicVMOmarchyGuestValidation -Provider $provider -VmName $Name -GuestUsername $Username -GuestAddress $Address -RequireSunshine $require
+        }.GetNewClosure())
+    $provider.CleanupOmarchyBootstrap = ({ param($Name,$Username,$Address)
+            Invoke-EpicVMOmarchyBootstrapCleanup -Provider $provider -VmName $Name -GuestUsername $Username -GuestAddress $Address
+        }.GetNewClosure())
+    $provider.RemoveOmarchySeed = ({ param($Name)
+            Remove-EpicVMOmarchySeed -Provider $provider -VmName $Name
+        }.GetNewClosure())
+    $provider.DiscardOmarchyBootstrap = ({ param($Name)
+            Remove-EpicVMOmarchyBootstrapArtifacts -Provider $provider -VmName $Name
         }.GetNewClosure())
     $provider.ConfigureGuest = ({ param($Name,$Username,$Password)
             $result = Invoke-EpicVMGuestConfiguration -Provider $provider -Config $provider.Config -VmName $Name -DesiredUser $Username -DesiredPassword $Password
             return $result
         }.GetNewClosure())
     $provider.TestBootstrapGuest = ({ param($Name,$TimeoutSeconds,$PollMilliseconds)
-            return Wait-EpicVMGuestBootstrapReady -Provider $provider -Config $provider.Config -VmName $Name -TimeoutSeconds ([int]$TimeoutSeconds) -PollMilliseconds ([int]$PollMilliseconds)
+            # Returns the classified failure code to the caller instead of discarding
+            # it, so a credential mismatch is distinguishable from a slow boot.
+            $classification=$null
+            $ok=Wait-EpicVMGuestBootstrapReady -Provider $provider -Config $provider.Config -VmName $Name -TimeoutSeconds ([int]$TimeoutSeconds) -PollMilliseconds ([int]$PollMilliseconds) -Classification ([ref]$classification)
+            return [ordered]@{ ok=[bool]$ok; failureCode=[string]$classification }
         }.GetNewClosure())
-    $provider.ConfigureSunshine = ({ param($Name,$GuestUsername,$GuestPassword,$SunshineUsername,$SunshinePassword,$GuestAddress,$ManagementCheckpoint,$ManagementHandoffAlreadyVerified,$IsGaming)
+    $provider.ConfigureSunshine = ({ param($Name,$GuestUsername,$GuestPassword,$SunshineUsername,$SunshinePassword,$GuestAddress,$ManagementCheckpoint,$ManagementHandoffAlreadyVerified,$IsGaming,$IsOmarchy)
+             if([bool]$IsOmarchy){
+                 return Invoke-EpicVMOmarchySunshineConfiguration -Provider $provider -VmName $Name -GuestUsername $GuestUsername -GuestPassword $GuestPassword -SunshineUsername $SunshineUsername -SunshinePassword $SunshinePassword -GuestAddress $GuestAddress
+             }
              if($null -ne $ManagementCheckpoint){
                 # The checkpoint callback is invoked only after the verified
                 # WinRM probe and before the credential-bearing Sunshine write.
@@ -1103,12 +1230,16 @@ function New-EpicVMHyperVProvider {
             $provider.LastTailscaleEnrollment = $result
             return $result
         }.GetNewClosure())
-    $provider.VerifyGuest = ({ param($Name,$GuestIp)
+    $provider.VerifyGuest = ({ param($Name,$GuestIp,$GuestUsername)
             $vm = @(& $provider.GetVMs | Where-Object {
                 [string](Get-EpicVMHyperVValue -Object $_ -Name 'name' -Default '') -ceq $Name
             }) | Select-Object -First 1
             if ($null -eq $vm -or -not [bool](Get-EpicVMHyperVValue -Object $vm -Name 'managed' -Default $false)) { return $false }
             if ([string](Get-EpicVMHyperVValue -Object $vm -Name 'state' -Default '') -ine 'Running') { return $false }
+            if ([string](Get-EpicVMHyperVValue -Object $vm -Name 'profile' -Default '') -ieq 'omarchy') {
+                if ([string]::IsNullOrWhiteSpace($GuestUsername)) { return $false }
+                try { return [bool](Invoke-EpicVMOmarchyGuestValidation -Provider $provider -VmName $Name -GuestUsername $GuestUsername -GuestAddress $GuestIp -RequireSunshine $true).ok } catch { return $false }
+            }
             return Test-EpicVMGuestRdpReachability -Address ([string]$GuestIp)
         }.GetNewClosure())
     $provider.RevokeTailscale = ({ param($DeviceId) Revoke-EpicVMTailscaleDevice -Provider $provider -DeviceId $DeviceId }.GetNewClosure())

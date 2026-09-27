@@ -1,0 +1,58 @@
+[
+  {
+    "Name": "astra-testmann",
+    "Id": "d542813d-04eb-441d-9043-c742e916fce8",
+    "Disks": [
+      "E:\\EpicVM\\vms\\astra-testmann\\astra-testmann.vhdx"
+    ],
+    "Status": "removed"
+  },
+  {
+    "Name": "epicvm-local-gaming-1",
+    "Id": "725d9f9c-bdc9-4c9c-89f3-4fa16f1a49d9",
+    "Disks": [
+      "E:\\EpicVM\\vms\\epicvm-local-gaming-1\\epicvm-local-gaming-1.vhdx"
+    ],
+    "Status": "removed"
+  },
+  {
+    "Name": "gaming-e2e-0919",
+    "Id": "d9be8f7c-a8fd-403c-acc2-ae56c9cfcc78",
+    "Disks": [
+      "E:\\EpicVM\\vms\\gaming-e2e-0919\\gaming-e2e-0919.vhdx"
+    ],
+    "Status": "removed"
+  },
+  {
+    "Name": "indogaming",
+    "Id": "0c828c4c-cfda-4979-ab02-fae6c178e63a",
+    "Disks": [
+      "E:\\EpicVM\\vms\\indogaming\\indogaming.vhdx"
+    ],
+    "Status": "removed"
+  },
+  {
+    "Name": "prod-gaming-verify-1",
+    "Id": "b23705f7-3633-4580-ae0c-1f928a28d920",
+    "Disks": [
+      "E:\\EpicVM\\vms\\prod-gaming-verify-1\\prod-gaming-verify-1.vhdx"
+    ],
+    "Status": "removed"
+  },
+  {
+    "Name": "testre",
+    "Id": "e050ae4b-10e7-435e-9745-4b70059c7ec6",
+    "Disks": [
+      "E:\\EpicVM\\vms\\testre\\Virtual Hard Disks\\testre_9C6710CA-9DCA-483F-BAD8-5CCDE587FFEC.avhdx"
+    ],
+    "Status": "removed"
+  },
+  {
+    "Name": "Windows 11 dev environment",
+    "Id": "6e689095-25d6-4a05-9737-3e87585eaf9c",
+    "Disks": [
+      "C:\\ProgramData\\Microsoft\\Windows\\Virtual Hard Disks\\Windows 11 dev environment.vhdx"
+    ],
+    "Status": "removed"
+  }
+]

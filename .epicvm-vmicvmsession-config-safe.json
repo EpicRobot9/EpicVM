@@ -1,9 +1,0 @@
-﻿{
-    "ok":  true,
-    "query":  "SERVICE_NAME: vmicvmsession          TYPE               : 30  WIN32           STATE              : 1  STOPPED          WIN32_EXIT_CODE    : 0  (0x0)         SERVICE_EXIT_CODE  : 0  (0x0)         CHECKPOINT         : 0x0         WAIT_HINT          : 0x0",
-    "trigger":  "[SC] QueryServiceConfig2 SUCCESS  SERVICE_NAME: vmicvmsession          START SERVICE            DEVICE INTERFACE ARRIVAL     : 999e53d4-3d5c-4c3e-8779-bed06ec056e1 [INTERFACE CLASS GUID]",
-    "config":  "[SC] QueryServiceConfig SUCCESS  SERVICE_NAME: vmicvmsession         TYPE               : 20  WIN32_SHARE_PROCESS          START_TYPE         : 3   DEMAND_START         ERROR_CONTROL      : 1   NORMAL         BINARY_PATH_NAME   : C:\\WINDOWS\\system32\\svchost.exe -k LocalSystemNetworkRestrictedRedirectionGuard -p         LOAD_ORDER_GROUP   :          TAG                : 0         DISPLAY_NAME       : Hyper-V PowerShell Direct Service         DEPENDENCIES       :          SERVICE_START_NAME : LocalSystem",
-    "eventCodes":  [
-
-                   ]
-}

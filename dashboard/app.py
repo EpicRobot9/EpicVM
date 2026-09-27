@@ -2,8 +2,11 @@
 import os, json, subprocess, shlex, base64, socket, threading, time, sqlite3, secrets, platform
 import shutil
 import re
+import math
+import ipaddress
+import tempfile
 from urllib import request as urlrequest, error as urlerror
-from urllib.parse import quote as url_quote, urlparse
+from urllib.parse import quote as url_quote, unquote as url_unquote, urlparse
 from html import escape as html_escape
 from functools import wraps
 from flask import Flask, jsonify, request, abort, send_from_directory, render_template_string, Response, send_file, redirect
@@ -56,7 +59,97 @@ except Exception:
     psutil = None
 
 app = Flask(__name__)
- 
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
+
+_FAVICON_MAX_BYTES = 512 * 1024
+_FAVICON_SIGNATURES = {
+    b'\x89PNG\r\n\x1a\n': 'image/png',
+    b'\xff\xd8\xff': 'image/jpeg',
+    b'GIF87a': 'image/gif',
+    b'GIF89a': 'image/gif',
+    b'\x00\x00\x01\x00': 'image/x-icon',
+}
+
+
+def _validate_vm_name(name: str) -> str:
+    safe = str(name or '').strip().lower()
+    if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,62}', safe):
+        raise ValueError('Invalid VM name')
+    return safe
+
+
+def _detect_favicon_mimetype(content: bytes) -> str:
+    for signature, mimetype in _FAVICON_SIGNATURES.items():
+        if content.startswith(signature):
+            return mimetype
+    if len(content) >= 12 and content[:4] == b'RIFF' and content[8:12] == b'WEBP':
+        return 'image/webp'
+    raise ValueError('Favicon must be PNG, JPEG, GIF, WebP, or ICO')
+
+
+def _read_favicon_upload(upload) -> bytes:
+    if upload is None or not getattr(upload, 'filename', ''):
+        raise ValueError('No file provided')
+    content = upload.read(_FAVICON_MAX_BYTES + 1)
+    if not content:
+        raise ValueError('Favicon file is empty')
+    if len(content) > _FAVICON_MAX_BYTES:
+        raise ValueError('Favicon file exceeds 512 KiB')
+    _detect_favicon_mimetype(content)
+    return content
+
+
+def _write_favicon_atomically(path: str, content: bytes) -> None:
+    target = os.path.abspath(path)
+    expected_root = os.path.abspath(os.path.join(_state_dir(), 'dashboard'))
+    if os.path.commonpath([target, expected_root]) != expected_root:
+        raise ValueError('Favicon path is outside the dashboard state directory')
+    os.makedirs(expected_root, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix='.favicon.', dir=expected_root)
+    try:
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _validate_favicon_url(value: str) -> str:
+    parsed = urlparse(str(value or '').strip())
+    hostname = str(parsed.hostname or '').strip().lower()
+    if not hostname or parsed.username or parsed.password:
+        raise ValueError('Favicon URL is invalid')
+    if parsed.scheme == 'http' and hostname not in {'localhost', '127.0.0.1', '::1'}:
+        raise ValueError('Favicon URL must use HTTPS')
+    if parsed.scheme not in {'http', 'https'}:
+        raise ValueError('Favicon URL must use HTTP or HTTPS')
+    if parsed.scheme == 'https':
+        try:
+            addresses = {item[4][0].split('%', 1)[0] for item in socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)}
+        except OSError as exc:
+            raise ValueError('Favicon URL host could not be resolved') from exc
+        if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+            raise ValueError('Favicon URL must resolve to a public address')
+    return parsed.geturl()
+
+
+def _safe_favicon_reference(value: str) -> str:
+    favicon = str(value or '').strip()
+    if favicon.startswith('/') and not favicon.startswith('//'):
+        return favicon
+    try:
+        return _validate_favicon_url(favicon)
+    except ValueError:
+        return ''
+
+
 # --- Admin authentication helpers (must be defined before route decorators) ---
 # BLOBEDASH_USER/PASS are the sole credentials for new installs. The legacy
 # dashboard password remains read-only migration support for existing hosts.
@@ -88,13 +181,13 @@ def _admin_credentials():
     user = os.environ.get('BLOBEDASH_USER', '').strip()
     password_hash = os.environ.get('BLOBEDASH_PASS_HASH', '').strip()
     if user and password_hash:
-        return user, password_hash
+        return user, _account_admin_password(user, password_hash)
     password = os.environ.get('BLOBEDASH_PASS', '')
     if user and password:
-        return user, password
+        return user, _account_admin_password(user, password)
     legacy = _get_legacy_dashboard_password()
     if legacy:
-        return 'admin', legacy
+        return 'admin', _account_admin_password('admin', legacy)
     return None, None
 
 def _extra_admin_credentials():
@@ -103,10 +196,10 @@ def _extra_admin_credentials():
     user = os.environ.get('BLOBEDASH_EXTRA_USER', '').strip()
     password_hash = os.environ.get('BLOBEDASH_EXTRA_PASS_HASH', '').strip()
     if user and password_hash:
-        return user, password_hash
+        return user, _account_admin_password(user, password_hash)
     password = os.environ.get('BLOBEDASH_EXTRA_PASS', '').strip()
     if user and password:
-        return user, password
+        return user, _account_admin_password(user, password)
     return None, None
 
 def _valid_dashboard_admin(username: str, pw: str) -> bool:
@@ -207,6 +300,7 @@ def _safe_provisioning_job(job: object) -> dict:
         'autonomousOutcome', 'autonomousErrorCode',
         'cpuCount', 'memoryBytes', 'diskSizeBytes', 'gpuPartitionPercent',
         'gpuDeviceIdentity', 'gamingGpuValidated', 'gamingValidationAt',
+        'omarchyGpuValidated', 'omarchyValidationAt', 'guestUsername', 'guestOs',
         'gamingCaptureConfigured', 'gamingCaptureAt',
         'consoleFrameVerified', 'consoleFrameVerifiedAt',
         'keyboardInputVerified', 'keyboardInputVerifiedAt',
@@ -232,6 +326,8 @@ def _is_pending_provisioning_job(job: object) -> bool:
     if not isinstance(job, dict):
         return False
     state = str(job.get('state') or '')
+    if state in {'queued', 'cloning', 'booting'}:
+        return True
     if state == 'unclaimed' and not bool(job.get('claimConsumed')):
         return True
     if not bool(job.get('claimConsumed')):
@@ -383,12 +479,14 @@ _CONSOLE_RETRY_LOCK = threading.Lock()
 _CONSOLE_RETRY_TASK_TTL_SECONDS = 900
 # ForwardAuth is called concurrently for Moonlight's host discovery requests.
 # Coalesce those calls and cache only a successful application-level staged
-# verification briefly. This never marks a Gaming job visually ready or
-# persists keyboard/mouse evidence.
+# verification briefly. This never marks a Gaming job ready or persists
+# browser input attestations.
 _CONSOLE_AUTH_VERIFY_CACHE = {}
 _CONSOLE_AUTH_VERIFY_LOCK = threading.Lock()
 _CONSOLE_AUTH_VERIFY_TTL_SECONDS = 20.0
 _CONSOLE_AUTH_VERIFY_WAIT_SECONDS = 11.0
+_CONSOLE_APP_IDS_CACHE = {}
+_CONSOLE_APP_IDS_CACHE_TTL_SECONDS = 900.0
 
 
 def _safe_console_retry_code(value, default='console_failed'):
@@ -419,12 +517,12 @@ def _prune_console_retry_tasks(now=None):
 
 
 def _set_console_retry_result(key, *, status, operation_id, failure_code='', route_prefix=''):
-    """Publish only safe terminal metadata for an async retry.
+    """Publish only safe terminal metadata for an async console worker.
 
-    ``pending_visual`` is intentionally distinct from ``ready``: pairing and
-    route setup do not prove that the browser received video or that input
-    reached the guest.  The authenticated console-verify endpoint performs the
-    final agent transition after those browser checks.
+    Workers persist readiness only through the agent's ``console-complete``
+    transition after the trusted automated route/guest-transport gates pass.
+    ``pending_visual`` is retained solely for backward-compatible overlays of
+    stale records; no current worker produces it.
     """
     finished = time.time()
     normalized_status = status if status in ('pending_visual', 'ready', 'failed') else 'failed'
@@ -450,6 +548,18 @@ def _set_console_retry_result(key, *, status, operation_id, failure_code='', rou
             current['visualValidationRequired'] = False
         _CONSOLE_RETRY_TASKS[key] = current
     return current
+
+
+def _await_agent_handoff(operation, *args, **kwargs):
+    """Retry only an explicit rejection before execution, never uncertain writes."""
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            return operation(*args, **kwargs)
+        except VmHostUnavailable as exc:
+            if getattr(exc, 'code', '') != 'agent_busy' or time.monotonic() >= deadline:
+                raise
+            time.sleep(2)
 
 
 def _start_remote_moonlight_console_retry(*, host, host_id, job_id, name, guest_ip,
@@ -485,7 +595,7 @@ def _start_remote_moonlight_console_retry(*, host, host_id, job_id, name, guest_
                 status=409,
                 code='console_retry_not_allowed',
             )
-        host.console_credentials(
+        _await_agent_handoff(host.console_credentials,
             job_id,
             guest_username=guest_username,
             guest_password=guest_password,
@@ -499,14 +609,32 @@ def _start_remote_moonlight_console_retry(*, host, host_id, job_id, name, guest_
             sunshine_username=sunshine_username,
             sunshine_password=sunshine_password,
         )
+        if not isinstance(started, dict) or not bool(started.get('ok')) or not bool(started.get('guestTcpVerified')):
+            raise ConsoleOrchestrationError(
+                'The Moonlight console did not pass automated route and guest transport verification.',
+                status=502,
+                code='console_verification_failed',
+            )
         route_prefix = f'/vm/{route_name}/'
+        completed = host.console_complete(
+            job_id,
+            route_prefix=route_prefix,
+            guest_tcp_verified=True,
+        )
+        completed_job = completed.get('job') if isinstance(completed, dict) else None
+        if not isinstance(completed_job, dict) or str(completed_job.get('state') or '') != 'ready':
+            raise ConsoleOrchestrationError(
+                'The host did not persist automated console readiness.',
+                status=502,
+                code='console_verification_failed',
+            )
         _set_console_retry_result(
             key,
-            status='pending_visual',
+            status='ready',
             operation_id=operation_id,
             route_prefix=route_prefix,
         )
-        app.logger.info('EpicVM console retry staged operation=%s status=pending_visual route=%s', operation_id, route_prefix)
+        app.logger.info('EpicVM console retry completed operation=%s status=ready route=%s', operation_id, route_prefix)
     except ConsoleOrchestrationError as exc:
         failure_code = _safe_console_retry_code(getattr(exc, 'code', 'console_failed'))
         _set_console_retry_result(key, status='failed', operation_id=operation_id, failure_code=failure_code)
@@ -545,11 +673,29 @@ def _start_remote_autonomous_provisioning(*, host, host_id, job_id, name,
     try:
         token = str(claim_token or '')
         if not token:
-            reissued = host.claim_reissue(job_id)
+            # New agents acknowledge the queued job before hashing/cloning and
+            # first boot. Keep that work outside the browser's HTTP request.
+            deadline = time.monotonic() + 1200
+            while True:
+                current = host.provisioning_status(job_id)
+                current_job = current.get('job') or {}
+                current_state = str(current_job.get('state') or '')
+                if current_state == 'unclaimed':
+                    break
+                if current_state.startswith('setup_failed:'):
+                    raise ConsoleOrchestrationError('The guest could not finish initial setup.', status=422, code=current_job.get('errorCode') or 'autonomous_provisioning_failed')
+                if current_state not in {'queued', 'cloning', 'booting'} or time.monotonic() >= deadline:
+                    raise ConsoleOrchestrationError('The guest did not reach the claim stage.', status=504, code='guest_bootstrap_not_ready')
+                with _CONSOLE_RETRY_LOCK:
+                    pending_task = _CONSOLE_RETRY_TASKS.get(key)
+                    if pending_task is not None:
+                        pending_task['stage'] = current_state
+                time.sleep(2)
+            reissued = _await_agent_handoff(host.claim_reissue, job_id)
             token = str(reissued.get('claimToken') or '') if isinstance(reissued, dict) else ''
         if not token:
             raise ConsoleOrchestrationError('The host did not return a one-time claim.', status=502, code='claim_token_missing')
-        claimed = host.claim(job_id, guest_username, guest_password, token)
+        claimed = _await_agent_handoff(host.claim, job_id, guest_username, guest_password, token)
         job = claimed.get('job') if isinstance(claimed, dict) else None
         state = str(job.get('state') or '') if isinstance(job, dict) else ''
         if state != 'streaming_setup':
@@ -682,20 +828,32 @@ def _start_remote_moonlight_console_repair(*, host, host_id, job_id, name, guest
                 sunshine_username=sunshine_username,
                 sunshine_password=sunshine_password,
             )
-        if not isinstance(started, dict) or not bool(started.get('ok')):
+        if not isinstance(started, dict) or not bool(started.get('ok')) or not bool(started.get('guestTcpVerified')):
             raise ConsoleOrchestrationError(
-                'The repaired Moonlight console did not pass verification.',
+                'The repaired Moonlight console did not pass automated route and guest transport verification.',
                 status=502,
                 code='console_verification_failed',
             )
         route_prefix = f'/vm/{route_name}/'
+        completed = host.console_complete(
+            job_id,
+            route_prefix=route_prefix,
+            guest_tcp_verified=True,
+        )
+        completed_job = completed.get('job') if isinstance(completed, dict) else None
+        if not isinstance(completed_job, dict) or str(completed_job.get('state') or '') != 'ready':
+            raise ConsoleOrchestrationError(
+                'The host did not persist automated console readiness.',
+                status=502,
+                code='console_verification_failed',
+            )
         _set_console_retry_result(
             key,
-            status='pending_visual',
+            status='ready',
             operation_id=operation_id,
             route_prefix=route_prefix,
         )
-        app.logger.info('EpicVM console repair staged operation=%s status=pending_visual route=%s', operation_id, route_prefix)
+        app.logger.info('EpicVM console repair completed operation=%s status=ready route=%s', operation_id, route_prefix)
     except ConsoleOrchestrationError as exc:
         failure_code = _safe_console_retry_code(getattr(exc, 'code', 'console_failed'))
         _set_console_retry_result(key, status='failed', operation_id=operation_id, failure_code=failure_code)
@@ -728,7 +886,7 @@ def _start_remote_guest_network_recovery(*, host, host_id, job_id, name,
         current = host.provisioning_status(job_id)
         current_job = current.get('job') if isinstance(current, dict) else None
         current_state = str(current_job.get('state') or '') if isinstance(current_job, dict) else ''
-        if current_state in ('ready', 'setup_failed:streaming', 'setup_failed:agent_restart', 'setup_failed:legacy_state_uncertain'):
+        if current_state in ('ready', 'streaming_setup', 'setup_failed:streaming', 'setup_failed:agent_restart', 'setup_failed:legacy_state_uncertain'):
             if not hasattr(host, 'network_recovery'):
                 raise ConsoleOrchestrationError(
                     'The remote host lacks the retained-network recovery boundary.',
@@ -741,11 +899,6 @@ def _start_remote_guest_network_recovery(*, host, host_id, job_id, name,
                 guest_password=guest_password,
                 reverify=True,
             )
-        elif current_state == 'streaming_setup':
-            # A concurrent request may have moved the job into the console
-            # gate before this worker started. Continue idempotently from the
-            # retained network checkpoint rather than sending a second request.
-            recovered = {'job': current_job}
         else:
             raise ConsoleOrchestrationError(
                 'The retained VM is no longer eligible for network recovery.',
@@ -777,20 +930,32 @@ def _start_remote_guest_network_recovery(*, host, host_id, job_id, name,
             sunshine_username=sunshine_username,
             sunshine_password=sunshine_password,
         )
-        if not isinstance(started, dict) or not bool(started.get('ok')):
+        if not isinstance(started, dict) or not bool(started.get('ok')) or not bool(started.get('guestTcpVerified')):
             raise ConsoleOrchestrationError(
-                'The recovered Moonlight console did not pass verification.',
+                'The recovered Moonlight console did not pass automated route and guest transport verification.',
                 status=502,
                 code='console_verification_failed',
             )
         route_prefix = f'/vm/{route_name}/'
+        completed = host.console_complete(
+            job_id,
+            route_prefix=route_prefix,
+            guest_tcp_verified=True,
+        )
+        completed_job = completed.get('job') if isinstance(completed, dict) else None
+        if not isinstance(completed_job, dict) or str(completed_job.get('state') or '') != 'ready':
+            raise ConsoleOrchestrationError(
+                'The host did not persist automated console readiness.',
+                status=502,
+                code='console_verification_failed',
+            )
         _set_console_retry_result(
             key,
-            status='pending_visual',
+            status='ready',
             operation_id=operation_id,
             route_prefix=route_prefix,
         )
-        app.logger.info('EpicVM guest network recovery staged operation=%s status=pending_visual route=%s', operation_id, route_prefix)
+        app.logger.info('EpicVM guest network recovery completed operation=%s status=ready route=%s', operation_id, route_prefix)
     except ConsoleOrchestrationError as exc:
         failure_code = _safe_console_retry_code(getattr(exc, 'code', 'network_recovery_failed'))
         _set_console_retry_result(key, status='failed', operation_id=operation_id, failure_code=failure_code)
@@ -945,7 +1110,7 @@ def _remote_console_forward_auth_verify(name: str, host_id: str) -> dict:
     Moonlight opens multiple protected API requests at once. Re-running staged
     verification for every request creates a race with the client's 12-second
     API timeout. Only successful route/application verification is cached, and
-    this cache never marks a Gaming job visually ready or persists input proof.
+    this cache never marks a Gaming job ready or persists browser input proof.
     """
     key = (str(name or '').strip().lower(), str(host_id or '').strip())
     now = time.monotonic()
@@ -1239,12 +1404,12 @@ def _reconcile_remote_console(name: str, host_id: str, *, wait: bool = False,
     the stale certificate's 500 response.  The wait is bounded and returns a
     retryable error instead of hanging a proxy worker indefinitely.
 
-    ``allow_pending_visual`` is restricted to the forward-auth boundary.  A
+    ``allow_pending_visual`` is restricted to the forward-auth boundary. A
     Gaming job whose agent-side capture marker is still absent may still have
-    a valid, application-level Moonlight host after a bounded repair or manual
-    recovery.  Let the browser reach that host so it can provide the required
-    visual/input evidence, but keep the result explicitly pending and never
-    persist ``ready`` from this path.
+    a valid, application-level Moonlight host after a bounded repair. Let the
+    browser reach that host for automated video diagnostics, but keep the
+    result explicitly pending and never persist ``ready`` from this path;
+    readiness is decided only by the agent's trusted gates.
     """
     orchestrator = _console_orchestrator()
     if not _moonlight_console(orchestrator):
@@ -1382,6 +1547,7 @@ def _vm_host_error_response(exc):
         'forbidden': 'The remote VM operation is not permitted.',
         'not_found': 'The requested remote VM resource was not found.',
         'conflict': 'The remote VM request conflicts with existing state.',
+        'gaming_capacity': 'Another Gaming VM is currently being provisioned. Wait for it to finish before creating another.',
         'claim_failed': 'The one-time guest claim was rejected.',
         'invalid_credential_input': 'The credential input is empty or does not meet the request policy.',
         'claim_in_progress': 'Another request already owns this claim.',
@@ -1409,14 +1575,24 @@ def _vm_host_error_response(exc):
         'guest_credential_rejected': 'The guest channel explicitly rejected the supplied credential.',
         'rdp_verification_failed': 'Guest RDP/NLA/firewall verification failed.',
         'guest_configuration_failed': 'Guest configuration failed at the secure setup gate.',
-        'guest_account_failed': 'Windows guest-account setup failed after the claim was consumed.',
-        'guest_account_readiness_failed': 'The desired Windows account did not pass readiness verification.',
+        'guest_account_failed': 'Guest-account setup failed after the claim was consumed.',
+        'guest_account_readiness_failed': 'The desired guest account did not pass readiness verification.',
         'bootstrap_cleanup_failed': 'Guest bootstrap cleanup did not verify.',
         'bootstrap_cleanup_transport_failed': 'The guest bootstrap cleanup channel failed.',
         'tailscale_enrollment_failed': 'Tailscale guest enrollment failed after guest setup.',
         'management_handoff_failed': 'The private management handoff did not verify after Tailscale enrollment.',
         'management_transport_failed': 'The private guest management channel failed safely; the VM was retained for diagnosis.',
         'management_transport_unavailable': 'The private guest management channel is unavailable; the VM was retained for diagnosis.',
+        'omarchy_not_validated': 'Omarchy Linux remains experimental until the pinned image, AMD GPU-P path, and accelerated guest pilot are verified.',
+        'omarchy_provisioning_unavailable': 'Omarchy Linux provisioning is unavailable on this host.',
+        'omarchy_template_invalid': 'The pinned Omarchy Linux template manifest failed validation.',
+        'omarchy_bootstrap_not_ready': 'The Omarchy Linux guest did not become reachable over Tailscale SSH.',
+        'omarchy_guest_configuration_unavailable': 'The Omarchy Linux guest configuration transport is unavailable.',
+        'omarchy_gpu_validation_failed': 'Omarchy accelerated rendering did not pass the AMD GPU-P guest validation gate.',
+        'omarchy_guest_validation_unavailable': 'The Omarchy AMD GPU and renderer validation channel is unavailable.',
+        'omarchy_encoder_unavailable': 'Sunshine did not report a working hardware encoder in Omarchy Linux.',
+        'omarchy_sunshine_configuration_failed': 'Sunshine hardware encoding could not be configured in Omarchy Linux.',
+        'omarchy_bootstrap_cleanup_failed': 'Omarchy Linux bootstrap cleanup did not verify; readiness was withheld.',
         'streaming_setup_failed': 'Moonlight/Sunshine setup failed after guest and network setup.',
         'sunshine_setup_failed': 'Automatic Sunshine setup failed after guest and network setup.',
         'sunshine_setup_unavailable': 'Automatic Sunshine setup is unavailable on this host.',
@@ -1437,6 +1613,8 @@ def _vm_host_error_response(exc):
         'guest_tcp_unverified': 'The server could not verify TCP reachability to the guest.',
         'legacy_state_uncertain': 'The persisted provisioning checkpoints are inconsistent; the VM was retained for diagnosis.',
         'host_unavailable': 'The remote VM host is unavailable.',
+        'invalid_name': 'VM names must start with a letter or number and use only lowercase letters, numbers, dots, underscores, or hyphens.',
+        'conflict': 'A VM with that name already exists.',
     }
     response = jsonify({'ok': False, 'error': messages.get(code, 'The remote VM request failed.'), 'code': code})
     response.headers['Cache-Control'] = 'no-store'
@@ -2526,7 +2704,7 @@ def _verify_v2_token(token_b64: str) -> bool:
         # payload format: expiry:random
         exp_str = payload.split(':',1)[0]
         exp = int(exp_str)
-        return time.time() < exp
+        return time.time() < exp and _account_dashboard_revision_valid(payload)
     except Exception:
         return False
 
@@ -2542,7 +2720,29 @@ def _users_db_path():
 def _users_conn():
     conn = sqlite3.connect(_users_db_path())
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA foreign_keys = ON')
     return conn
+
+
+def _resource_key(resource_type: str, host_id: str, native_id: str) -> str:
+    kind = 'cloudpc' if str(resource_type or '').lower() == 'cloudpc' else 'vm'
+    host = 'external' if kind == 'cloudpc' else (str(host_id or 'local').strip().lower() or 'local')
+    native = str(native_id or '').strip()
+    if not native:
+        raise ValueError('Resource identity is missing')
+    return f'{kind}:{url_quote(host, safe="")}:{url_quote(native, safe="")}'
+
+
+def _parse_resource_key(value: str):
+    parts = str(value or '').split(':', 2)
+    if len(parts) != 3 or parts[0] not in ('vm', 'cloudpc'):
+        return None
+    return {
+        'resourceType': parts[0],
+        'hostId': url_unquote(parts[1]),
+        'nativeId': url_unquote(parts[2]),
+        'resourceKey': str(value),
+    }
 
 def _init_users_db():
     conn = _users_conn()
@@ -2572,6 +2772,44 @@ def _init_users_db():
         );
         CREATE UNIQUE INDEX IF NOT EXISTS one_pending_access_request
         ON access_requests(username, vm_name) WHERE status = 'pending';
+        CREATE TABLE IF NOT EXISTS user_resource_access (
+            user_id INTEGER NOT NULL,
+            resource_key TEXT NOT NULL,
+            resource_type TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            PRIMARY KEY (user_id, resource_key),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS resource_metadata (
+            resource_key TEXT PRIMARY KEY,
+            resource_type TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            native_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            access_mode TEXT NOT NULL DEFAULT 'restricted',
+            title TEXT NOT NULL DEFAULT '',
+            host_override TEXT NOT NULL DEFAULT '',
+            path_override TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        CREATE TABLE IF NOT EXISTS resource_owners (
+            resource_key TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            source TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        CREATE TABLE IF NOT EXISTS resource_migration_issues (
+            source_table TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            legacy_name TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            candidates TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            resolved_at INTEGER,
+            PRIMARY KEY (source_table, source_id)
+        );
         CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY,
             type TEXT NOT NULL,
@@ -2597,15 +2835,29 @@ def _init_users_db():
                 ('who', "TEXT NOT NULL DEFAULT ''"),
                 ('vm_name', 'TEXT'),
                 ('provisioning_state', 'TEXT'),
+                ('session_version', 'INTEGER NOT NULL DEFAULT 1'),
+                ('provisioning_job_id', 'TEXT'),
+                ('provisioning_error', "TEXT NOT NULL DEFAULT ''"),
             ):
                 if col not in cols:
                     conn.execute(f'ALTER TABLE users ADD COLUMN {col} {ddl}')
             # Existing rows (created before this column existed) default to NULL
             # for the nullable account_status column; treat them as approved.
             conn.execute("UPDATE users SET account_status = 'approved' WHERE account_status IS NULL OR account_status = ''")
-            # Safety net for rows the first migration pinned to 'pending': any
-            # pre-existing user that already had VM access is approved.
-            conn.execute("UPDATE users SET account_status = 'approved' WHERE account_status = 'pending' AND id IN (SELECT DISTINCT user_id FROM user_vm_access)")
+            # Account-state transitions are handled by explicit actions.  A
+            # schema initializer must never repeatedly promote pending users.
+            req_cols = {r[1] for r in conn.execute('PRAGMA table_info(access_requests)')}
+            for col, ddl in (
+                ('resource_key', 'TEXT'),
+                ('resource_type', 'TEXT'),
+                ('host_id', 'TEXT'),
+            ):
+                if col not in req_cols:
+                    conn.execute(f'ALTER TABLE access_requests ADD COLUMN {col} {ddl}')
+            conn.execute('DROP INDEX IF EXISTS one_pending_access_request')
+            conn.execute('''CREATE UNIQUE INDEX IF NOT EXISTS one_pending_resource_request
+                            ON access_requests(username, resource_key)
+                            WHERE status = 'pending' AND resource_key IS NOT NULL''')
         except Exception:
             pass
         conn.commit()
@@ -2639,6 +2891,236 @@ def _normalize_vm_names(vms):
         out.append(name)
     return out
 
+
+def _resource_capabilities(item, *, resource_type='vm', classification='managed'):
+    supplied = item.get('capabilities') if isinstance(item, dict) else None
+    if isinstance(supplied, dict):
+        caps = dict(supplied)
+    else:
+        caps = {}
+    if resource_type == 'cloudpc':
+        defaults = {
+            'streamStart': True, 'streamStop': True, 'pair': True,
+            'powerStart': False, 'powerStop': False, 'restart': False,
+            'logs': False, 'exec': False, 'recover': False,
+            'optimizer': False, 'deletePhysicalPc': False,
+        }
+    else:
+        remote = str(item.get('placement') or '').lower() == 'remote'
+        protected = classification in ('template', 'protected', 'external')
+        defaults = {
+            'powerStart': not protected,
+            'powerStop': not protected,
+            'restart': not protected,
+            'logs': True,
+            'exec': not remote and not protected,
+            'recover': not protected,
+            'optimizer': not remote and not protected,
+            'delete': not protected,
+        }
+    return {**defaults, **caps}
+
+
+def _classify_vm_resource(item):
+    name = str(item.get('name') or '')
+    lowered = name.lower()
+    profile = str(item.get('profile') or '').lower()
+    if 'template' in lowered or profile in ('template', 'builder'):
+        return 'template'
+    if item.get('protected') is True:
+        return 'protected'
+    if item.get('managed') is False:
+        return 'external'
+    return 'managed'
+
+
+def _resource_inventory(*, include_cloudpcs=True, persist_metadata=True):
+    """Return provider-qualified resources plus provider availability.
+
+    Resource arrays and provider errors are intentionally separate.  A failed
+    host can therefore be shown as unavailable without implying its resources
+    or grants were deleted.
+    """
+    VM_HOST_REGISTRY.refresh()
+    resources, providers = [], []
+    for host_id, provider in (getattr(VM_HOST_REGISTRY, 'providers', {}) or {}).items():
+        host_name = getattr(provider, 'host_name', host_id)
+        try:
+            listed = manager_json_list() if host_id == 'local' else manager_json_list(host_id)
+            providers.append({'hostId': host_id, 'hostName': host_name, 'available': True, 'error': None})
+        except Exception as exc:
+            providers.append({'hostId': host_id, 'hostName': host_name, 'available': False, 'error': str(exc)})
+            continue
+        for item in listed:
+            name = str(item.get('name') or '').strip()
+            if not name:
+                continue
+            placement = str(item.get('placement') or ('local' if host_id == 'local' else 'remote')).lower()
+            native_id = name if host_id == 'local' else str(item.get('id') or item.get('Id') or item.get('vm_id') or name)
+            key = _resource_key('vm', host_id, native_id)
+            classification = _classify_vm_resource(item)
+            host_online = item.get('host_online') is not False
+            resource = dict(item)
+            resource.update({
+                'resourceKey': key,
+                'resourceType': 'vm',
+                'nativeId': native_id,
+                'name': name,
+                'hostId': host_id,
+                'host_id': host_id,
+                'hostName': item.get('host_name') or host_name,
+                'placement': placement,
+                'classification': classification,
+                'available': bool(host_online),
+                'stale': not bool(host_online),
+            })
+            resource['capabilities'] = _resource_capabilities(resource, classification=classification)
+            resources.append(resource)
+    if include_cloudpcs:
+        try:
+            cloud_pcs = _load_cloud_pcs(include_disabled=True)
+        except TypeError:  # compatibility with older test doubles
+            cloud_pcs = _load_cloud_pcs()
+        for pc in cloud_pcs:
+            pc_id = str(pc.get('id') or '').strip()
+            if not pc_id:
+                continue
+            key = _resource_key('cloudpc', 'external', pc_id)
+            enabled = pc.get('enabled', True) is not False
+            resources.append({
+                'resourceKey': key,
+                'resourceType': 'cloudpc',
+                'nativeId': pc_id,
+                'name': pc_id,
+                'title': pc.get('display_name') or pc_id,
+                'hostId': 'external',
+                'host_id': 'external',
+                'hostName': 'User-owned PC',
+                'placement': 'external',
+                'classification': 'external',
+                'owner': pc.get('owner') or '',
+                'paired': bool(pc.get('paired')),
+                'enabled': enabled,
+                'available': enabled,
+                'stale': False,
+                'capabilities': _resource_capabilities(pc, resource_type='cloudpc', classification='external'),
+            })
+    if persist_metadata:
+        _sync_resource_metadata(resources)
+    return resources, providers
+
+
+def _sync_resource_metadata(resources):
+    _init_users_db()
+    conn = _users_conn()
+    try:
+        for resource in resources:
+            key = resource['resourceKey']
+            existing = conn.execute('SELECT resource_key FROM resource_metadata WHERE resource_key = ?', (key,)).fetchone()
+            if existing:
+                conn.execute('''UPDATE resource_metadata SET resource_type = ?, host_id = ?, native_id = ?,
+                                display_name = ?, updated_at = strftime('%s','now') WHERE resource_key = ?''',
+                             (resource['resourceType'], resource['hostId'], resource['nativeId'], resource['name'], key))
+                continue
+            if resource['resourceType'] == 'vm' and resource['hostId'] == 'local':
+                access_mode = str(_instance_meta(resource['name']).get('access_mode') or 'public').lower()
+                if access_mode not in ('public', 'restricted'):
+                    access_mode = 'restricted'
+            else:
+                access_mode = 'restricted'
+            conn.execute('''INSERT INTO resource_metadata
+                            (resource_key, resource_type, host_id, native_id, display_name, access_mode, title)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                         (key, resource['resourceType'], resource['hostId'], resource['nativeId'],
+                          resource['name'], access_mode, str(resource.get('title') or '')))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _migrate_legacy_resource_access(resources):
+    by_name = {}
+    for resource in resources:
+        if resource.get('resourceType') == 'vm':
+            by_name.setdefault(resource['name'], []).append(resource)
+    _init_users_db()
+    conn = _users_conn()
+    try:
+        legacy = conn.execute('SELECT user_id, vm_name FROM user_vm_access ORDER BY user_id, vm_name').fetchall()
+        for row in legacy:
+            already = conn.execute('SELECT 1 FROM user_resource_access WHERE user_id = ? AND display_name = ?',
+                                   (row['user_id'], row['vm_name'])).fetchone()
+            if already:
+                continue
+            candidates = by_name.get(row['vm_name'], [])
+            if len(candidates) == 1:
+                candidate = candidates[0]
+                conn.execute('''INSERT OR IGNORE INTO user_resource_access
+                                (user_id, resource_key, resource_type, host_id, display_name)
+                                VALUES (?, ?, ?, ?, ?)''',
+                             (row['user_id'], candidate['resourceKey'], 'vm', candidate['hostId'], row['vm_name']))
+            else:
+                unresolved_key = _resource_key('vm', 'unresolved', row['vm_name'])
+                conn.execute('''INSERT OR IGNORE INTO user_resource_access
+                                (user_id, resource_key, resource_type, host_id, display_name)
+                                VALUES (?, ?, 'vm', 'unresolved', ?)''',
+                             (row['user_id'], unresolved_key, row['vm_name']))
+                source_id = f"{row['user_id']}:{row['vm_name']}"
+                reason = 'ambiguous_name' if len(candidates) > 1 else 'resource_unavailable'
+                conn.execute('''INSERT OR REPLACE INTO resource_migration_issues
+                                (source_table, source_id, legacy_name, reason, candidates, created_at, resolved_at)
+                                VALUES ('user_vm_access', ?, ?, ?, ?, strftime('%s','now'), NULL)''',
+                             (source_id, row['vm_name'], reason,
+                              json.dumps([candidate['resourceKey'] for candidate in candidates])))
+        # Only pending requests require an actionable resource identity.
+        # Historical approved/denied/dismissed rows remain as audit history;
+        # they must not generate permanent migration warnings or retroactive
+        # grants when the old bare VM name no longer exists.
+        conn.execute('''UPDATE resource_migration_issues SET resolved_at = strftime('%s','now')
+                        WHERE source_table = 'access_requests' AND resolved_at IS NULL
+                          AND source_id IN (
+                              SELECT CAST(id AS TEXT) FROM access_requests WHERE status <> 'pending'
+                          )''')
+        request_rows = conn.execute('''SELECT id, vm_name, resource_key FROM access_requests
+                                       WHERE status = 'pending'
+                                         AND (resource_key IS NULL OR resource_key = '')''').fetchall()
+        for row in request_rows:
+            candidates = by_name.get(row['vm_name'], [])
+            if len(candidates) == 1:
+                candidate = candidates[0]
+                conn.execute('''UPDATE access_requests SET resource_key = ?, resource_type = 'vm', host_id = ? WHERE id = ?''',
+                             (candidate['resourceKey'], candidate['hostId'], row['id']))
+            else:
+                source_id = str(row['id'])
+                reason = 'ambiguous_name' if len(candidates) > 1 else 'resource_unavailable'
+                conn.execute('''INSERT OR REPLACE INTO resource_migration_issues
+                                (source_table, source_id, legacy_name, reason, candidates, created_at, resolved_at)
+                                VALUES ('access_requests', ?, ?, ?, ?, strftime('%s','now'), NULL)''',
+                             (source_id, row['vm_name'], reason,
+                              json.dumps([candidate['resourceKey'] for candidate in candidates])))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _resolve_resource(value, *, host_id=None, resources=None, resource_type=None):
+    resources = resources if resources is not None else _resource_inventory()[0]
+    value = str(value or '').strip()
+    parsed = _parse_resource_key(value)
+    if parsed:
+        matches = [r for r in resources if r['resourceKey'] == value]
+    else:
+        matches = [r for r in resources if r['name'] == value]
+        if host_id:
+            matches = [r for r in matches if r['hostId'] == host_id]
+        if resource_type:
+            matches = [r for r in matches if r['resourceType'] == resource_type]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError('Ambiguous resource name; use a provider-qualified resource key')
+    return None
+
 def _known_vm_names():
     """Return VM names from every configured provider.
 
@@ -2650,20 +3132,27 @@ def _known_vm_names():
     local/other-host VMs.
     """
     names = set()
-    try:
-        providers = getattr(VM_HOST_REGISTRY, 'providers', {}) or {}
+    providers = getattr(VM_HOST_REGISTRY, 'providers', {}) or {}
+    if isinstance(providers, dict) and providers:
         for host_id in providers:
             try:
-                inventory = manager_json_list(host_id)
+                listed = manager_json_list(host_id)
             except Exception:
                 continue
-            names.update(str(item.get('name')) for item in inventory if item.get('name'))
-        if not providers:
-            inventory = manager_json_list()
-            names.update(str(item.get('name')) for item in inventory if item.get('name'))
-    except Exception:
+            names.update(
+                str(item.get('name') or '').strip().lower()
+                for item in listed
+                if isinstance(item, dict) and str(item.get('name') or '').strip()
+            )
         return names
-    return names
+    try:
+        return {
+            str(item.get('name') or '').strip().lower()
+            for item in manager_json_list()
+            if isinstance(item, dict) and str(item.get('name') or '').strip()
+        }
+    except Exception:
+        return set()
 
 def _validate_known_vm_names(names):
     names = _normalize_vm_names(names)
@@ -2732,19 +3221,38 @@ def _start_job(job_type: str, targets, work):
     threading.Thread(target=runner, daemon=True).start()
     return job_id
 
-def _user_row_to_dict(row, vm_names=None):
+def _resource_access_row_to_dict(row):
+    return {
+        'resourceKey': row['resource_key'],
+        'resourceType': row['resource_type'],
+        'hostId': row['host_id'],
+        'name': row['display_name'],
+        'resolved': row['host_id'] != 'unresolved',
+    }
+
+
+def _user_row_to_dict(row, resource_access=None, vm_names=None):
+    assigned_resources = list(resource_access or [])
+    assigned_names = [item['name'] for item in assigned_resources]
+    if not assigned_names:
+        assigned_names = _normalize_vm_names(vm_names or [])
     return {
         'id': row['id'],
         'username': row['username'],
         'isAdmin': bool(row['is_admin']),
         'disabled': bool(row['disabled']),
         'createdAt': int(row['created_at'] or 0),
-        'assignedVms': sorted(_normalize_vm_names(vm_names or [])),
+        'assignedVms': sorted(_normalize_vm_names(assigned_names)),
+        'assignedResources': sorted(assigned_resources, key=lambda item: (item['name'].lower(), item['hostId'])),
         'accountStatus': str(row['account_status'] or 'pending') if 'account_status' in row.keys() else 'pending',
         'email': (row['email'] or '') if 'email' in row.keys() else '',
         'who': (row['who'] or '') if 'who' in row.keys() else '',
         'vmName': (row['vm_name'] or '') if 'vm_name' in row.keys() else '',
         'provisioningState': (row['provisioning_state'] or None) if 'provisioning_state' in row.keys() else None,
+        'provisioningJobId': (row['provisioning_job_id'] or None) if 'provisioning_job_id' in row.keys() else None,
+        'provisioningError': (row['provisioning_error'] or '') if 'provisioning_error' in row.keys() else '',
+        'realm': 'portal',
+        'role': 'portal-admin' if bool(row['is_admin']) else 'portal-user',
     }
 
 def _list_users():
@@ -2752,11 +3260,15 @@ def _list_users():
     conn = _users_conn()
     try:
         rows = conn.execute('SELECT * FROM users ORDER BY username COLLATE NOCASE').fetchall()
-        access = conn.execute('SELECT user_id, vm_name FROM user_vm_access ORDER BY vm_name COLLATE NOCASE').fetchall()
-        vm_map = {}
-        for r in access:
-            vm_map.setdefault(r['user_id'], []).append(r['vm_name'])
-        return [_user_row_to_dict(r, vm_map.get(r['id'], [])) for r in rows]
+        access = conn.execute('''SELECT user_id, resource_key, resource_type, host_id, display_name
+                                 FROM user_resource_access ORDER BY display_name COLLATE NOCASE''').fetchall()
+        legacy = conn.execute('SELECT user_id, vm_name FROM user_vm_access ORDER BY vm_name COLLATE NOCASE').fetchall()
+        resource_map, vm_map = {}, {}
+        for item in access:
+            resource_map.setdefault(item['user_id'], []).append(_resource_access_row_to_dict(item))
+        for item in legacy:
+            vm_map.setdefault(item['user_id'], []).append(item['vm_name'])
+        return [_user_row_to_dict(r, resource_map.get(r['id'], []), vm_map.get(r['id'], [])) for r in rows]
     finally:
         conn.close()
 
@@ -2767,24 +3279,64 @@ def _get_user_by_username(username: str):
         row = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
         if not row:
             return None
+        resources = [_resource_access_row_to_dict(r) for r in conn.execute(
+            '''SELECT resource_key, resource_type, host_id, display_name FROM user_resource_access
+               WHERE user_id = ? ORDER BY display_name COLLATE NOCASE''', (row['id'],)).fetchall()]
         vms = [r['vm_name'] for r in conn.execute('SELECT vm_name FROM user_vm_access WHERE user_id = ? ORDER BY vm_name COLLATE NOCASE', (row['id'],)).fetchall()]
-        return _user_row_to_dict(row, vms) | { 'password_hash': row['password_hash'] }
+        return _user_row_to_dict(row, resources, vms) | { 'password_hash': row['password_hash'], 'sessionVersion': int(row['session_version'] or 1) if 'session_version' in row.keys() else 1 }
     finally:
         conn.close()
 
-def _create_user(username: str, password: str, assigned_vms=None, is_admin: bool=False):
+def _normalize_resource_assignments(values, *, existing=None):
+    values = _normalize_vm_names(values)
+    if not values:
+        return []
+    resources, _ = _resource_inventory()
+    by_key = {item['resourceKey']: item for item in resources}
+    existing_by_key = {item['resourceKey']: item for item in (existing or [])}
+    normalized = []
+    for value in values:
+        resource = by_key.get(value) or existing_by_key.get(value)
+        if resource is None and not _parse_resource_key(value):
+            resource = _resolve_resource(value, resources=resources, resource_type='vm')
+        if resource is None:
+            raise ValueError(f'Unknown or unavailable resource: {value}')
+        if resource.get('resourceType') == 'cloudpc':
+            raise ValueError('Cloud PC ownership cannot be changed through VM grants')
+        normalized.append({
+            'resourceKey': resource['resourceKey'],
+            'resourceType': resource.get('resourceType') or 'vm',
+            'hostId': resource.get('hostId') or 'local',
+            'name': resource.get('name') or value,
+        })
+    return list({item['resourceKey']: item for item in normalized}.values())
+
+
+def _replace_user_resource_access(conn, user_id, assignments):
+    conn.execute('DELETE FROM user_resource_access WHERE user_id = ?', (user_id,))
+    conn.executemany('''INSERT INTO user_resource_access
+                        (user_id, resource_key, resource_type, host_id, display_name)
+                        VALUES (?, ?, ?, ?, ?)''',
+                     [(user_id, item['resourceKey'], item['resourceType'], item['hostId'], item['name'])
+                      for item in assignments])
+
+
+def _create_user(username: str, password: str, assigned_vms=None, is_admin: bool=False, assigned_resources=None):
     if not re.fullmatch(r'[A-Za-z0-9_.-]{3,64}', username or ''):
         raise ValueError('Username must be 3-64 chars using letters, numbers, dot, underscore, or dash')
     if not password or len(password) < 3:
         raise ValueError('Password must be at least 3 characters')
-    assigned_vms = _normalize_vm_names(assigned_vms)
-    _validate_known_vm_names(assigned_vms)
+    requested = assigned_resources if assigned_resources is not None else assigned_vms
+    assignments = _normalize_resource_assignments(requested or [])
     _init_users_db()
     conn = _users_conn()
     try:
+        collision = conn.execute('SELECT username FROM users WHERE lower(username) = lower(?)', (username,)).fetchone()
+        if collision:
+            raise ValueError(f'Username conflicts with existing account {collision["username"]}; usernames are case-insensitive for new accounts')
         cur = conn.execute('INSERT INTO users (username, password_hash, is_admin, account_status) VALUES (?, ?, ?, ?)', (username, _hash_user_password(password), 1 if is_admin else 0, 'approved'))
         uid = cur.lastrowid
-        conn.executemany('INSERT OR IGNORE INTO user_vm_access (user_id, vm_name) VALUES (?, ?)', [(uid, vm) for vm in assigned_vms])
+        _replace_user_resource_access(conn, uid, assignments)
         conn.commit()
     except sqlite3.IntegrityError:
         raise ValueError('Username already exists')
@@ -2792,7 +3344,8 @@ def _create_user(username: str, password: str, assigned_vms=None, is_admin: bool
         conn.close()
     return _get_user_by_username(username)
 
-def _update_user(username: str, assigned_vms=None, password=None, disabled=None):
+def _update_user(username: str, assigned_vms=None, password=None, disabled=None, *, assigned_resources=None,
+                 account_status=None, is_admin=None):
     _init_users_db()
     conn = _users_conn()
     try:
@@ -2802,14 +3355,28 @@ def _update_user(username: str, assigned_vms=None, password=None, disabled=None)
         if password is not None:
             if len(password) < 3:
                 raise ValueError('Password must be at least 3 characters')
-            conn.execute('UPDATE users SET password_hash = ? WHERE id = ?', (_hash_user_password(password), row['id']))
+            conn.execute('UPDATE users SET password_hash = ?, session_version = session_version + 1 WHERE id = ?', (_hash_user_password(password), row['id']))
         if disabled is not None:
-            conn.execute('UPDATE users SET disabled = ? WHERE id = ?', (1 if disabled else 0, row['id']))
-        if assigned_vms is not None:
-            assigned_vms = _normalize_vm_names(assigned_vms)
-            _validate_known_vm_names(assigned_vms)
-            conn.execute('DELETE FROM user_vm_access WHERE user_id = ?', (row['id'],))
-            conn.executemany('INSERT OR IGNORE INTO user_vm_access (user_id, vm_name) VALUES (?, ?)', [(row['id'], vm) for vm in assigned_vms])
+            value = 1 if disabled else 0
+            if value != int(row['disabled'] or 0):
+                conn.execute('UPDATE users SET disabled = ?, session_version = session_version + 1 WHERE id = ?', (value, row['id']))
+        if account_status is not None:
+            account_status = str(account_status).strip().lower()
+            if account_status not in ('pending', 'approved', 'rejected'):
+                raise ValueError('Invalid account status')
+            if account_status != str(row['account_status'] or 'pending'):
+                conn.execute('UPDATE users SET account_status = ?, session_version = session_version + 1 WHERE id = ?', (account_status, row['id']))
+        if is_admin is not None:
+            value = 1 if is_admin else 0
+            if value != int(row['is_admin'] or 0):
+                conn.execute('UPDATE users SET is_admin = ?, session_version = session_version + 1 WHERE id = ?', (value, row['id']))
+        requested = assigned_resources if assigned_resources is not None else assigned_vms
+        if requested is not None:
+            existing_rows = conn.execute('''SELECT resource_key, resource_type, host_id, display_name
+                                            FROM user_resource_access WHERE user_id = ?''', (row['id'],)).fetchall()
+            existing = [_resource_access_row_to_dict(item) for item in existing_rows]
+            assignments = _normalize_resource_assignments(requested, existing=existing)
+            _replace_user_resource_access(conn, row['id'], assignments)
         conn.commit()
     finally:
         conn.close()
@@ -2822,7 +3389,16 @@ def _delete_user(username: str):
         row = conn.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
         if not row:
             return False
+        try:
+            cloud_pc_records = _load_cloud_pcs(include_disabled=True)
+        except TypeError:
+            cloud_pc_records = _load_cloud_pcs()
+        owned_cloud_pcs = [pc.get('id') for pc in cloud_pc_records if pc.get('owner') == username]
+        if owned_cloud_pcs:
+            raise ValueError('User owns Cloud PC records; disable the account or explicitly resolve ownership first')
         conn.execute('DELETE FROM user_vm_access WHERE user_id = ?', (row['id'],))
+        conn.execute('DELETE FROM user_resource_access WHERE user_id = ?', (row['id'],))
+        conn.execute('DELETE FROM access_requests WHERE username = ?', (username,))
         conn.execute('DELETE FROM users WHERE id = ?', (row['id'],))
         conn.commit()
         return True
@@ -2834,11 +3410,12 @@ def _create_portal_token(username: str, is_admin: bool=False) -> str:
     if not secret:
         raise ValueError('Portal session secret is not configured')
     exp = int(time.time() + 30*24*3600)
-    payload = json.dumps({'u': username, 'exp': exp, 'admin': bool(is_admin)}, separators=(',', ':'))
+    user = _get_user_by_username(username)
+    payload = json.dumps({'u': username, 'exp': exp, 'admin': bool(is_admin), 'sv': int((user or {}).get('sessionVersion') or 1)}, separators=(',', ':'))
     mac = hmac.new(secret.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}.{mac}".encode('utf-8')).decode('utf-8')
 
-def _verify_portal_token(token: str):
+def _verify_portal_token(token: str, *, require_approved=True):
     try:
         secret = _portal_secret()
         if not secret:
@@ -2854,15 +3431,19 @@ def _verify_portal_token(token: str):
         user = _get_user_by_username(data.get('u') or '')
         if not user or user.get('disabled'):
             return None
+        if int(data.get('sv') or 1) != int(user.get('sessionVersion') or 1):
+            return None
+        if require_approved and str(user.get('accountStatus') or 'pending') != 'approved':
+            return None
         return user
     except Exception:
         return None
 
-def _current_portal_user():
+def _current_portal_user(*, require_approved=True):
     token = request.cookies.get('Portal-Auth')
     if not token:
         return None
-    return _verify_portal_token(token)
+    return _verify_portal_token(token, require_approved=require_approved)
 
 def portal_auth_required(fn):
     @wraps(fn)
@@ -2876,10 +3457,44 @@ def portal_auth_required(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-def _vm_access_mode(name: str) -> str:
-    meta = _instance_meta(name)
-    mode = str(meta.get('access_mode') or 'public').strip().lower()
-    return mode if mode in ('public', 'restricted') else 'public'
+def _resource_key_for_name(name: str, *, host_id=None, resource_type='vm'):
+    if _parse_resource_key(name):
+        return name
+    if resource_type == 'cloudpc' or _is_cloudpc(name):
+        return _resource_key('cloudpc', 'external', name)
+    _init_users_db()
+    conn = _users_conn()
+    try:
+        sql = 'SELECT resource_key FROM resource_metadata WHERE resource_type = ? AND display_name = ?'
+        params = [resource_type, name]
+        if host_id:
+            sql += ' AND host_id = ?'
+            params.append(host_id)
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    if len(rows) == 1:
+        return rows[0]['resource_key']
+    if host_id == 'local' or (not host_id and not rows):
+        return _resource_key('vm', 'local', name)
+    return None
+
+
+def _vm_access_mode(name: str, *, host_id=None, resource_key=None) -> str:
+    key = resource_key or _resource_key_for_name(name, host_id=host_id)
+    if key:
+        _init_users_db()
+        conn = _users_conn()
+        try:
+            row = conn.execute('SELECT access_mode FROM resource_metadata WHERE resource_key = ?', (key,)).fetchone()
+        finally:
+            conn.close()
+        if row and str(row['access_mode']).lower() in ('public', 'restricted'):
+            return str(row['access_mode']).lower()
+    if (host_id or 'local') == 'local' and not _is_cloudpc(name):
+        mode = str(_instance_meta(name).get('access_mode') or 'public').strip().lower()
+        return mode if mode in ('public', 'restricted') else 'restricted'
+    return 'restricted'
 
 
 def _admin_vm_sso_enabled() -> bool:
@@ -2893,12 +3508,26 @@ def _admin_vm_sso_authenticated() -> bool:
     return _admin_vm_sso_enabled() and _verify_v2_token(request.cookies.get('Dashboard-Auth', ''))
 
 
-def _user_can_access_vm(user, name: str) -> bool:
-    if _vm_access_mode(name) == 'public':
+def _user_can_access_vm(user, name: str, *, host_id=None, resource_key=None) -> bool:
+    key = resource_key or _resource_key_for_name(name, host_id=host_id)
+    mode = (_vm_access_mode(name, host_id=host_id, resource_key=key)
+            if host_id or resource_key else _vm_access_mode(name))
+    if mode == 'public':
         return True
     if not user:
         return False
-    return name in set(user.get('assignedVms') or [])
+    if user.get('disabled') or str(user.get('accountStatus') or 'pending') != 'approved':
+        return False
+    if user.get('isAdmin'):
+        return True
+    if _is_cloudpc(name):
+        pc = _load_cloud_pc(name)
+        return bool(pc and pc.get('owner') == user.get('username'))
+    assigned_keys = {item.get('resourceKey') for item in (user.get('assignedResources') or [])}
+    if key and key in assigned_keys:
+        return True
+    # Compatibility for a pre-migration, uniquely named local assignment.
+    return not key and name in set(user.get('assignedVms') or [])
 
 def _portal_login_redirect(next_url: str):
     prefix = '/EpicVM' if request.path.startswith('/EpicVM/portal') else ''
@@ -2912,12 +3541,24 @@ def _safe_portal_next(next_url: str) -> str:
     return value
 
 def _render_vm_denied(name: str, user):
-    username = (user or {}).get('username', '')
-    page = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VM Login</title><style>body{{margin:0;font-family:Inter,system-ui,Arial;background:radial-gradient(circle at top,#101933 0%,#050816 58%,#03050d 100%);color:#e7f0f4;display:grid;place-items:center;min-height:100vh;padding:24px}}.card{{max-width:430px;width:100%;box-sizing:border-box;background:#071117;border:1px solid #1a2b33;border-top:2px solid #02bdf3;border-radius:5px;padding:34px;box-shadow:none}}.brand{{display:flex;align-items:center;gap:11px;border-bottom:1px solid #1a2b33;padding-bottom:20px;margin-bottom:26px}}.brand-mark{{display:grid;place-items:center;width:32px;height:32px;border-radius:5px;background:#02bdf3;color:#00131b;font-weight:900}}.brand-name{{font-size:18px;font-weight:700}}h1{{margin:0 0 8px;font-size:26px;font-weight:500;letter-spacing:-.025em}}.muted{{color:#9fb0b8;line-height:1.55}}input,button{{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:4px;border:1px solid #29404a;background:#061016;color:#e7f0f4;margin-top:10px;font:inherit}}input:focus{{outline:2px solid rgba(2,189,243,.25);border-color:#02bdf3}}button{{background:#02bdf3;color:#00131b;border-color:#34cdf8;cursor:pointer;font-weight:700}}button:hover{{background:#35cdf6}}#err{{color:#ff9ab0!important;margin-top:10px}}</style></head><body><div class=card><div class=brand><span class=brand-mark>B</span><span class=brand-name>BlobeVM</span></div><h1>VM Login</h1><div class=muted>Sign in to access restricted BlobeVM instances.</div><form onsubmit="return doLogin(event)"><input id=u placeholder="Username" autocomplete="username" /><input id=p type=password placeholder="Password" autocomplete="current-password" /><button>Sign in</button><div id=err style="color:#fca5a5;margin-top:10px"></div></form></div><script>async function doLogin(e){{e.preventDefault();const r=await fetch('/portal/api/auth/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{username:document.getElementById('u').value,password:document.getElementById('p').value}})}});const j=await r.json().catch(()=>({{}}));if(j.ok){{location.href={next_js};return false}}document.getElementById('err').textContent=j.error||'Login failed';return false}}</script></body></html>'''
+    next_url = request.path
+    if request.query_string:
+        next_url += '?' + request.query_string.decode('utf-8', 'ignore')
+    # Keep the local-only return target safe in both URL and inline-script
+    # contexts.  JSON permits angle brackets, but an HTML parser would still
+    # treat a user-controlled </script> sequence as the end of this block.
+    next_js = (json.dumps(_safe_portal_next(next_url))
+               .replace('<', '\\u003c')
+               .replace('>', '\\u003e')
+               .replace('&', '\\u0026'))
+    page = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EpicVM Login</title><style>body{{margin:0;font-family:Inter,system-ui,Arial;background:radial-gradient(circle at top,#101933 0%,#050816 58%,#03050d 100%);color:#e7f0f4;display:grid;place-items:center;min-height:100vh;padding:24px}}.card{{max-width:430px;width:100%;box-sizing:border-box;background:#071117;border:1px solid #1a2b33;border-top:2px solid #02bdf3;border-radius:5px;padding:34px;box-shadow:none}}.brand{{display:flex;align-items:center;gap:11px;border-bottom:1px solid #1a2b33;padding-bottom:20px;margin-bottom:26px}}.brand-mark{{display:grid;place-items:center;width:32px;height:32px;border-radius:5px;background:#02bdf3;color:#00131b;font-weight:900}}.brand-name{{font-size:18px;font-weight:700}}h1{{margin:0 0 8px;font-size:26px;font-weight:500;letter-spacing:-.025em}}.muted{{color:#9fb0b8;line-height:1.55}}input,button{{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:4px;border:1px solid #29404a;background:#061016;color:#e7f0f4;margin-top:10px;font:inherit}}input:focus{{outline:2px solid rgba(2,189,243,.25);border-color:#02bdf3}}button{{background:#02bdf3;color:#00131b;border-color:#34cdf8;cursor:pointer;font-weight:700}}button:hover{{background:#35cdf6}}#err{{color:#ff9ab0!important;margin-top:10px}}</style></head><body><div class=card><div class=brand><span class=brand-mark>E</span><span class=brand-name>EpicVM</span></div><h1>VM Login</h1><div class=muted>Sign in to access restricted EpicVM instances.</div><form onsubmit="return doLogin(event)"><input id=u placeholder="Username" autocomplete="username" /><input id=p type=password placeholder="Password" autocomplete="current-password" /><button>Sign in</button><div id=err style="color:#fca5a5;margin-top:10px"></div></form></div><script>async function doLogin(e){{e.preventDefault();const r=await fetch('/portal/api/auth/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{username:document.getElementById('u').value,password:document.getElementById('p').value}})}});const j=await r.json().catch(()=>({{}}));if(j.ok){{location.href={next_js};return false}}document.getElementById('err').textContent=j.error||'Login failed';return false}}</script></body></html>'''
     return Response(page, mimetype='text/html')
 
-def _enforce_vm_user_access(name: str):
-    if _vm_access_mode(name) == 'public' or _admin_vm_sso_authenticated():
+def _enforce_vm_user_access(name: str, *, host_id=None, resource_key=None):
+    host_id = host_id or str(request.values.get('host_id') or request.values.get('host') or '').strip() or None
+    access_mode = (_vm_access_mode(name, host_id=host_id, resource_key=resource_key)
+                   if host_id or resource_key else _vm_access_mode(name))
+    if access_mode == 'public' or _admin_vm_sso_authenticated():
         return None
     user = _current_portal_user()
     next_url = request.path
@@ -2925,7 +3566,9 @@ def _enforce_vm_user_access(name: str):
         next_url += '?' + request.query_string.decode('utf-8', 'ignore')
     if not user:
         return _portal_login_redirect(next_url)
-    if not _user_can_access_vm(user, name):
+    allowed = (_user_can_access_vm(user, name, host_id=host_id, resource_key=resource_key)
+               if host_id or resource_key else _user_can_access_vm(user, name))
+    if not allowed:
         return _render_vm_denied(name, user)
     request.portal_user = user
     return None
@@ -2933,11 +3576,11 @@ def _enforce_vm_user_access(name: str):
 def _portal_vm_payload(name: str):
     items = [i for i in manager_json_list() if i.get('name') == name]
     vm = items[0] if items else {'name': name, 'status': 'Unknown', 'url': _build_vm_url(name)}
-    vm['accessMode'] = _vm_access_mode(name)
+    vm['accessMode'] = _vm_access_mode(name, host_id=vm.get('host_id'))
     return vm
 
 def _state_dir():
-    return os.environ.get('BLOBEDASH_STATE', '/opt/bloe-vm')
+    return os.environ.get('BLOBEDASH_STATE', '/opt/blobe-vm')
 
 def _repo_manager_path():
     # Fallback path to the repo-managed CLI inside the mounted state dir
@@ -2997,6 +3640,8 @@ def _guess_icon_mimetype(path: str) -> str:
 
 def _send_icon_file(path: str):
     mimetype = _guess_icon_mimetype(path)
+    if mimetype == 'application/octet-stream':
+        abort(415)
     resp = send_file(path, mimetype=mimetype, conditional=False)
     resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     resp.headers['Pragma'] = 'no-cache'
@@ -3491,7 +4136,19 @@ def _tail_vm_logs(name: str, lines: int = 160) -> str:
 
 def _recover_vm(name: str, source: str = 'manual', aggressive: bool = True, mode: str = 'standard'):
     attempts = []
-    before = _vm_status_payload_bounded(name)
+    host = _vm_host()
+    def current_status():
+        if getattr(host, 'kind', 'local') == 'remote':
+            envelope = host.status(name)
+            raw = envelope.get('vm') if isinstance(envelope, dict) else envelope
+            vm = normalize_remote_vm_record(raw if isinstance(raw, dict) else {})
+            return {
+                **vm, 'ok': True, 'placement': 'remote', 'host_id': host.host_id,
+                'host_name': host.host_name, 'healthy': bool(vm.get('running')),
+                'exists': True,
+            }
+        return _vm_status_payload_bounded(name)
+    before = current_status()
     recovery_state = str(before.get('recoveryState') or '').lower()
     protected_vm = bool(before.get('protectedVm'))
     if before.get('running') and not before.get('crashed'):
@@ -3510,7 +4167,7 @@ def _recover_vm(name: str, source: str = 'manual', aggressive: bool = True, mode
             sequence.append('recreate')
     for action in sequence:
         try:
-            proc = _vm_host().run_manager(action, name, capture_output=True, text=True, timeout=60)
+            proc = host.run_manager(action, name, capture_output=True, text=True, timeout=60)
             attempt = {
                 'action': action,
                 'ok': proc.returncode == 0,
@@ -3522,7 +4179,7 @@ def _recover_vm(name: str, source: str = 'manual', aggressive: bool = True, mode
             attempt = {'action': action, 'ok': False, 'stdout': '', 'stderr': str(e), 'returncode': None}
         attempts.append(attempt)
         time.sleep(2.5)
-        current = _vm_status_payload_bounded(name)
+        current = current_status()
         if current.get('running') and (current.get('healthy') or current.get('state') == 'running'):
             return {'ok': True, 'recovered': True, 'attempts': attempts, 'status': current, 'message': f'VM recovered via {action}', 'source': source, 'mode': mode}
         # Chain actions only when needed: if this action succeeded but the VM
@@ -3532,10 +4189,10 @@ def _recover_vm(name: str, source: str = 'manual', aggressive: bool = True, mode
             # start worked but not marked healthy yet; wait a little longer
             # before deciding to escalate to restart/recreate.
             time.sleep(6)
-            current = _vm_status_payload_bounded(name)
+            current = current_status()
             if current.get('running') and (current.get('healthy') or current.get('state') == 'running'):
                 return {'ok': True, 'recovered': True, 'attempts': attempts, 'status': current, 'message': f'VM recovered via {action}', 'source': source, 'mode': mode}
-    final = _vm_status_payload_bounded(name)
+    final = current_status()
     return {'ok': False, 'recovered': False, 'attempts': attempts, 'status': final, 'message': 'VM recovery failed', 'source': source, 'mode': mode}
 
 
@@ -3597,7 +4254,10 @@ def _load_dashboard_settings():
     try:
         if os.path.isfile(p):
             with open(p, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, dict):
+                    data['favicon'] = _safe_favicon_reference(data.get('favicon', ''))
+                    return data
     except Exception:
         pass
     # defaults
@@ -3624,7 +4284,15 @@ def dashboard_favicon():
     # If no local file, try to redirect to configured favicon URL
     cfg = _load_dashboard_settings()
     if cfg.get('favicon'):
-        return '', 302, {'Location': cfg.get('favicon'), 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Pragma': 'no-cache', 'Expires': '0'}
+        favicon = str(cfg.get('favicon') or '').strip()
+        if favicon.startswith('/') and not favicon.startswith('//'):
+            safe_favicon = favicon
+        else:
+            try:
+                safe_favicon = _validate_favicon_url(favicon)
+            except ValueError:
+                abort(404)
+        return '', 302, {'Location': safe_favicon, 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0', 'Pragma': 'no-cache', 'Expires': '0'}
     # Not found
     abort(404)
 
@@ -3645,6 +4313,8 @@ def api_get_settings():
 @app.post('/dashboard/api/settings')
 @auth_required
 def api_set_settings():
+    if request.content_length and request.content_length > _FAVICON_MAX_BYTES:
+        return jsonify({'ok': False, 'error': 'Request exceeds 512 KiB'}), 413
     data = request.get_json(silent=True) if request.is_json else None
     data = data if isinstance(data, dict) else request.values
     title = str(data.get('title','') or '').strip()
@@ -3671,27 +4341,13 @@ def api_set_settings():
         except Exception:
             pass
     else:
-        # treat favicon as URL: try to download and save as favicon.ico under state_dir/dashboard/
-        if favicon.lower().startswith('http://') or favicon.lower().startswith('https://'):
-            try:
-                resp = urlrequest.urlopen(favicon, timeout=8)
-                data = resp.read()
-                try:
-                    ddir = os.path.join(_state_dir(), 'dashboard')
-                    os.makedirs(ddir, exist_ok=True)
-                    with open(os.path.join(ddir, 'favicon.ico'), 'wb') as f:
-                        f.write(data)
-                    # prefer local serve
-                    cfg['favicon'] = ''
-                except Exception:
-                    # fallback to storing URL
-                    cfg['favicon'] = favicon
-            except Exception:
-                # if download failed, just store URL so template can reference it
-                cfg['favicon'] = favicon
-        else:
-            # treat as direct URL or path; store it
+        if favicon.startswith('/') and not favicon.startswith('//'):
             cfg['favicon'] = favicon
+        else:
+            try:
+                cfg['favicon'] = _validate_favicon_url(favicon)
+            except ValueError as exc:
+                return jsonify({'ok': False, 'error': str(exc)}), 400
         
     ok = _save_dashboard_settings(cfg)
     return jsonify({'ok': bool(ok)})
@@ -3701,49 +4357,42 @@ def api_set_settings():
 @app.post('/dashboard/api/upload-favicon')
 @auth_required
 def api_upload_favicon():
-    # Expect a form file field named 'file'
-    f = None
     try:
         f = request.files.get('file')
-    except Exception:
-        pass
-    if not f:
-        return jsonify({'ok': False, 'error': 'No file provided'}), 400
-    try:
+        content = _read_favicon_upload(f)
         ddir = os.path.join(_state_dir(), 'dashboard')
         os.makedirs(ddir, exist_ok=True)
         outp = os.path.join(ddir, 'favicon.ico')
-        # Save file bytes
-        f.save(outp)
+        _write_favicon_atomically(outp, content)
         # clear stored URL in settings so local file is preferred
         cfg = _load_dashboard_settings()
         cfg['favicon'] = ''
         _save_dashboard_settings(cfg)
         return jsonify({'ok': True})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+    except ValueError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+    except Exception:
+        app.logger.exception('failed to upload dashboard favicon')
+        return jsonify({'ok': False, 'error': 'Unable to save favicon'}), 500
 
 
 @app.post('/dashboard/api/upload-vm-favicon/<name>')
 @auth_required
 def api_upload_vm_favicon(name):
-    f = None
     try:
+        safe = _validate_vm_name(name)
         f = request.files.get('file')
-    except Exception:
-        pass
-    if not f:
-        return jsonify({'ok': False, 'error': 'No file provided'}), 400
-    try:
+        content = _read_favicon_upload(f)
         ddir = os.path.join(_state_dir(), 'dashboard', 'vm-fav')
         os.makedirs(ddir, exist_ok=True)
-        # normalize name
-        safe = re.sub(r'[^A-Za-z0-9_-]', '_', name)
         outp = os.path.join(ddir, f"{safe}.ico")
-        f.save(outp)
+        _write_favicon_atomically(outp, content)
         return jsonify({'ok': True})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+    except ValueError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+    except Exception:
+        app.logger.exception('failed to upload VM favicon')
+        return jsonify({'ok': False, 'error': 'Unable to save favicon'}), 500
 
 
     # Serve dashboard v2 production assets requested from absolute `/assets/*` paths
@@ -3771,6 +4420,15 @@ def api_upload_vm_favicon(name):
 
 @app.get('/dashboard/auth/vm/<name>')
 def dashboard_vm_forward_auth(name):
+    if name.startswith('seat-'):
+        record = globals().get('_host_game_stream_record', lambda _name: None)(name)
+        user = _current_portal_user()
+        admin = _admin_vm_sso_authenticated()
+        if not record or not (admin or (user and record['realm'] == 'portal' and record['username'] == user['username'])):
+            return Response('Game session is unavailable.', 403, {'Cache-Control': 'no-store'})
+        if not _console_orchestrator().has_auto_login(name):
+            return Response('Game stream is preparing.', 503, {'Cache-Control': 'no-store', 'Retry-After': '3'})
+        return Response('OK', 200, {'Cache-Control': 'no-store'})
     if _admin_vm_sso_authenticated():
         authenticated = True
     else:
@@ -4012,19 +4670,15 @@ def portal_login_api():
             count = _LOGIN_ATTEMPTS.get(remote, {}).get('count', 0) + 1
             _LOGIN_ATTEMPTS[remote] = {'count': count, 'until': now + min(30, 2 ** min(count, 5))}
         return jsonify({'ok': False, 'error': 'invalid'}), 401
-    # Only approved accounts may obtain a session.
-    if str(user.get('accountStatus') or user.get('account_status') or 'pending') != 'approved':
-        with _LOGIN_LOCK:
-            count = _LOGIN_ATTEMPTS.get(remote, {}).get('count', 0) + 1
-            _LOGIN_ATTEMPTS[remote] = {'count': count, 'until': now + min(30, 2 ** min(count, 5))}
-        return jsonify({'ok': False, 'error': 'Account not approved'}), 403
     with _LOGIN_LOCK:
         _LOGIN_ATTEMPTS.pop(remote, None)
     try:
         token = _create_portal_token(user['username'], bool(user.get('isAdmin')))
     except ValueError as exc:
         return jsonify({'ok': False, 'error': str(exc)}), 503
-    resp = jsonify({'ok': True, 'user': {k:v for k,v in user.items() if k != 'password_hash'}})
+    approved = str(user.get('accountStatus') or 'pending') == 'approved'
+    resp = jsonify({'ok': True, 'accessGranted': approved, 'statusOnly': not approved,
+                    'user': {k:v for k,v in user.items() if k != 'password_hash'}})
     resp.set_cookie('Portal-Auth', token, httponly=True, samesite='Strict', secure=_request_is_https(), max_age=30*24*3600, path='/')
     return resp
 
@@ -4038,8 +4692,10 @@ def portal_logout_api():
 
 @app.get('/portal/api/auth/status')
 def portal_auth_status_api():
-    user = _current_portal_user()
-    return jsonify({'ok': bool(user), 'user': ({k:v for k,v in user.items() if k != 'password_hash'} if user else None)})
+    user = _current_portal_user(require_approved=False)
+    approved = bool(user and str(user.get('accountStatus') or 'pending') == 'approved')
+    return jsonify({'ok': bool(user), 'accessGranted': approved, 'statusOnly': bool(user and not approved),
+                    'user': ({k:v for k,v in user.items() if k != 'password_hash'} if user else None)})
 
 # --- Public beta signup + account status (EpicVM landing front door) ---
 @app.post('/EpicVM/api/signup')
@@ -4060,9 +4716,9 @@ def epicvm_signup_api():
     _init_users_db()
     conn = _users_conn()
     try:
-        existing = conn.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
+        existing = conn.execute('SELECT id, username FROM users WHERE lower(username) = lower(?)', (username,)).fetchone()
         if existing:
-            return jsonify({'ok': False, 'error': 'That username is already taken.'}), 409
+            return jsonify({'ok': False, 'error': 'That username conflicts with an existing account. Usernames are case-insensitive for new accounts.'}), 409
         # account_status starts 'pending'; admin must approve before VM access.
         conn.execute(
             'INSERT INTO users (username, password_hash, is_admin, account_status, email, who) VALUES (?, ?, ?, ?, ?, ?)',
@@ -4073,12 +4729,18 @@ def epicvm_signup_api():
         return jsonify({'ok': False, 'error': 'That username is already taken.'}), 409
     finally:
         conn.close()
-    return jsonify({'ok': True, 'status': 'pending', 'message': 'Access request received. Your account is waiting for approval.'})
+    created = _get_user_by_username(username)
+    resp = jsonify({'ok': True, 'status': 'pending', 'authenticated': True,
+                    'message': 'Access request received. Your account is waiting for approval.'})
+    if created:
+        token = _create_portal_token(created['username'], False)
+        resp.set_cookie('Portal-Auth', token, httponly=True, samesite='Strict', secure=_request_is_https(), max_age=30*24*3600, path='/')
+    return resp
 
 
 @app.get('/EpicVM/api/me')
 def epicvm_public_me_api():
-    user = _current_portal_user()
+    user = _current_portal_user(require_approved=False)
     if not user:
         return jsonify({'ok': False, 'authenticated': False})
     payload = {k: v for k, v in user.items() if k != 'password_hash'}
@@ -4090,62 +4752,107 @@ def epicvm_public_me_api():
 @portal_auth_required
 def portal_vms_api():
     user = request.portal_user
-    assigned = _normalize_vm_names(user.get('assignedVms') or [])
-    assigned_set = set(assigned)
-    # The portal lists only the caller's assigned machines by default.
-    # Public VMs are no longer surfaced here; they remain directly openable
-    # through their /vm/<name>/ wrapper if their access mode allows it.
-    all_vms = {item.get('name'): item for item in manager_json_list() if item.get('name')}
-    visible = [name for name in all_vms if name in assigned_set]
+    resources, providers = _resource_inventory(include_cloudpcs=True)
+    _migrate_legacy_resource_access(resources)
+    user = _get_user_by_username(user['username']) or user
+    all_resources = {item['resourceKey']: item for item in resources}
     vms = []
-    for name in visible:
-        try:
-            status = _vm_status_payload_bounded(name, timeout_s=6)
-        except Exception:
-            status = {'ok': False, 'name': name, 'status': 'unknown', 'state': 'unknown', 'running': False, 'healthy': False, 'crashed': False, 'exists': False}
-        meta = _instance_meta(name) or {}
+    for grant in user.get('assignedResources') or []:
+        if grant.get('resourceType') != 'vm':
+            continue
+        inventory = all_resources.get(grant['resourceKey'])
+        if not inventory:
+            vms.append({
+                'resourceKey': grant['resourceKey'], 'name': grant['name'],
+                'host_id': grant['hostId'], 'host_name': grant['hostId'],
+                'type': 'unknown', 'profile': 'unknown', 'os': 'Unknown',
+                'status': 'Unavailable', 'state': 'unavailable', 'running': False,
+                'healthy': False, 'exists': False, 'available': False, 'stale': True,
+                'readiness': 'unavailable', 'allowed': False,
+                'unavailableReason': 'The assigned provider or resource is not currently available.',
+                'capabilities': {},
+            })
+            continue
+        name = inventory['name']
+        is_remote = inventory.get('placement') == 'remote'
+        if is_remote:
+            status = inventory
+            meta = inventory
+        else:
+            try:
+                status = _vm_status_payload_bounded(name, timeout_s=6)
+            except Exception:
+                status = {'ok': False, 'name': name, 'status': 'unknown', 'state': 'unknown', 'running': False, 'healthy': False, 'crashed': False, 'exists': False}
+            meta = _instance_meta(name) or {}
         # Classify machine type from profile/platform metadata when present.
         profile = str((status.get('profile') or meta.get('profile') or 'standard')).strip().lower()
-        os_kind = str((meta.get('os') or meta.get('platform') or '')).strip().lower()
-        if 'windows' in os_kind or profile == 'windows':
+        os_kind = str((meta.get('os') or meta.get('platform') or status.get('os') or status.get('guest_os') or '')).strip().lower()
+        if 'windows' in os_kind or profile in ('windows', 'gaming'):
             vm_type = 'windows'
         elif profile == 'gaming':
             vm_type = 'gaming'
+        elif profile == 'omarchy':
+            vm_type = 'omarchy'
         else:
             vm_type = 'linux'
         state = str(status.get('state') or status.get('status') or 'unknown').lower()
-        running = bool(status.get('running'))
-        # Readiness: a machine is only "ready" when running AND not mid-transition.
-        provisioning = state in ('creating', 'configuring', 'starting', 'provisioning', 'loading')
-        if state == 'failed' or status.get('crashed'):
+        host_online = inventory.get('host_online') is not False and inventory.get('available', True) is not False
+        running = bool(status.get('running')) and host_online
+        provisioning_state = str(status.get('provisioning_state') or status.get('provisioningState') or state).lower()
+        provisioning = provisioning_state in (
+            'queued', 'creating', 'configuring', 'starting', 'provisioning', 'loading',
+            'streaming_setup', 'gaming_guest', 'gaming_network', 'gaming_gpu', 'omarchy_setup',
+        )
+        automated_ready = status.get('ready') is True or provisioning_state == 'ready'
+        if not host_online:
+            readiness = 'unavailable'
+        elif state == 'failed' or provisioning_state.startswith('failed') or provisioning_state.startswith('setup_failed') or status.get('crashed'):
             readiness = 'failed'
         elif provisioning:
             readiness = 'provisioning'
-        elif running and not provisioning:
+        elif running and automated_ready:
             readiness = 'ready'
+        elif running:
+            readiness = 'running-unready'
         elif state in ('stopping',):
             readiness = 'stopping'
         elif state in ('stopped', 'exited', 'dead'):
             readiness = 'stopped'
         else:
-            readiness = 'ready' if running else 'stopped'
+            readiness = 'stopped'
         item = {
+            'resourceKey': inventory['resourceKey'],
+            'resourceType': 'vm',
             'name': name,
-            'url': _build_vm_url(name),
-            'wrapperUrl': f'/vm/{name}/',
-            'accessMode': _vm_access_mode(name),
+            'url': inventory.get('url') or _build_vm_url(name),
+            'wrapperUrl': (
+                _build_vm_url(name, host_id=str(inventory.get('host_id') or ''))
+                if str(inventory.get('placement') or '').lower() == 'remote'
+                else f'/vm/{name}/'
+            ),
+            'accessMode': _vm_access_mode(name, host_id=inventory['hostId'], resource_key=inventory['resourceKey']),
             'allowed': True,
+            'placement': inventory.get('placement') or 'local',
+            'host_id': inventory.get('host_id') or 'local',
+            'host_name': inventory.get('host_name') or '',
+            'provider': inventory.get('provider') or '',
             'type': vm_type,
-            'os': os_kind or ('Windows' if vm_type == 'windows' else 'Linux'),
+            'os': os_kind or ('Windows' if vm_type == 'windows' else ('Omarchy Linux' if vm_type == 'omarchy' else 'Linux')),
             'profile': profile,
             'status': status.get('status') or status.get('state') or 'Unknown',
             'state': state,
             'running': running,
-            'healthy': bool(status.get('healthy')),
+            'powerRunning': bool(status.get('running')),
+            'hostReachable': host_online,
+            'healthy': bool(status.get('healthy', status.get('running', False))) and host_online,
             'crashed': bool(status.get('crashed')),
             'exists': bool(status.get('exists', True)),
             'recoveryState': status.get('recoveryState') or 'healthy',
             'readiness': readiness,
+            'provisioningState': provisioning_state,
+            'available': host_online,
+            'stale': bool(inventory.get('stale')),
+            'capabilities': inventory.get('capabilities') or {},
             'title': meta.get('title') or '',
             'cpu': meta.get('cpu') or status.get('cpu') or '',
             'memory': meta.get('memory') or status.get('memory') or '',
@@ -4157,6 +4864,8 @@ def portal_vms_api():
             continue
         st = _cp_status(pc['id'], tailnet_ip=pc['tailnet_ip'])
         vms.append({
+            'resourceKey': _resource_key('cloudpc', 'external', pc['id']),
+            'resourceType': 'cloudpc',
             'name': pc['id'],
             'url': _build_vm_url(pc['id']),
             'wrapperUrl': f'/vm/{pc["id"]}/',
@@ -4178,6 +4887,8 @@ def portal_vms_api():
             'memory': '',
             'owner': pc['owner'],
             'paired': pc.get('paired', False),
+            'available': pc.get('enabled', True) is not False,
+            'capabilities': _resource_capabilities(pc, resource_type='cloudpc', classification='external'),
         })
     # Provisioning summary for the dashboard header.
     summary = {
@@ -4187,47 +4898,78 @@ def portal_vms_api():
         'stopped': sum(1 for v in vms if v['readiness'] == 'stopped'),
         'failed': sum(1 for v in vms if v['readiness'] == 'failed'),
     }
-    return jsonify({'ok': True, 'user': {k:v for k,v in user.items() if k != 'password_hash'}, 'vms': vms, 'summary': summary})
+    return jsonify({'ok': True, 'user': {k:v for k,v in user.items() if k != 'password_hash'},
+                    'vms': vms, 'summary': summary, 'providers': providers})
 
 @app.post('/portal/api/start/<name>')
 @portal_auth_required
 def portal_start_vm(name):
-    if not _user_can_access_vm(request.portal_user, name):
-        # Cloud PCs are owner-scoped, not via assignedVms.
-        if _is_cloudpc(name):
-            pc = _load_cloud_pc(name)
-            if pc and (pc['owner'] == request.portal_user['username'] or _admin_vm_sso_authenticated()):
-                try:
-                    _cp_start(name)
-                except _CloudPcConfigError as exc:
-                    return jsonify({'ok': False, 'error': str(exc)}), 400
-                return jsonify({'ok': True, 'wrapperUrl': f'/vm/{name}/', 'openUrl': _build_vm_url(name)})
-        return jsonify({'ok': False, 'error': 'Forbidden'}), 403
+    data = request.get_json(silent=True) or {}
+    # Resolve kind before generic ACL logic.  Cloud PCs have stream lifecycle
+    # operations, not VM power operations, and are always owner/admin scoped.
+    if _is_cloudpc(name):
+        pc = _load_cloud_pc(name)
+        if not pc:
+            return jsonify({'ok': False, 'error': 'Cloud PC not found'}), 404
+        if pc['owner'] != request.portal_user['username'] and not request.portal_user.get('isAdmin') and not _admin_vm_sso_authenticated():
+            return jsonify({'ok': False, 'error': 'Forbidden'}), 403
+        try:
+            _cp_start(name)
+        except _CloudPcConfigError as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 400
+        return jsonify({'ok': True, 'resourceType': 'cloudpc', 'operation': 'stream-start',
+                        'wrapperUrl': f'/vm/{name}/', 'openUrl': _build_vm_url(name)})
     try:
-        _vm_host().check_call('start', name)
+        resource = _resolve_resource(data.get('resourceKey') or name, host_id=data.get('hostId') or data.get('host_id'), resource_type='vm')
+    except ValueError as exc:
+        return jsonify({'ok': False, 'error': str(exc), 'code': 'ambiguous_resource'}), 409
+    if not resource:
+        return jsonify({'ok': False, 'error': 'VM not found'}), 404
+    if not _user_can_access_vm(request.portal_user, resource['name'], host_id=resource['hostId'], resource_key=resource['resourceKey']):
+        return jsonify({'ok': False, 'error': 'Forbidden'}), 403
+    if not resource.get('capabilities', {}).get('powerStart', False):
+        return jsonify({'ok': False, 'error': 'Start is unsupported for this resource', 'code': 'capability_unsupported'}), 409
+    try:
+        _vm_host(resource['hostId']).check_call('start', resource['name'])
         try:
             dash_optimizer.note_vm_activity(name, 'portal-start')
         except Exception:
             pass
-        return jsonify({'ok': True, 'wrapperUrl': f'/vm/{name}/', 'openUrl': _build_vm_url(name)})
+        return jsonify({'ok': True, 'resourceKey': resource['resourceKey'],
+                        'wrapperUrl': _build_vm_url(resource['name'], host_id=resource['hostId']),
+                        'openUrl': _build_vm_url(resource['name'], host_id=resource['hostId'])})
     except subprocess.CalledProcessError as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 @app.post('/portal/api/stop/<name>')
 @portal_auth_required
 def portal_stop_vm(name):
-    if not _user_can_access_vm(request.portal_user, name):
-        if _is_cloudpc(name):
-            pc = _load_cloud_pc(name)
-            if pc and (pc['owner'] == request.portal_user['username'] or _admin_vm_sso_authenticated()):
-                try:
-                    _cp_stop(name)
-                except _CloudPcConfigError as exc:
-                    return jsonify({'ok': False, 'error': str(exc)}), 400
-                return jsonify({'ok': True})
-        return jsonify({'ok': False, 'error': 'Forbidden'}), 403
+    data = request.get_json(silent=True) or {}
+    if _is_cloudpc(name):
+        pc = _load_cloud_pc(name)
+        if not pc:
+            return jsonify({'ok': False, 'error': 'Cloud PC not found'}), 404
+        if pc['owner'] != request.portal_user['username'] and not request.portal_user.get('isAdmin') and not _admin_vm_sso_authenticated():
+            return jsonify({'ok': False, 'error': 'Forbidden'}), 403
+        try:
+            _cp_stop(name)
+        except _CloudPcConfigError as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 400
+        return jsonify({'ok': True, 'resourceType': 'cloudpc', 'operation': 'stream-stop'})
     try:
-        _vm_host().check_call('stop', name)
+        resource = _resolve_resource(data.get('resourceKey') or name, host_id=data.get('hostId') or data.get('host_id'), resource_type='vm')
+    except ValueError as exc:
+        return jsonify({'ok': False, 'error': str(exc), 'code': 'ambiguous_resource'}), 409
+    if not resource:
+        return jsonify({'ok': False, 'error': 'VM not found'}), 404
+    if not _user_can_access_vm(request.portal_user, resource['name'], host_id=resource['hostId'], resource_key=resource['resourceKey']):
+        return jsonify({'ok': False, 'error': 'Forbidden'}), 403
+    if not resource.get('capabilities', {}).get('powerStop', False):
+        return jsonify({'ok': False, 'error': 'Stop is unsupported for this resource', 'code': 'capability_unsupported'}), 409
+    try:
+        host = _vm_host(resource['hostId'])
+        host.check_call('stop', resource['name'])
+        _stop_remote_console_after_vm(host, resource['name'])
         return jsonify({'ok': True})
     except subprocess.CalledProcessError as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
@@ -4242,7 +4984,7 @@ def _cloudpc_owner_ok(name):
     pc = _load_cloud_pc(name)
     if not pc:
         return None
-    if pc['owner'] == request.portal_user['username'] or _admin_vm_sso_authenticated():
+    if pc['owner'] == request.portal_user['username'] or request.portal_user.get('isAdmin') or _admin_vm_sso_authenticated():
         return pc
     return False  # owned by someone else
 
@@ -4437,23 +5179,29 @@ def portal_vm_escalation_status(name):
 @portal_auth_required
 def portal_request_access(name):
     user = request.portal_user
-    if name not in _known_vm_names():
-        return jsonify({'ok': False, 'error': 'VM not found'}), 404
-    if _user_can_access_vm(user, name):
-        return jsonify({'ok': False, 'error': 'You already have access'}), 400
-    note = ''
+    data = request.get_json(silent=True) or {}
     try:
-        data = request.get_json(silent=True) or {}
-        note = str(data.get('note') or '').strip()[:1000]
-    except Exception:
-        note = ''
+        resource = _resolve_resource(data.get('resourceKey') or name,
+                                     host_id=data.get('hostId') or data.get('host_id'),
+                                     resource_type='vm')
+    except ValueError as exc:
+        return jsonify({'ok': False, 'error': str(exc), 'code': 'ambiguous_resource'}), 409
+    if not resource:
+        return jsonify({'ok': False, 'error': 'VM not found'}), 404
+    if _user_can_access_vm(user, resource['name'], host_id=resource['hostId'], resource_key=resource['resourceKey']):
+        return jsonify({'ok': False, 'error': 'You already have access'}), 400
+    note = str(data.get('note') or '').strip()[:1000]
     _init_users_db()
     conn = _users_conn()
     try:
-        existing = conn.execute('SELECT id FROM access_requests WHERE username = ? AND vm_name = ? AND status = ?', (user['username'], name, 'pending')).fetchone()
+        existing = conn.execute('SELECT id FROM access_requests WHERE username = ? AND resource_key = ? AND status = ?',
+                                (user['username'], resource['resourceKey'], 'pending')).fetchone()
         if existing:
             return jsonify({'ok': True, 'alreadyPending': True})
-        conn.execute('INSERT INTO access_requests (username, vm_name, note, status) VALUES (?, ?, ?, ?)', (user['username'], name, note, 'pending'))
+        conn.execute('''INSERT INTO access_requests
+                        (username, vm_name, resource_key, resource_type, host_id, note, status)
+                        VALUES (?, ?, ?, 'vm', ?, ?, 'pending')''',
+                     (user['username'], resource['name'], resource['resourceKey'], resource['hostId'], note))
         conn.commit()
     finally:
         conn.close()
@@ -4475,7 +5223,7 @@ def portal_login_page():
         return redirect(_safe_portal_next(request.args.get('next')))
     next_url = _safe_portal_next(request.args.get('next'))
     next_js = json.dumps(next_url)
-    page = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VM Login</title><style>body{{margin:0;font-family:Inter,system-ui,Arial;background:radial-gradient(circle at top,#101933 0%,#050816 58%,#03050d 100%);color:#e7f0f4;display:grid;place-items:center;min-height:100vh;padding:24px}}.card{{max-width:430px;width:100%;box-sizing:border-box;background:#071117;border:1px solid #1a2b33;border-top:2px solid #02bdf3;border-radius:5px;padding:34px;box-shadow:none}}.brand{{display:flex;align-items:center;gap:11px;border-bottom:1px solid #1a2b33;padding-bottom:20px;margin-bottom:26px}}.brand-mark{{display:grid;place-items:center;width:32px;height:32px;border-radius:5px;background:#02bdf3;color:#00131b;font-weight:900}}.brand-name{{font-size:18px;font-weight:700}}h1{{margin:0 0 8px;font-size:26px;font-weight:500;letter-spacing:-.025em}}.muted{{color:#9fb0b8;line-height:1.55}}input,button{{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:4px;border:1px solid #29404a;background:#061016;color:#e7f0f4;margin-top:10px;font:inherit}}input:focus{{outline:2px solid rgba(2,189,243,.25);border-color:#02bdf3}}button{{background:#02bdf3;color:#00131b;border-color:#34cdf8;cursor:pointer;font-weight:700}}button:hover{{background:#35cdf6}}#err{{color:#ff9ab0!important;margin-top:10px}}</style></head><body><div class=card><div class=brand><span class=brand-mark>B</span><span class=brand-name>BlobeVM</span></div><h1>VM Login</h1><div class=muted>Sign in to access restricted BlobeVM instances.</div><form onsubmit="return doLogin(event)"><input id=u placeholder="Username" autocomplete="username" /><input id=p type=password placeholder="Password" autocomplete="current-password" /><button>Sign in</button><div id=err style="color:#fca5a5;margin-top:10px"></div></form></div><script>async function doLogin(e){{e.preventDefault();const r=await fetch('/portal/api/auth/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{username:document.getElementById('u').value,password:document.getElementById('p').value}})}});const j=await r.json().catch(()=>({{}}));if(j.ok){{location.href={next_js};return false}}document.getElementById('err').textContent=j.error||'Login failed';return false}}</script></body></html>'''
+    page = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EpicVM Login</title><style>body{{margin:0;font-family:Inter,system-ui,Arial;background:radial-gradient(circle at top,#101933 0%,#050816 58%,#03050d 100%);color:#e7f0f4;display:grid;place-items:center;min-height:100vh;padding:24px}}.card{{max-width:430px;width:100%;box-sizing:border-box;background:#071117;border:1px solid #1a2b33;border-top:2px solid #02bdf3;border-radius:5px;padding:34px;box-shadow:none}}.brand{{display:flex;align-items:center;gap:11px;border-bottom:1px solid #1a2b33;padding-bottom:20px;margin-bottom:26px}}.brand-mark{{display:grid;place-items:center;width:32px;height:32px;border-radius:5px;background:#02bdf3;color:#00131b;font-weight:900}}.brand-name{{font-size:18px;font-weight:700}}h1{{margin:0 0 8px;font-size:26px;font-weight:500;letter-spacing:-.025em}}.muted{{color:#9fb0b8;line-height:1.55}}input,button{{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:4px;border:1px solid #29404a;background:#061016;color:#e7f0f4;margin-top:10px;font:inherit}}input:focus{{outline:2px solid rgba(2,189,243,.25);border-color:#02bdf3}}button{{background:#02bdf3;color:#00131b;border-color:#34cdf8;cursor:pointer;font-weight:700}}button:hover{{background:#35cdf6}}#err{{color:#ff9ab0!important;margin-top:10px}}</style></head><body><div class=card><div class=brand><span class=brand-mark>E</span><span class=brand-name>EpicVM</span></div><h1>VM Login</h1><div class=muted>Sign in to access restricted EpicVM instances.</div><form onsubmit="return doLogin(event)"><input id=u placeholder="Username" autocomplete="username" /><input id=p type=password placeholder="Password" autocomplete="current-password" /><button>Sign in</button><div id=err style="color:#fca5a5;margin-top:10px"></div></form></div><script>async function doLogin(e){{e.preventDefault();const r=await fetch('/portal/api/auth/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{username:document.getElementById('u').value,password:document.getElementById('p').value}})}});const j=await r.json().catch(()=>({{}}));if(j.ok){{location.href={next_js};return false}}document.getElementById('err').textContent=j.error||'Login failed';return false}}</script></body></html>'''
     return Response(page, mimetype='text/html')
 
 # --- EpicVM namespace aliases for the existing portal (no duplicated logic) ---
@@ -4499,13 +5247,58 @@ def epicvm_portal_login_page():
 @app.get('/dashboard/api/users')
 @v2_auth_required
 def dashboard_users_list():
+    resources, providers = _resource_inventory(include_cloudpcs=True)
+    _migrate_legacy_resource_access(resources)
     _init_users_db()
     conn = _users_conn()
     try:
-        reqs = [dict(r) for r in conn.execute('SELECT id, username, vm_name, note, status, created_at FROM access_requests ORDER BY created_at DESC LIMIT 200').fetchall()]
+        limit = min(200, max(1, int(request.args.get('limit') or 50)))
+        offset = max(0, int(request.args.get('offset') or 0))
+        reqs = [dict(r) for r in conn.execute('''SELECT id, username, vm_name, resource_key, resource_type,
+                                                       host_id, note, status, created_at
+                                                FROM access_requests ORDER BY created_at DESC LIMIT ? OFFSET ?''',
+                                                 (limit, offset)).fetchall()]
+        request_count = int(conn.execute('SELECT COUNT(*) FROM access_requests').fetchone()[0])
+        metadata = {r['resource_key']: dict(r) for r in conn.execute('SELECT * FROM resource_metadata').fetchall()}
+        grants = conn.execute('''SELECT a.resource_key, u.username FROM user_resource_access a
+                                 JOIN users u ON u.id = a.user_id ORDER BY u.username COLLATE NOCASE''').fetchall()
+        assigned = {}
+        for grant in grants:
+            assigned.setdefault(grant['resource_key'], []).append(grant['username'])
+        issues = [dict(r) for r in conn.execute('''SELECT source_table, source_id, legacy_name, reason, candidates, created_at
+                                                   FROM resource_migration_issues WHERE resolved_at IS NULL
+                                                   ORDER BY created_at, source_table, source_id''').fetchall()]
     finally:
         conn.close()
-    return jsonify({'ok': True, 'users': _list_users(), 'requests': reqs, 'vms': manager_json_list()})
+    for resource in resources:
+        meta = metadata.get(resource['resourceKey'], {})
+        resource['accessMode'] = meta.get('access_mode') or 'restricted'
+        resource['title'] = meta.get('title') or resource.get('title') or ''
+        resource['assignedUsers'] = assigned.get(resource['resourceKey'], [])
+    config_admins = []
+    for username, source in ((_admin_credentials()[0], 'primary-config'), (_extra_admin_credentials()[0], 'secondary-config')):
+        if username:
+            config_admins.append({
+                'username': username, 'realm': 'dashboard-config', 'role': 'dashboard-admin',
+                'source': source, 'protected': True, 'readOnly': True,
+            })
+    users = _list_users()
+    folded_counts = {}
+    for user in users:
+        folded_counts[user['username'].casefold()] = folded_counts.get(user['username'].casefold(), 0) + 1
+    for user in users:
+        user['caseCollision'] = folded_counts.get(user['username'].casefold(), 0) > 1
+    return jsonify({
+        'ok': True,
+        'users': users,
+        'adminIdentities': config_admins,
+        'requests': reqs,
+        'requestPage': {'offset': offset, 'limit': limit, 'total': request_count},
+        'vms': resources,
+        'resources': resources,
+        'providers': providers,
+        'migrationIssues': issues,
+    })
 
 @app.post('/dashboard/api/users')
 @v2_auth_required
@@ -4513,7 +5306,9 @@ def dashboard_users_create():
     data = request.get_json(silent=True) or {}
     try:
         is_admin = bool(data.get('isAdmin')) if isinstance(data.get('isAdmin'), bool) else str(data.get('isAdmin') or '').strip().lower() in ('1', 'true', 'yes', 'on')
-        user = _create_user(str(data.get('username') or '').strip(), str(data.get('password') or ''), data.get('assignedVms') or [], is_admin=is_admin)
+        user = _create_user(str(data.get('username') or '').strip(), str(data.get('password') or ''),
+                            data.get('assignedVms') or [], is_admin=is_admin,
+                            assigned_resources=(data.get('assignedResources') if 'assignedResources' in data else None))
         return jsonify({'ok': True, 'user': {k:v for k,v in user.items() if k != 'password_hash'}})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 400
@@ -4523,7 +5318,14 @@ def dashboard_users_create():
 def dashboard_users_update(username):
     data = request.get_json(silent=True) or {}
     try:
-        user = _update_user(username, assigned_vms=(data.get('assignedVms') if 'assignedVms' in data else None), password=(str(data.get('password')) if data.get('password') else None), disabled=(data.get('disabled') if 'disabled' in data else None))
+        user = _update_user(
+            username,
+            assigned_vms=(data.get('assignedVms') if 'assignedVms' in data else None),
+            assigned_resources=(data.get('assignedResources') if 'assignedResources' in data else None),
+            password=(str(data.get('password')) if data.get('password') else None),
+            disabled=(data.get('disabled') if 'disabled' in data else None),
+            is_admin=(data.get('isAdmin') if 'isAdmin' in data else None),
+        )
         return jsonify({'ok': True, 'user': {k:v for k,v in user.items() if k != 'password_hash'}})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 400
@@ -4531,8 +5333,11 @@ def dashboard_users_update(username):
 @app.post('/dashboard/api/users/<username>/delete')
 @v2_auth_required
 def dashboard_users_delete(username):
-    ok = _delete_user(username)
-    return jsonify({'ok': ok})
+    try:
+        ok = _delete_user(username)
+        return jsonify({'ok': ok})
+    except ValueError as exc:
+        return jsonify({'ok': False, 'error': str(exc), 'code': 'cloudpc_ownership_requires_resolution'}), 409
 
 @app.post('/dashboard/api/access-requests/<int:req_id>/action')
 @v2_auth_required
@@ -4544,15 +5349,30 @@ def dashboard_access_request_action(req_id):
     _init_users_db()
     conn = _users_conn()
     try:
-        row = conn.execute('SELECT id, username, vm_name, note, status FROM access_requests WHERE id = ?', (req_id,)).fetchone()
+        row = conn.execute('''SELECT id, username, vm_name, resource_key, resource_type, host_id, note, status
+                              FROM access_requests WHERE id = ?''', (req_id,)).fetchone()
         if not row:
             return jsonify({'ok': False, 'error': 'Request not found'}), 404
+        if row['status'] != 'pending':
+            if ((action == 'approve' and row['status'] == 'approved') or
+                    (action == 'deny' and row['status'] == 'denied') or
+                    (action == 'dismiss' and row['status'] == 'dismissed')):
+                return jsonify({'ok': True, 'status': row['status'], 'repeated': True})
+            return jsonify({'ok': False, 'error': f"Request is already {row['status']}"}), 409
         if action == 'approve':
-            user = _get_user_by_username(row['username'])
-            if not user:
+            user_row = conn.execute('SELECT id FROM users WHERE username = ?', (row['username'],)).fetchone()
+            if not user_row:
                 return jsonify({'ok': False, 'error': 'User no longer exists'}), 404
-            assigned = sorted(set((user.get('assignedVms') or []) + [row['vm_name']]))
-            _update_user(row['username'], assigned_vms=assigned, account_status='approved')
+            if not row['resource_key']:
+                return jsonify({'ok': False, 'error': 'Legacy request has no unambiguous resource identity'}), 409
+            meta = conn.execute('SELECT resource_key, resource_type, host_id, display_name FROM resource_metadata WHERE resource_key = ?',
+                                (row['resource_key'],)).fetchone()
+            if not meta:
+                return jsonify({'ok': False, 'error': 'Requested resource is unavailable or was deleted'}), 409
+            conn.execute('''INSERT OR IGNORE INTO user_resource_access
+                            (user_id, resource_key, resource_type, host_id, display_name)
+                            VALUES (?, ?, ?, ?, ?)''',
+                         (user_row['id'], meta['resource_key'], meta['resource_type'], meta['host_id'], meta['display_name']))
             new_status = 'approved'
         elif action == 'deny':
             new_status = 'denied'
@@ -4560,7 +5380,10 @@ def dashboard_access_request_action(req_id):
             new_status = 'dismissed'
         conn.execute('UPDATE access_requests SET status = ? WHERE id = ?', (new_status, req_id))
         conn.commit()
-        return jsonify({'ok': True, 'status': new_status, 'request': {'id': row['id'], 'username': row['username'], 'vm_name': row['vm_name']}})
+        return jsonify({'ok': True, 'status': new_status, 'request': {
+            'id': row['id'], 'username': row['username'], 'vm_name': row['vm_name'],
+            'resource_key': row['resource_key'], 'host_id': row['host_id'],
+        }})
     finally:
         conn.close()
 
@@ -4572,25 +5395,129 @@ def _safe_linux_vm_name(username: str) -> str:
     return (base[:32] or 'user').lower()
 
 
-def _provision_user_linux_vm(username: str) -> str:
-    """Best-effort provision a Linux VM for an approved user. Returns a state string."""
-    vm_name = _safe_linux_vm_name(username)
+def _provisioning_vm_name(username: str):
+    base = _safe_linux_vm_name(username)
+    resources, _ = _resource_inventory(include_cloudpcs=False)
+    local_by_name = {r['name']: r for r in resources if r['hostId'] == 'local'}
+    _init_users_db()
+    conn = _users_conn()
     try:
-        host = _vm_host('local')
-        ok, out, err, rc = _run_manager('create', vm_name)
-        if not ok and 'already exists' not in (err or '') and 'already exists' not in (out or ''):
-            app.logger.warning('EpicVM auto-provision create failed for %s: %s', username, err or out)
-            return 'creating'
-        _set_instance_meta(vm_name, 'access_mode', 'restricted')
-        conn = _users_conn()
+        case_collision = conn.execute('''SELECT 1 FROM users WHERE lower(username) = lower(?) AND username <> ?''',
+                                      (username, username)).fetchone()
+        existing = local_by_name.get(base)
+        if existing:
+            owner = conn.execute('SELECT username FROM resource_owners WHERE resource_key = ?',
+                                 (existing['resourceKey'],)).fetchone()
+            if owner and owner['username'] == username:
+                return base, existing, True
+        if case_collision or existing:
+            suffix = hashlib.sha256(username.encode('utf-8')).hexdigest()[:6]
+            base = f'{base[:25]}-{suffix}'
+            existing = local_by_name.get(base)
+            if existing:
+                owner = conn.execute('SELECT username FROM resource_owners WHERE resource_key = ?',
+                                     (existing['resourceKey'],)).fetchone()
+                if not owner or owner['username'] != username:
+                    raise ValueError('Provisioning target already exists and is not owned by this account')
+                return base, existing, True
+        return base, existing, False
+    finally:
+        conn.close()
+
+
+def _start_user_linux_provisioning(username: str, *, host_id='local', profile='standard'):
+    """Start a durable, idempotent account provisioning job.
+
+    Account approval and VM creation are separate state transitions.  The
+    public-beta default is explicitly local + standard Linux; unsupported
+    provider/profile selections fail rather than silently falling back.
+    """
+    if host_id != 'local' or profile != 'standard':
+        raise ValueError('Account auto-provisioning currently supports host local with profile standard')
+    vm_name, existing, owned = _provisioning_vm_name(username)
+    _init_users_db()
+    conn = _users_conn()
+    try:
+        row = conn.execute('SELECT id, provisioning_job_id, provisioning_state FROM users WHERE username = ?', (username,)).fetchone()
+        if not row:
+            raise ValueError('User not found')
+        if row['provisioning_job_id'] and str(row['provisioning_state'] or '') in ('queued', 'creating', 'created', 'ready'):
+            return row['provisioning_job_id'], str(row['provisioning_state']), vm_name
+    finally:
+        conn.close()
+
+    def work():
         try:
-            row = conn.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
-            if row:
-                conn.execute('INSERT OR IGNORE INTO user_vm_access (user_id, vm_name) VALUES (?, ?)', (row['id'], vm_name))
+            if not owned:
+                ok, out, err, _rc = _run_manager('create', vm_name)
+                if not ok:
+                    message = str(err or out or 'VM create failed')
+                    conn = _users_conn()
+                    try:
+                        conn.execute('''UPDATE users SET provisioning_state = 'failed', provisioning_error = ?
+                                        WHERE username = ?''', (message[:2000], username))
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    return False, message
+            _set_instance_meta(vm_name, 'access_mode', 'restricted')
+            key = _resource_key('vm', 'local', vm_name)
+            conn = _users_conn()
+            try:
+                user_row = conn.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
+                if not user_row:
+                    return False, 'User was deleted during provisioning'
+                conn.execute('''INSERT OR REPLACE INTO resource_metadata
+                                (resource_key, resource_type, host_id, native_id, display_name, access_mode, updated_at)
+                                VALUES (?, 'vm', 'local', ?, ?, 'restricted', strftime('%s','now'))''',
+                             (key, vm_name, vm_name))
+                conn.execute('''INSERT OR REPLACE INTO resource_owners (resource_key, username, source)
+                                VALUES (?, ?, 'account-provisioning')''', (key, username))
+                conn.execute('''INSERT OR IGNORE INTO user_resource_access
+                                (user_id, resource_key, resource_type, host_id, display_name)
+                                VALUES (?, ?, 'vm', 'local', ?)''', (user_row['id'], key, vm_name))
+                conn.execute('''UPDATE users SET provisioning_state = 'created', provisioning_error = '', vm_name = ?
+                                WHERE id = ?''', (vm_name, user_row['id']))
                 conn.commit()
-        finally:
-            conn.close()
-        return 'creating'
+            finally:
+                conn.close()
+            return True, f'Created {vm_name}' if not owned else f'Linked owned resource {vm_name}'
+        except Exception as exc:
+            conn = _users_conn()
+            try:
+                conn.execute('''UPDATE users SET provisioning_state = 'failed', provisioning_error = ?
+                                WHERE username = ?''', (str(exc)[:2000], username))
+                conn.commit()
+            finally:
+                conn.close()
+            return False, str(exc)
+
+    job_id = _create_job('account-provision', [_resource_key('vm', 'local', vm_name)])
+    conn = _users_conn()
+    try:
+        conn.execute('''UPDATE users SET provisioning_job_id = ?, provisioning_state = 'queued',
+                        provisioning_error = '', vm_name = ? WHERE username = ?''',
+                     (job_id, vm_name, username))
+        conn.commit()
+    finally:
+        conn.close()
+    def runner():
+        _update_job(job_id, status='running', progress='Creating account VM')
+        try:
+            ok, output = work()
+            _update_job(job_id, status='succeeded' if ok else 'failed',
+                        progress='Completed' if ok else 'Failed', output=output if ok else '',
+                        error='' if ok else output)
+        except Exception as exc:
+            _update_job(job_id, status='failed', progress='Failed', error=str(exc))
+    threading.Thread(target=runner, daemon=True).start()
+    return job_id, 'queued', vm_name
+
+
+def _provision_user_linux_vm(username: str) -> str:
+    """Compatibility wrapper returning the durable provisioning state."""
+    try:
+        return _start_user_linux_provisioning(username)[1]
     except Exception as exc:
         app.logger.warning('EpicVM auto-provision error for %s: %s', username, exc)
         return 'failed'
@@ -4599,24 +5526,34 @@ def _provision_user_linux_vm(username: str) -> str:
 @app.post('/dashboard/api/accounts/<username>/approve')
 @v2_auth_required
 def dashboard_account_approve(username):
+    data = request.get_json(silent=True) or {}
+    should_provision = data.get('provision', True) is not False
+    host_id = str(data.get('hostId') or 'local').strip().lower()
+    profile = str(data.get('profile') or 'standard').strip().lower()
     _init_users_db()
     conn = _users_conn()
     try:
-        row = conn.execute('SELECT id, username, account_status FROM users WHERE username = ?', (username,)).fetchone()
+        row = conn.execute('''SELECT id, username, account_status, provisioning_job_id, provisioning_state
+                              FROM users WHERE username = ?''', (username,)).fetchone()
         if not row:
             return jsonify({'ok': False, 'error': 'User not found'}), 404
-        provisioning_state = None
         if str(row['account_status'] or 'pending') != 'approved':
-            provisioning_state = _provision_user_linux_vm(username)
-            conn.execute('UPDATE users SET account_status = ?, provisioning_state = ?, vm_name = ? WHERE id = ?',
-                         ('approved', provisioning_state, _safe_linux_vm_name(username), row['id']))
-        else:
-            conn.execute('UPDATE users SET account_status = ? WHERE id = ?', ('approved', row['id']))
+            conn.execute('''UPDATE users SET account_status = 'approved', session_version = session_version + 1
+                            WHERE id = ?''', (row['id'],))
         conn.commit()
-        user = _get_user_by_username(username)
     finally:
         conn.close()
-    return jsonify({'ok': True, 'status': 'approved', 'provisioningState': provisioning_state, 'user': {k:v for k,v in user.items() if k != 'password_hash'}})
+    job_id = row['provisioning_job_id']
+    provisioning_state = row['provisioning_state']
+    if should_provision:
+        try:
+            job_id, provisioning_state, _vm_name = _start_user_linux_provisioning(username, host_id=host_id, profile=profile)
+        except ValueError as exc:
+            return jsonify({'ok': False, 'error': str(exc), 'status': 'approved', 'code': 'provisioning_not_started'}), 409
+    user = _get_user_by_username(username)
+    return jsonify({'ok': True, 'status': 'approved', 'provisioningState': provisioning_state,
+                    'provisioningJobId': job_id,
+                    'user': {k:v for k,v in user.items() if k != 'password_hash'}})
 
 
 @app.post('/dashboard/api/accounts/<username>/reject')
@@ -4628,7 +5565,8 @@ def dashboard_account_reject(username):
         row = conn.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
         if not row:
             return jsonify({'ok': False, 'error': 'User not found'}), 404
-        conn.execute('UPDATE users SET account_status = ?, provisioning_state = ? WHERE id = ?', ('rejected', None, row['id']))
+        conn.execute('''UPDATE users SET account_status = ?, provisioning_state = ?,
+                        session_version = session_version + 1 WHERE id = ?''', ('rejected', None, row['id']))
         conn.commit()
         user = _get_user_by_username(username)
     finally:
@@ -4666,7 +5604,7 @@ def dashboard_v2_login_public():
     with _LOGIN_LOCK:
         _LOGIN_ATTEMPTS.pop(remote, None)
     exp = int(time.time() + 24*3600)
-    payload = f"{exp}:{os.urandom(8).hex()}"
+    payload = _account_dashboard_payload(username)
     token = _sign_v2_token(payload)
     resp = jsonify({'ok': True, 'expiry': exp, 'authRequired': True})
     resp.set_cookie('Dashboard-Auth', token, httponly=True, samesite='Strict', secure=_request_is_https(), max_age=24*3600, path='/')
@@ -4682,7 +5620,11 @@ def dashboard_v2_status_public():
         return jsonify({'ok': False, 'authRequired': True, 'configured': False}), 503
     token = request.cookies.get('Dashboard-Auth')
     ok = bool(token and _verify_v2_token(token))
-    return jsonify({'ok': ok, 'authRequired': True, 'configured': True, 'username': user if ok else None})
+    identity = None
+    if ok:
+        payload = base64.urlsafe_b64decode(token).decode().rsplit(':', 1)[0]
+        identity = _account_dashboard_identity(payload)
+    return jsonify({'ok': ok, 'authRequired': True, 'configured': True, 'username': identity})
 
 
 @app.get('/dashboard/api/auth/csrf')
@@ -4847,55 +5789,68 @@ def api_set_vm_title(name):
 @auth_required
 def api_get_vm_settings(name):
     requested_host_id = str(request.values.get('host_id') or request.values.get('host') or 'local').strip() or 'local'
-    if requested_host_id != 'local':
+    resources, providers = _resource_inventory(include_cloudpcs=False)
+    try:
+        resource = _resolve_resource(request.args.get('resourceKey') or name, host_id=requested_host_id,
+                                     resources=resources, resource_type='vm')
+    except ValueError as exc:
+        return jsonify({'ok': False, 'error': str(exc), 'code': 'ambiguous_resource'}), 409
+    if not resource and requested_host_id != 'local':
         try:
             host = _vm_host(requested_host_id)
-            if getattr(host, 'kind', 'local') == 'remote':
-                envelope = host.status(name)
-                raw_vm = envelope.get('vm') if isinstance(envelope, dict) else envelope
-                vm = normalize_remote_vm_record(raw_vm if isinstance(raw_vm, dict) else {})
-                return jsonify({
-                    'ok': True,
-                    'name': name,
-                    'placement': 'remote',
-                    'host_id': requested_host_id,
-                    'host_name': getattr(host, 'host_name', requested_host_id),
-                    'title': '',
-                    'hostOverride': '',
-                    'pathOverride': '',
-                    'faviconUrl': '',
-                    'accessMode': 'public',
-                    'assignedUsers': [],
-                    'state': vm.get('state', 'Unknown'),
-                    'status': vm.get('status', 'Unknown'),
-                    'provider_status': vm.get('provider_status', ''),
-                    'running': bool(vm.get('running', False)),
-                    'vm_id': vm.get('id', vm.get('Id', '')),
-                    'profile': vm.get('profile', 'standard'),
-                    'cpuUsagePercent': vm.get('cpuUsagePercent'),
-                    'memoryAssignedBytes': vm.get('memoryAssignedBytes'),
-                    'uptimeSeconds': vm.get('uptimeSeconds'),
-                })
-        except VmHostUnavailable as exc:
-            return _vm_host_error_response(exc)
+            envelope = host.status(name)
+            raw_vm = envelope.get('vm') if isinstance(envelope, dict) else envelope
+            vm = normalize_remote_vm_record(raw_vm if isinstance(raw_vm, dict) else {})
+            native_id = str(vm.get('id') or vm.get('Id') or name)
+            resource = {
+                **vm, 'resourceKey': _resource_key('vm', requested_host_id, native_id),
+                'resourceType': 'vm', 'nativeId': native_id, 'name': name,
+                'hostId': requested_host_id, 'host_id': requested_host_id,
+                'hostName': getattr(host, 'host_name', requested_host_id),
+                'placement': 'remote', 'available': True, 'stale': False,
+                'classification': _classify_vm_resource(vm),
+            }
+            resource['capabilities'] = _resource_capabilities(resource, classification=resource['classification'])
+            _sync_resource_metadata([resource])
         except Exception as exc:
             return jsonify({'ok': False, 'error': str(exc)}), 502
-
-    cfg = _load_dashboard_settings()
-    vm_titles = cfg.get('vm_titles', {}) if isinstance(cfg.get('vm_titles', {}), dict) else {}
-    meta = _instance_meta(name)
+    if not resource:
+        return jsonify({'ok': False, 'error': 'VM not found'}), 404
+    _init_users_db()
+    conn = _users_conn()
+    try:
+        meta = conn.execute('SELECT * FROM resource_metadata WHERE resource_key = ?', (resource['resourceKey'],)).fetchone()
+        assigned_users = [r['username'] for r in conn.execute('''SELECT u.username FROM user_resource_access a
+                                                                  JOIN users u ON u.id = a.user_id
+                                                                  WHERE a.resource_key = ? ORDER BY u.username COLLATE NOCASE''',
+                                                               (resource['resourceKey'],)).fetchall()]
+    finally:
+        conn.close()
     safe = re.sub(r'[^A-Za-z0-9_-]', '_', name)
     fav_path = os.path.join(_state_dir(), 'dashboard', 'vm-fav', f"{safe}.ico")
-    assigned_users = [u['username'] for u in _list_users() if name in (u.get('assignedVms') or [])]
     return jsonify({
         'ok': True,
+        'resourceKey': resource['resourceKey'],
+        'resourceType': resource['resourceType'],
         'name': name,
-        'title': vm_titles.get(name, ''),
-        'hostOverride': meta.get('host_override', ''),
-        'pathOverride': meta.get('path_override', ''),
-        'faviconUrl': f'/dashboard/vm-favicon/{name}' if os.path.isfile(fav_path) else '',
-        'accessMode': _vm_access_mode(name),
+        'placement': resource.get('placement'),
+        'host_id': resource['hostId'],
+        'host_name': resource.get('hostName') or resource['hostId'],
+        'title': (meta['title'] if meta else '') or resource.get('title') or '',
+        'hostOverride': meta['host_override'] if meta else '',
+        'pathOverride': meta['path_override'] if meta else '',
+        'faviconUrl': f'/dashboard/vm-favicon/{name}' if requested_host_id == 'local' and os.path.isfile(fav_path) else '',
+        'accessMode': (meta['access_mode'] if meta else 'restricted'),
         'assignedUsers': assigned_users,
+        'state': resource.get('state') or 'Unknown',
+        'status': resource.get('status') or 'Unknown',
+        'running': bool(resource.get('running')) and resource.get('host_online') is not False,
+        'available': resource.get('available', True),
+        'stale': resource.get('stale', False),
+        'profile': resource.get('profile') or 'standard',
+        'vm_id': resource.get('id') or resource.get('Id') or resource.get('nativeId'),
+        'capabilities': resource.get('capabilities') or {},
+        'providers': providers,
     })
 
 
@@ -4905,20 +5860,55 @@ def api_set_vm_settings(name):
     try:
         data = request.get_json(silent=True) or {}
         requested_host_id = str((data.get('host_id') if isinstance(data, dict) else None) or request.values.get('host_id') or 'local').strip() or 'local'
-        if requested_host_id != 'local':
+        resources, _providers = _resource_inventory(include_cloudpcs=False)
+        resource = _resolve_resource(data.get('resourceKey') or name, host_id=requested_host_id,
+                                     resources=resources, resource_type='vm')
+        if not resource and requested_host_id != 'local':
             host = _vm_host(requested_host_id)
-            if getattr(host, 'kind', 'local') == 'remote':
-                return jsonify({
-                    'ok': False,
-                    'code': 'remote_settings_read_only',
-                    'error': 'Remote VM presentation settings are managed on the dashboard host.'
-                }), 409
+            matching = [vm for vm in host.list_vms() if str(vm.get('name') or '') == name]
+            if len(matching) == 1:
+                vm = normalize_remote_vm_record(matching[0])
+                native_id = str(vm.get('id') or vm.get('Id') or name)
+                resource = {
+                    **vm, 'resourceKey': _resource_key('vm', requested_host_id, native_id),
+                    'resourceType': 'vm', 'nativeId': native_id, 'name': name,
+                    'hostId': requested_host_id, 'host_id': requested_host_id,
+                    'hostName': getattr(host, 'host_name', requested_host_id),
+                    'placement': 'remote', 'classification': _classify_vm_resource(vm),
+                }
+                resource['capabilities'] = _resource_capabilities(resource, classification=resource['classification'])
+                _sync_resource_metadata([resource])
+        if not resource:
+            return jsonify({'ok': False, 'error': 'VM not found'}), 404
         host_override = (data.get('hostOverride') if isinstance(data, dict) else None)
         title = (data.get('title') if isinstance(data, dict) else None)
         access_mode = (data.get('accessMode') if isinstance(data, dict) else None)
         changed_runtime = False
 
-        if title is not None:
+        _init_users_db()
+        conn = _users_conn()
+        try:
+            updates, values = [], []
+            if title is not None:
+                updates.append('title = ?')
+                values.append(str(title).strip())
+            if host_override is not None:
+                updates.append('host_override = ?')
+                values.append(str(host_override).strip())
+            if access_mode is not None:
+                access_mode = str(access_mode).strip().lower()
+                if access_mode not in ('public', 'restricted'):
+                    return jsonify({'ok': False, 'error': 'Invalid access mode'}), 400
+                updates.append('access_mode = ?')
+                values.append(access_mode)
+            if updates:
+                values.extend([int(time.time()), resource['resourceKey']])
+                conn.execute(f"UPDATE resource_metadata SET {', '.join(updates)}, updated_at = ? WHERE resource_key = ?", values)
+                conn.commit()
+        finally:
+            conn.close()
+
+        if title is not None and requested_host_id == 'local':
             cfg = _load_dashboard_settings()
             vm_titles = cfg.get('vm_titles', {}) if isinstance(cfg.get('vm_titles', {}), dict) else {}
             title = str(title).strip()
@@ -4931,24 +5921,23 @@ def api_set_vm_settings(name):
             _set_instance_meta(name, 'title', title)
             changed_runtime = True
 
-        if host_override is not None:
+        if host_override is not None and requested_host_id == 'local':
             host_override = str(host_override).strip()
             _set_instance_meta(name, 'host_override', host_override)
             changed_runtime = True
 
         if access_mode is not None:
-            access_mode = str(access_mode).strip().lower()
-            if access_mode not in ('public', 'restricted'):
-                return jsonify({'ok': False, 'error': 'Invalid access mode'}), 400
-            _set_instance_meta(name, 'access_mode', access_mode)
-            changed_runtime = True
+            if requested_host_id == 'local':
+                _set_instance_meta(name, 'access_mode', access_mode)
 
         if changed_runtime:
             ok, out, err, rc = _run_manager('recreate', name)
             if not ok:
                 return jsonify({'ok': False, 'error': err or out or 'Failed recreating VM with updated settings', 'returncode': rc}), 500
 
-        return api_get_vm_settings(name)
+        return jsonify({'ok': True, 'resourceKey': resource['resourceKey'], 'name': name,
+                        'host_id': requested_host_id, 'accessMode': access_mode,
+                        'title': str(title or ''), 'hostOverride': str(host_override or '')})
     except VmHostUnavailable as exc:
         return _vm_host_error_response(exc)
     except Exception as e:
@@ -4960,7 +5949,10 @@ def api_set_vm_settings(name):
 def dashboard_vm_favicon(name):
     # Serve per-VM favicon if exists, otherwise redirect to main favicon (which may itself redirect)
     ddir = os.path.join(_state_dir(), 'dashboard', 'vm-fav')
-    safe = re.sub(r'[^A-Za-z0-9_-]', '_', name)
+    try:
+        safe = _validate_vm_name(name)
+    except ValueError:
+        abort(404)
     candidate = os.path.join(ddir, f"{safe}.ico")
     if os.path.isfile(candidate):
         return _send_icon_file(candidate)
@@ -4979,7 +5971,9 @@ def _get_console_bp_pref(name: str) -> bool:
                 return bool(v)
     except Exception:
         pass
-    return True
+    # Desktop is the reliable baseline; Big Picture remains available as an
+    # explicit per-VM preference or appId URL.
+    return False
 
 
 def _set_console_bp_pref(name: str, enabled: bool):
@@ -5067,9 +6061,14 @@ def _console_app_ids(name: str, host_id: str):
                     except (TypeError, ValueError):
                         continue
             if out:
+                _CONSOLE_APP_IDS_CACHE[(str(host_id), str(name).strip().lower())] = (time.monotonic(), dict(out))
                 return out
         except Exception as exc:
             last_err = f'{type(exc).__name__}: {str(exc)[:80]}'
+    cached = _CONSOLE_APP_IDS_CACHE.get((str(host_id), str(name).strip().lower()))
+    if cached and time.monotonic() - cached[0] < _CONSOLE_APP_IDS_CACHE_TTL_SECONDS:
+        print(f'[console-apps] using cached apps for {name}', flush=True)
+        return dict(cached[1])
     print(f'[console-apps] no apps for {name}: {last_err}', flush=True)
     return out
 
@@ -5117,6 +6116,17 @@ def dashboard_vm_wrapper(name):
         if gate is not None:
                 return gate
         try:
+                from .direct_stream import configured_streams
+        except ImportError:
+                from direct_stream import configured_streams
+        direct_route = 'vm-' + str(name).lower()
+        direct = configured_streams().get(direct_route)
+        selected_host = str(request.args.get('host_id') or '').strip().lower()
+        if (selected_host == 'epic-pc' and
+                ((isinstance(direct, dict) and direct.get('enabled') is True) or
+                 _console_orchestrator().has_auto_login(name))):
+                return redirect('/EpicVM/stream-launch/' + direct_route, code=302)
+        try:
                 dash_optimizer.note_vm_activity(name, 'wrapper-open')
         except Exception:
                 pass
@@ -5126,6 +6136,9 @@ def dashboard_vm_wrapper(name):
         host_id = str(request.args.get('host_id') or 'local').strip().lower()
         is_remote_wrapper = host_id != 'local'
         if is_remote_wrapper:
+                remote_running = False
+                moonlight_host_id = ''
+                moonlight_user_id = ''
                 try:
                         remote_host = _vm_host(host_id)
                         remote_status_fn = getattr(remote_host, 'status', None)
@@ -5167,23 +6180,44 @@ def dashboard_vm_wrapper(name):
                                 'placement': 'remote',
                                 'consoleAvailable': False,
                         }
+                if remote_running:
+                        try:
+                                orchestrator = _console_orchestrator()
+                                datafile = os.path.join(orchestrator._instance_root(name), 'server', 'data.json')
+                                with open(datafile, 'r', encoding='utf-8') as handle:
+                                        data = json.load(handle)
+                                hosts = data.get('hosts') if isinstance(data, dict) else {}
+                                if isinstance(hosts, dict) and hosts:
+                                        moonlight_host_id = str(next(iter(hosts)))
+                                users = data.get('users') if isinstance(data, dict) else {}
+                                if isinstance(users, dict) and users:
+                                        moonlight_user_id = str(next(iter(users)))
+                        except Exception:
+                                moonlight_host_id = ''
+                                moonlight_user_id = ''
                 url = ''
+                if remote_running:
+                        route_prefix = f'/vm/{_remote_console_route_name(name, host_id)}/'
+                        url = _build_remote_console_url(name, host_id, route_prefix)
+                        initial_status['url'] = url
+                        initial_status['consoleAvailable'] = True
                 # Steam launch-mode preference: deep-link straight into
                 # stream.html with the preferred appId.
                 try:
                         if url and '?host_id=' in url and remote_running:
                                 ids = _console_app_ids(name, host_id)
                                 bp = _get_console_bp_pref(name)
-                                want = 'Steam Big Picture' if bp else 'Steam'
+                                want = 'Steam Big Picture' if bp else 'Desktop'
                                 aid = ids.get(want)
-                                if aid is None and ids:
+                                if aid is None and ids and bp:
                                         for t, i in ids.items():
                                                 if 'steam' in t.lower():
                                                         aid = i
                                                         break
                                 if aid is not None:
                                         root_part, hid_part = url.split('?host_id=', 1)
-                                        url = f'{root_part.rstrip("/")}/stream.html?host_id={hid_part}&appId={aid}'
+                                        host_query = f'&hostId={url_quote(moonlight_host_id, safe="")}' if moonlight_host_id else ''
+                                        url = f'{root_part.rstrip("/")}/stream.html?host_id={hid_part}{host_query}&appId={aid}'
                                         initial_status['url'] = url
                 except Exception:
                         pass
@@ -5215,12 +6249,16 @@ def dashboard_vm_wrapper(name):
                 js_name = json.dumps(name)
                 js_status = json.dumps(initial_status)
                 js_bp = json.dumps(_get_console_bp_pref(name))
+                js_host_id = json.dumps(moonlight_host_id if is_remote_wrapper else '')
+                js_user_id = json.dumps(moonlight_user_id if is_remote_wrapper else '')
         except Exception:
                 js_title = '"%s"' % (title.replace('"','\"'))
                 js_fav = '"%s"' % (fav_url.replace('"','\"'))
                 js_url = '"%s"' % (url.replace('"','\"'))
                 js_name = '"%s"' % (name.replace('"','\"'))
                 js_status = '{"ok":true,"status":"unknown","state":"unknown","running":false,"healthy":false,"crashed":false,"exists":false}'
+                js_host_id = '""'
+                js_user_id = '""'
 
         # The page includes React + Babel via CDN so we can write a compact React component
         # for the fallback UI without changing the project's build pipeline.
@@ -5245,6 +6283,8 @@ def dashboard_vm_wrapper(name):
                 .vm-iframe{position:fixed;top:-2px;left:-2px;width:calc(100vw + 4px);height:calc(100vh + 4px);display:block;border:none;background:#000;overflow:hidden;scrollbar-width:none;-ms-overflow-style:none}
                 .vm-controls-handle{position:fixed;right:18px;bottom:18px;z-index:58;width:46px;height:46px;border-radius:16px;border:1px solid rgba(255,255,255,.12);background:linear-gradient(180deg,rgba(12,18,38,.78),rgba(5,8,22,.82));color:#eef4ff;display:flex;align-items:center;justify-content:center;font-size:21px;font-weight:900;cursor:pointer;box-shadow:0 16px 34px rgba(0,0,0,.28);backdrop-filter:blur(16px);opacity:.68;transition:transform .18s ease, box-shadow .18s ease, opacity .18s ease}
                 .vm-controls-handle:hover{transform:translateY(-1px);box-shadow:0 20px 42px rgba(0,0,0,.34);opacity:.92}
+                .vm-fullscreen-cta{position:fixed;left:50%;bottom:18px;z-index:59;transform:translateX(-50%);padding:10px 15px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(5,8,22,.82);color:#eef4ff;font:700 13px Inter,system-ui,sans-serif;cursor:pointer;box-shadow:0 12px 30px rgba(0,0,0,.32);backdrop-filter:blur(16px);opacity:.82;transition:opacity .18s ease,background .18s ease}
+                .vm-fullscreen-cta:hover{opacity:1;background:rgba(12,18,38,.94)}
                 .vm-controls-shell{position:fixed;right:18px;bottom:76px;z-index:60;pointer-events:none}
                 .vm-controls-panel{width:min(420px,calc(100vw - 32px));padding:18px;border-radius:22px;border:1px solid rgba(255,255,255,.12);background:linear-gradient(180deg,rgba(10,16,34,.88),rgba(6,10,22,.92));backdrop-filter:blur(24px);box-shadow:0 24px 80px rgba(0,0,0,.42);color:var(--text);pointer-events:auto;transform-origin:top right;transition:opacity .2s ease, transform .2s ease}
                 .vm-controls-panel.open{opacity:1;transform:translateY(0) scale(1)}
@@ -5306,15 +6346,15 @@ def dashboard_vm_wrapper(name):
                 .meaning-card{border-radius:4px;border-color:rgba(245,158,11,.3);background:#17170f;padding:14px}.meaning-card p{color:#b9b08c}.meaning-note{color:#8f896d}
                 .loading-wrap{border-top:1px solid #1a2b33;border-bottom:1px solid #1a2b33;padding:18px 0;margin:8px 0}.spinner{border-top-color:#ff7a1a}.loading-subtitle{color:#788991}
                 .error-box,.sent-box{border-radius:4px;box-shadow:none}.details-box{border-radius:4px;background:#030a0e;border-color:#1a2b33;color:#b8d2da}
-                @media (max-width: 720px){.fallback{padding:20px 16px}.shell{padding-top:0}.fallback-topbar{margin-bottom:20px}.checked-at{font-size:12px}.hero-card{padding:22px;border-radius:24px}.vm-heading-row{display:block}.state-summary{text-align:left;margin-top:7px}.meta-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.actions{flex-direction:column}.btn{width:100%}.hero-subtitle{font-size:15px}.vm-controls-shell{right:12px;left:12px;bottom:68px}.vm-controls-panel{width:auto}.vm-controls-handle{right:12px;bottom:12px;width:46px;height:46px;border-radius:14px}}
+                @media (max-width: 720px){.fallback{padding:20px 16px}.shell{padding-top:0}.fallback-topbar{margin-bottom:20px}.checked-at{font-size:12px}.hero-card{padding:22px;border-radius:24px}.vm-heading-row{display:block}.state-summary{text-align:left;margin-top:7px}.meta-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.actions{flex-direction:column}.btn{width:100%}.hero-subtitle{font-size:15px}.vm-controls-shell{right:12px;left:12px;bottom:68px}.vm-controls-panel{width:auto}.vm-controls-handle{right:12px;bottom:12px;width:46px;height:46px;border-radius:14px}.vm-fullscreen-cta{bottom:12px}}
                 @media (max-width: 720px){.fallback{padding:16px}.hero-card{padding:20px;border-radius:22px}.actions{flex-direction:column}.btn{width:100%}.hero-subtitle{font-size:15px}.vm-controls-shell{right:12px;left:12px;bottom:68px}.vm-controls-panel{width:auto}.vm-controls-handle{right:12px;bottom:12px;width:46px;height:46px;border-radius:14px}}
             </style>
         </head>
         <body>
             <div id="root"></div>
-            <iframe id="vmframe" class="vm-iframe" src="about:blank" data-vm-src=__JS_URL__ style="display:none" scrolling="no" sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-downloads allow-pointer-lock allow-popups"></iframe>
+            <iframe id="vmframe" class="vm-iframe" src="about:blank" data-vm-src=__JS_URL__ style="display:none" scrolling="no" allow="fullscreen; autoplay; clipboard-read; clipboard-write" allowfullscreen sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-downloads allow-pointer-lock allow-popups"></iframe>
             <script>
-              window.__VM_WRAPPER_INIT = { vmname: __JS_NAME__, vmurl: __JS_URL__, initialStatus: __JS_STATUS__ };
+              window.__VM_WRAPPER_INIT = { vmname: __JS_NAME__, vmurl: __JS_URL__, initialStatus: __JS_STATUS__, moonlightHostId: __JS_HOST_ID__, moonlightUserId: __JS_USER_ID__ };
               window.__VM_WRAPPER_BP = __JS_BP__;
               window.__VM_WRAPPER_FAVICON = __JS_FAVICON__;
               (function(){
@@ -5345,7 +6385,7 @@ def dashboard_vm_wrapper(name):
         </body>
     </html>
     '''
-        page = tmpl.replace('__TITLE__', title).replace('__FAV__', fav_link).replace('__JS_URL__', js_url).replace('__JS_NAME__', js_name).replace('__JS_FAVICON__', json.dumps(fav_url)).replace('__JS_STATUS__', js_status).replace('__JS_BP__', js_bp).replace('__ASSET_VER__', asset_ver)
+        page = tmpl.replace('__TITLE__', title).replace('__FAV__', fav_link).replace('__JS_URL__', js_url).replace('__JS_NAME__', js_name).replace('__JS_FAVICON__', json.dumps(fav_url)).replace('__JS_STATUS__', js_status).replace('__JS_BP__', js_bp).replace('__JS_HOST_ID__', js_host_id).replace('__JS_USER_ID__', js_user_id).replace('__ASSET_VER__', asset_ver)
         resp = Response(page, mimetype='text/html')
         resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
         resp.headers['Pragma'] = 'no-cache'
@@ -5558,10 +6598,10 @@ def _enable_single_port(port: int):
         _docker('rm', '-f', 'blobedash-proxy')
     _docker('run', '-d', '--name', 'blobedash-proxy', '--restart', 'unless-stopped',
             '-v', f'{_state_dir()}:/opt/blobe-vm',
-            '-v', '/usr/local/bin/blobe-vm-manager:/usr/local/bin/blobe-vm-manager:ro',
+            '-v', '/usr/local/bin/epicvm:/usr/local/bin/epicvm:ro',
             '-v', '/var/run/docker.sock:/var/run/docker.sock',
             '-v', DOCKER_VOLUME_BIND,
-            '-v', f'{_state_dir()}/dashboard/app.py:/app/app.py:ro',
+            '-v', f'{_state_dir()}/dashboard:/app:ro',
             '-e', f'BLOBEDASH_USER={os.environ.get("BLOBEDASH_USER","")}',
             '-e', f'BLOBEDASH_PASS={os.environ.get("BLOBEDASH_PASS","")}',
             '-e', f'HOST_DOCKER_BIN={HOST_DOCKER_BIN}',
@@ -5571,7 +6611,7 @@ def _enable_single_port(port: int):
             '--label', 'traefik.http.routers.blobe-dashboard.entrypoints=web',
             '--label', 'traefik.http.services.blobe-dashboard.loadbalancer.server.port=5000',
             'python:3.11-slim',
-            'bash', '-c', 'pip install --no-cache-dir flask && python /app/app.py')
+            'bash', '-c', 'pip install --no-cache-dir flask gunicorn && gunicorn --bind 0.0.0.0:5000 --workers 1 --threads 4 --timeout 60 --access-logfile - --error-logfile - wsgi:app')
 
     # Recreate VM containers into proxy network
     inst_root = os.path.join(_state_dir(), 'instances')
@@ -5679,8 +6719,20 @@ def manager_json_fleet_list():
             # Keep the no-argument local call as a compatibility seam for
             # existing overview tests and integrations; remote providers need
             # an explicit host id.
-            listed = manager_json_list() if host_id == 'local' else manager_json_list(host_id)
-            instances.extend(listed)
+            listed = manager_json_list(host_id)
+            for item in listed:
+                name = str(item.get('name') or '')
+                native_id = name if host_id == 'local' else str(item.get('id') or item.get('Id') or item.get('vm_id') or name)
+                classification = _classify_vm_resource(item)
+                item['resourceKey'] = _resource_key('vm', host_id, native_id)
+                item['resourceType'] = 'vm'
+                item['nativeId'] = native_id
+                item['hostId'] = host_id
+                item['classification'] = classification
+                item['available'] = item.get('host_online') is not False
+                item['stale'] = item.get('host_online') is False
+                item['capabilities'] = _resource_capabilities(item, classification=classification)
+                instances.append(item)
         except VmHostUnavailable:
             continue
         except Exception:
@@ -5880,19 +6932,27 @@ def api_provisioning_job_create():
     name = str(payload.get('name') or '').strip()
     profile = str(payload.get('profile') or 'standard').strip().lower()
     mode = str(payload.get('mode') or 'claim').strip().lower()
-    if not host_id or not name or profile not in {'standard', 'gaming'} or mode not in {'claim', 'automatic'}:
+    if not host_id or not name or profile not in {'standard', 'gaming', 'omarchy'} or mode not in {'claim', 'automatic'}:
         response = jsonify({'ok': False, 'error': 'host_id, name, and a valid profile are required'})
         response.headers['Cache-Control'] = 'no-store'
         return response, 400
     try:
         host = _vm_host(host_id)
         if getattr(host, 'kind', 'local') != 'remote' or not hasattr(host, 'provision'):
-            response = jsonify({'ok': False, 'error': 'Provisioning is available only on an enrolled Windows host'})
+            message = 'Provisioning is available only on an enrolled remote Hyper-V host'
+            if profile == 'omarchy':
+                message = 'Omarchy Linux provisioning is available only on an enrolled remote Hyper-V host'
+            response = jsonify({'ok': False, 'error': message})
             response.headers['Cache-Control'] = 'no-store'
             return response, 409
         host_record = host.public_record() if hasattr(host, 'public_record') else {}
-        if not (host_record.get('online') and (host_record.get('capabilities') or {}).get('provisioning')):
-            response = jsonify({'ok': False, 'error': 'Provisioning prerequisites are not ready on this host', 'code': 'provisioning_unavailable'})
+        capability_key = {'omarchy': 'omarchy_provisioning', 'gaming': 'gaming_provisioning'}.get(profile, 'provisioning')
+        if not (host_record.get('online') and (host_record.get('capabilities') or {}).get(capability_key)):
+            message = 'Provisioning prerequisites are not ready on this host'
+            code = 'omarchy_provisioning_unavailable' if profile == 'omarchy' else 'provisioning_unavailable'
+            if profile == 'omarchy':
+                message = 'Omarchy Linux prerequisites are not ready on this host; the experimental AMD GPU-P pilot remains gated.'
+            response = jsonify({'ok': False, 'error': message, 'code': code})
             response.headers['Cache-Control'] = 'no-store'
             return response, 409
         guest_credentials = None
@@ -5913,12 +6973,12 @@ def api_provisioning_job_create():
                     return response, 503
             else:
                 sunshine_credentials = ('', '')
-        gaming_spec = _gaming_provisioning_spec(payload) if profile == 'gaming' else None
-        if gaming_spec is not None:
+        profile_spec = _gaming_provisioning_spec(payload) if profile in {'gaming', 'omarchy'} else None
+        if profile_spec is not None:
             result = host.provision(
                 name,
                 profile,
-                spec=gaming_spec,
+                spec=profile_spec,
                 idempotency_key=request.headers.get('Idempotency-Key'),
             )
         else:
@@ -6012,12 +7072,19 @@ def api_provisioning_jobs_pending():
             except VmHostUnavailable:
                 continue
             for raw_job in jobs if isinstance(jobs, list) else []:
-                if not _is_pending_provisioning_job(raw_job):
-                    continue
                 safe_job = _safe_provisioning_job(raw_job)
                 task = None
                 with _CONSOLE_RETRY_LOCK:
                     task = _CONSOLE_RETRY_TASKS.get((provider_id, str(safe_job.get('id') or '')))
+                awaiting_visual = bool(task and task.get('status') == 'pending_visual')
+                if not _is_pending_provisioning_job(raw_job) and not awaiting_visual:
+                    continue
+                if awaiting_visual:
+                    safe_job.update({
+                        'consoleVisualValidationPending': True,
+                        'consoleRoutePrefix': str(task.get('routePrefix') or ''),
+                        'consoleRepairOutcome': 'pending_visual',
+                    })
                 if task and task.get('autonomous'):
                     safe_job.update({
                         'autonomousPending': str(task.get('status') or 'pending') == 'pending',
@@ -6237,7 +7304,7 @@ def api_provisioning_job_claim(job_id):
     username = str(payload.get('username') or '')
     password = str(payload.get('password') or '')
     claim_token = str(payload.get('claimToken') or payload.get('claim_token') or '')
-    # Claim mode intentionally accepts only Windows credentials. Sunshine
+    # Claim mode accepts the guest account credentials for the selected profile. Sunshine
     # pairing always uses the protected dashboard default; client-supplied
     # Sunshine fields are ignored rather than treated as an override.
     sunshine_username = ''
@@ -6263,7 +7330,8 @@ def api_provisioning_job_claim(job_id):
         result = host.claim(job_id, username, password, claim_token)
         job = result.get('job') if isinstance(result, dict) else None
         if not isinstance(job, dict) or job.get('state') != 'streaming_setup':
-            raise ConsoleOrchestrationError('The Windows host did not reach the console gate.', status=422, code='console_gate_missing')
+            guest_os = 'Omarchy Linux' if isinstance(job, dict) and str(job.get('profile') or '').lower() == 'omarchy' else 'Windows'
+            raise ConsoleOrchestrationError(f'The {guest_os} host did not reach the console gate.', status=422, code='console_gate_missing')
         guest_ip = str(job.get('tailnetIp') or '')
         name = str(job.get('name') or '')
         if _moonlight_console(orchestrator):
@@ -6340,7 +7408,7 @@ def api_provisioning_job_claim(job_id):
 @app.post('/dashboard/api/provisioning-jobs/<job_id>/console-verify')
 @auth_required
 def api_provisioning_job_console_verify(job_id):
-    """Persist readiness only after browser-KVM visual and input evidence."""
+    """Compatibility endpoint for automated route and guest transport completion."""
     if not _request_is_https():
         response = jsonify({'ok': False, 'error': 'Console verification requires HTTPS'})
         response.headers['Cache-Control'] = 'no-store'
@@ -6349,53 +7417,13 @@ def api_provisioning_job_console_verify(job_id):
     payload = payload if isinstance(payload, dict) else {}
     host_id = str(payload.get('host_id') or '').strip()
     route_prefix = str(payload.get('routePrefix') or payload.get('route_prefix') or '').strip()
-    evidence_source = str(payload.get('evidenceSource') or '').strip().lower()
     if not host_id or not route_prefix:
         return jsonify({'ok': False, 'error': 'host_id and routePrefix are required'}), 400
-    if evidence_source != 'browser_kvm':
-        return jsonify({'ok': False, 'error': 'browser_kvm evidence is required'}), 422
-    evidence_fields = ('videoFrameVerified', 'keyboardInputVerified', 'mouseInputVerified')
-    if any(payload.get(field) is not True for field in evidence_fields):
-        return jsonify({'ok': False, 'error': 'Rendered video, keyboard, and mouse evidence are required'}), 422
     if payload.get('guestTcpVerified') is not True:
         return jsonify({'ok': False, 'error': 'Guest transport evidence is required'}), 422
-    # Quantified frame evidence replaces trust-me booleans. A stream that
-    # never delivered a first frame (or delivered frozen/black frames) must
-    # not be able to persist Gaming or standard readiness.
     frame_metrics = payload.get('frameMetrics')
     if not isinstance(frame_metrics, dict):
-        return jsonify({'ok': False, 'error': {'code': 'frame_metrics_required', 'message': 'Quantified frame metrics are required for readiness.'}}), 422
-
-    def _metric(name):
-        try:
-            return float(frame_metrics.get(name))
-        except (TypeError, ValueError):
-            return None
-
-    non_black = _metric('nonblackFraction')
-    mean_luma = _metric('meanLuma')
-    std_dev = _metric('stdDev')
-    frame_delta = _metric('decodedFramesDelta')
-    duration_ms = _metric('durationMs')
-    if None in (non_black, mean_luma, std_dev, frame_delta, duration_ms):
-        return jsonify({'ok': False, 'error': {'code': 'frame_metrics_invalid', 'message': 'Frame metrics are incomplete.'}}), 422
-    failures = []
-    if non_black < 0.60:
-        failures.append('nonblackFraction below 0.60 (black or near-uniform video)')
-    if mean_luma < 12.0:
-        failures.append('meanLuma below 12 (black frame)')
-    if mean_luma > 252.0:
-        failures.append('meanLuma above 252 (blank white frame)')
-    if std_dev < 8.0:
-        failures.append('stdDev below 8 (frozen placeholder video)')
-    if frame_delta < 3:
-        failures.append('decodedFramesDelta below 3 (video not advancing)')
-    if duration_ms < 1500:
-        failures.append('durationMs below 1500 (evidence window too short)')
-    if failures:
-        response = jsonify({'ok': False, 'error': {'code': 'frame_evidence_rejected', 'message': '; '.join(failures)}})
-        response.headers['Cache-Control'] = 'no-store'
-        return response, 422
+        return jsonify({'ok': False, 'error': 'Decoded video frame evidence is required'}), 422
     try:
         host = _vm_host(host_id)
         if not hasattr(host, 'console_complete') or not hasattr(host, 'provisioning_status'):
@@ -6408,9 +7436,7 @@ def api_provisioning_job_console_verify(job_id):
             job_id,
             route_prefix=route_prefix,
             guest_tcp_verified=True,
-            video_frame_verified=True,
-            keyboard_input_verified=True,
-            mouse_input_verified=True,
+            frame_metrics=frame_metrics,
         )
         task_key = (host_id, str(job_id))
         with _CONSOLE_RETRY_LOCK:
@@ -7008,7 +8034,7 @@ def api_vm_console_reconcile(name):
 @app.post('/dashboard/api/vm/<name>/gpu-partition')
 @auth_required
 def api_vm_gpu_partition(name):
-    """Change only the live GPU-P partition percentage for a Gaming VM."""
+    """Change only the live GPU-P partition percentage for a managed GPU-P VM."""
     payload = request.get_json(silent=True) if request.is_json else request.form.to_dict(flat=True)
     payload = payload if isinstance(payload, dict) else {}
     host_id = str(payload.get('host_id') or payload.get('host') or '').strip()
@@ -7024,7 +8050,7 @@ def api_vm_gpu_partition(name):
     try:
         host = _vm_host(host_id)
         if getattr(host, 'kind', 'local') != 'remote' or not callable(getattr(host, 'set_gaming_gpu_percent', None)):
-            return jsonify({'ok': False, 'error': 'GPU-P partition updates are available only on an enrolled Windows host'}), 409
+            return jsonify({'ok': False, 'error': 'GPU-P partition updates are available only on an enrolled remote Hyper-V host'}), 409
         _ensure_remote_vm_exists(host, name)
         result = host.set_gaming_gpu_percent(
             name,
@@ -7039,7 +8065,7 @@ def api_vm_gpu_partition(name):
     except ValueError as exc:
         return jsonify({'ok': False, 'error': str(exc)}), 400
     except Exception:
-        return jsonify({'ok': False, 'error': 'Unable to update the Gaming GPU-P partition'}), 502
+        return jsonify({'ok': False, 'error': 'Unable to update the GPU-P partition'}), 502
 
 
 @app.post('/dashboard/api/vm/<name>/recover')
@@ -7078,6 +8104,16 @@ def api_vm_escalate(name):
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
+def _stop_remote_console_after_vm(host, name):
+    if getattr(host, 'kind', 'local') != 'remote':
+        return
+    orchestrator = _console_orchestrator()
+    if _moonlight_console(orchestrator):
+        # Each gaming bundle reserves the VM UDP range. Release it when the
+        # VM stops, while retaining pairing data for the next start.
+        orchestrator.stop_staged(name)
+
+
 @app.post('/dashboard/api/stop/<name>')
 @auth_required
 def api_stop(name):
@@ -7087,6 +8123,7 @@ def api_stop(name):
         result = host.run_manager('stop', name, capture_output=True, text=True)
         if getattr(result, 'returncode', 0) != 0:
             return jsonify({'ok': False, 'error': getattr(result, 'stderr', '') or getattr(result, 'stdout', '') or 'Failed to stop VM'}), 502
+        _stop_remote_console_after_vm(host, name)
         return jsonify({'ok': True})
     except VmHostUnavailable as exc:
         return _vm_host_error_response(exc)
@@ -7379,14 +8416,25 @@ def dashboard_v2_vm_stats():
     try:
         for record in get_docker_stats():
             cname = record['name']
+            if not cname.startswith('blobevm_'):
+                continue
             cpu = record['cpu_percent']
             mem = record['mem_percent']
             # Normalize VM name if container is named blobevm_<name>
             vmname = cname
             if vmname.startswith('blobevm_'):
                 vmname = vmname[len('blobevm_'):]
-            stats[vmname] = {'cpu_percent': round(cpu,2), 'mem_percent': round(mem,2), 'container_name': cname}
-        return jsonify({'ok': True, 'vms': stats})
+            key = _resource_key('vm', 'local', vmname)
+            stats[key] = {'resourceKey': key, 'name': vmname, 'hostId': 'local',
+                          'cpuPercent': round(cpu,2), 'memoryPercent': round(mem,2),
+                          'cpu_percent': round(cpu,2), 'mem_percent': round(mem,2),
+                          'container_name': cname}
+        return jsonify({'ok': True, 'scope': {'hostId': 'local', 'provider': 'docker'},
+                        'units': {'cpuPercent': 'percent', 'memoryPercent': 'percent'},
+                        'vms': stats, 'unsupportedProviders': [
+                            {'hostId': host_id, 'reason': 'Per-VM metrics are unavailable from this provider'}
+                            for host_id in (getattr(VM_HOST_REGISTRY, 'providers', {}) or {}) if host_id != 'local'
+                        ]})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
@@ -7441,36 +8489,11 @@ def dashboard_v2_info_alias():
 @app.post('/Dashboard/api/vm/exec/<name>')
 @v2_auth_required
 def dashboard_v2_vm_exec(name):
-    """Execute a single command inside the VM container named `blobevm_<name>`.
-    Expects JSON payload: {"cmd": "<command string>"} and returns stdout/stderr.
-    This is intended for short-lived commands (timeout 10s) and requires the
-    Flask process to have access to the host Docker CLI.
-    """
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        cmd = data.get('cmd') if isinstance(data, dict) else None
-        if not cmd or not isinstance(cmd, str):
-            return jsonify({'ok': False, 'error': 'missing cmd'}), 400
-        cname = f'blobevm_{name}'
-        # Try bash first, fallback to sh
-        exec_cmds = [
-            ['docker', 'exec', cname, '/bin/bash', '-lc', cmd],
-            ['docker', 'exec', cname, '/bin/sh', '-lc', cmd]
-        ]
-        last_exc = None
-        for ec in exec_cmds:
-            try:
-                proc = subprocess.run(ec, capture_output=True, text=True, timeout=10)
-                return jsonify({'ok': proc.returncode == 0, 'returncode': proc.returncode, 'output': proc.stdout, 'error_output': proc.stderr})
-            except subprocess.TimeoutExpired as e:
-                return jsonify({'ok': False, 'error': 'timeout', 'output': getattr(e, 'output', ''), 'stderr': getattr(e, 'stderr', '')}), 504
-            except Exception as e:
-                last_exc = e
-                continue
-        # If we get here, no exec succeeded
-        return jsonify({'ok': False, 'error': str(last_exc) if last_exc else 'exec failed'}), 500
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({
+        'ok': False,
+        'error': 'Interactive VM command execution is disabled. Use read-only diagnostics or the VM console instead.',
+        'code': 'capability_unsafe',
+    }), 410
 
 
 @app.post('/dashboard/api/vm/exec/<name>')
@@ -7962,6 +8985,20 @@ def api_optimizer_activity(name):
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
+@app.post('/portal/api/optimizer/activity/<name>')
+@portal_auth_required
+def portal_optimizer_activity(name):
+    if not _user_can_access_vm(request.portal_user, name):
+        return jsonify({'ok': False, 'error': 'VM access denied'}), 403
+    try:
+        data = request.get_json(silent=True) or {}
+        source = (data.get('source') if isinstance(data, dict) else None) or 'portal-vm-wrapper'
+        dash_optimizer.note_vm_activity(name, source)
+        return jsonify({'ok': True, 'name': name, 'source': source})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
 @app.get('/dashboard/api/optimizer/admission/<name>')
 @auth_required
 def api_optimizer_admission(name):
@@ -8032,6 +9069,19 @@ def api_optimizer_clean_system():
         return jsonify({'ok': True, 'jobId': job_id}), 202
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+try:
+    from .account_workspace import register_account_workspace
+except ImportError:
+    from account_workspace import register_account_workspace
+_account_dashboard_identity = register_account_workspace(app, globals())
+
+try:
+    from .direct_stream import register_direct_stream
+except ImportError:
+    from direct_stream import register_direct_stream
+register_direct_stream(app, globals())
 
 
 if __name__ == '__main__':

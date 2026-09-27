@@ -1,0 +1,58 @@
+EGRESS VERDICT - 2026-09-25 (read-only, no host changes)
+
+CONCLUSION: guest internet egress WORKS. The empty Get-NetNat ExternalIPInterfaceAddressPrefix
+is cosmetic, not the fault. Do NOT modify the NAT.
+
+EVIDENCE (from E:\EpicVM\provisioning-jobs.json, 75 job records):
+  22 jobs recorded a tailnetIp        -> guest reached the internet and enrolled in Tailscale
+  21 jobs recorded a tailnetDeviceId  -> enrollment completed far enough to mint a device
+  15 jobs recorded completedStages containing the FINAL stage 'stream_validation'
+     with streamValidationVerified = True
+  20 jobs recorded managementTransport = 'tailscale_winrm'
+       -> the WinRM management handoff over Tailscale also worked end to end
+
+WHAT THIS RULES OUT:
+  - 'no guest egress' / NAT misconfiguration as the cause of the failures
+  - Tailscale enrollment as a systemic blocker
+  - the management_handoff transport as a systemic blocker
+
+CORRECTION TO PRIOR PREFLIGHT NOTE:
+  The earlier preflight flagged the empty ExternalIPInterfaceAddressPrefix as the
+  'prime suspect'. That was wrong. Get-NetNat with an empty external prefix still
+  forwards when the internal vNIC is the one in use; the probe was insufficient.
+  Default Switch guests demonstrably had working internet for months.
+
+WHERE THE FAILURE ACTUALLY IS:
+  All 15 fully-pipeline jobs ended in a POST-PROVISIONING state transition, never in
+  an early stage:
+    - 11 x setup_failed:agent_restart / reverification_failed
+    -  2 x setup_failed:legacy_state_uncertain / legacy_state_uncertain
+    -  1 x setup_failed:streaming / management_transport_failed
+    -  1 x setup_failed:legacy_state_uncertain (prod-gaming-verify-1)
+  None failed at claim, guest_setup, or network_setup.
+
+  This matches the code read earlier: Provisioning.ps1:789-795 (retainedReadyRecovery)
+  and :818-835 (ready -> reverification_failed) demote an ALREADY-READY job to
+  setup_failed:agent_restart when the post-restart readiness checkpoint does not hold.
+  The checkpoint at :770-786 requires:
+     claimConsumed && claimUsed
+     && completedStages contains claim, guest_setup, network_setup,
+        management_handoff, streaming_setup, stream_validation
+     && streamValidationVerified == true
+     && (gaming -> gamingCaptureConfigured)  (omarchy -> omarchyGpuValidated)
+     && Test-EpicVMProvisioningReadyIdentity
+  and the VM must currently be Running AND managed.
+
+  So the VM is built correctly, then LOST on a later pass. Prime suspects, in order:
+    1. The agent service restarted (NSSM wrapper, install.ps1:135-155) and on restart
+       the ready-gate re-verification could not confirm the VM, demoting ready ->
+       setup_failed:agent_restart. RDP reachability (Test-EpicVMGuestRdpReachability,
+       GuestProvider.ps1:2034) is the concrete check and is the most fragile part:
+       it is a 3s TCP connect to 100.x:3389.
+    2. The VM was stopped/deleted by the time re-verification ran (readyVmRunning false
+       -> retainedReadyRecovery false -> demote).
+    3. claimConsumed/claimUsed or a completedStages field missing from the persisted
+       record, so the checkpoint can never hold on re-read.
+
+NEXT ACTION: reproduce ONE job and read which of these three it is. Do not touch NAT,
+do not touch the readiness gate.

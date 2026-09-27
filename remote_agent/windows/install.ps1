@@ -10,7 +10,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $sourceRoot = $PSScriptRoot
+. (Join-Path $sourceRoot 'ServiceRuntime.ps1')
 New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+$pwsh = Resolve-EpicVMServiceRuntime -InstallRoot $InstallRoot
 New-Item -ItemType Directory -Path (Join-Path $InstallRoot 'providers') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $InstallRoot 'logs') -Force | Out-Null
 $vmDrive = Split-Path -Qualifier $VmRoot
@@ -40,10 +42,10 @@ else {
 $agentPath = Join-Path $InstallRoot 'EpicVM.Agent.ps1'
 $providerPath = Join-Path $InstallRoot 'providers/HyperVProvider.ps1'
 Copy-Item -LiteralPath (Join-Path $sourceRoot 'EpicVM.Agent.ps1') -Destination $agentPath -Force
-foreach ($sourceFile in @('Provisioning.ps1','TemplateBuilder.ps1','Set-TailscaleOAuthSecret.ps1')) {
+foreach ($sourceFile in @('Provisioning.ps1','TemplateBuilder.ps1','Set-TailscaleOAuthSecret.ps1','ServiceRuntime.ps1','AgentTransport.ps1','SharedGames.ps1','SharedGamesWorker.ps1','SharedGamesCodex.ps1','HostGaming.ps1')) {
     Copy-Item -LiteralPath (Join-Path $sourceRoot $sourceFile) -Destination (Join-Path $InstallRoot $sourceFile) -Force
 }
-foreach ($providerFile in @('HyperVProvider.ps1','GuestProvider.ps1','TailscaleProvider.ps1','GamingGpuPProvider.ps1')) {
+foreach ($providerFile in @('HyperVProvider.ps1','GuestProvider.ps1','TailscaleProvider.ps1','GamingGpuPProvider.ps1','OmarchyProvider.ps1')) {
     Copy-Item -LiteralPath (Join-Path $sourceRoot ('providers/' + $providerFile)) -Destination (Join-Path $InstallRoot ('providers/' + $providerFile)) -Force
 }
 $configPath = Join-Path $InstallRoot 'config.json'
@@ -76,6 +78,13 @@ $config = [ordered]@{
     MaxDiskSizeBytes = 549755813888
     Generation = 2
     TemplateManifestPath = 'E:\EpicVM\templates\win11-25h2\manifest.json'
+    OmarchyTemplateManifestPath = 'E:\EpicVM\templates\omarchy-3.8.3\manifest.json'
+    OmarchyVersion = '3.8.3'
+    OmarchyIsoUrl = 'https://iso.omarchy.org/omarchy-3.8.3.iso'
+    OmarchyIsoSha256 = '40c9368eeb7e021a13d0899b379517843b4839f6e7721473169369fbd0fe61ac'
+    OmarchyGpuDeviceIdentity = 'VEN_1002&DEV_73BF'
+    OmarchyGpuPartitionPercent = 50
+    OmarchyPilotValidated = $false
     ProvisioningStatePath = 'E:\EpicVM\provisioning-jobs.json'
     GamingVMNames = @('testre')
     GamingGpuDeviceIdentity = 'VEN_1002&DEV_73BF'
@@ -96,6 +105,7 @@ $config = [ordered]@{
         'C:\ProgramData\Sunshine\config\sunshine_state.json'
     )
     EnableGamingProvisioning = $false
+    EnableOmarchyProvisioning = $false
 }
 if (Test-Path -LiteralPath $configPath -PathType Leaf) {
     try {
@@ -123,7 +133,6 @@ foreach ($identity in @('SYSTEM', 'Administrators')) {
 Set-Acl -LiteralPath $tokenPath -AclObject $acl
 
 $serviceName = 'EpicVMRemoteAgent'
-$pwsh = (Get-Command pwsh -ErrorAction Stop).Source
 $nssm = Join-Path $InstallRoot 'nssm.exe'
 if (-not (Test-Path -LiteralPath $nssm -PathType Leaf)) {
     throw 'The existing EpicVM NSSM service wrapper is required and was not found.'

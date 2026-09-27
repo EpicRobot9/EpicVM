@@ -48,6 +48,15 @@ test('Gaming create payload carries initialization resources but standard payloa
   assert.deepEqual(gamingPartitionPayload({ hostId:'epic-pc', percent:999 }), { host_id:'epic-pc', percent:100 })
 })
 
+test('Omarchy create payload carries AMD GPU-P resources and remains explicitly experimental', () => {
+  assert.deepEqual(provisioningCreatePayload({ hostId:'linux-pilot', name:' omarchy ', profile:'omarchy', mode:'claim', cpuCount:'8', memoryGiB:'16', diskSizeGiB:'256', gpuPartitionPercent:'65' }), {
+    host_id:'linux-pilot', name:'omarchy', profile:'omarchy', mode:'claim', cpuCount:8, memoryGiB:16, diskSizeGiB:256, gpuPartitionPercent:65
+  })
+  assert.match(provisioningFailureReason({ profile:'omarchy', errorCode:'omarchy_not_validated' }), /experimental/)
+  assert.match(provisioningFailureReason({ profile:'omarchy', errorCode:'omarchy_encoder_unavailable' }), /hardware encoder.*Omarchy Linux/i)
+  assert.match(provisioningFailureReason({ profile:'omarchy', errorCode:'guest_account_failed', failureDetailCode:'admin_membership_failed' }), /Linux wheel membership/i)
+})
+
 test('safe provisioning failure codes explain the failed trust boundary', () => {
   assert.equal(provisioningFailureReason({ errorCode:'powershell_direct_failed' }), 'PowerShell Direct could not open the cloned guest.')
   assert.equal(provisioningFailureReason({ errorCode:'rdp_verification_failed' }), 'Guest RDP/NLA/firewall verification failed.')

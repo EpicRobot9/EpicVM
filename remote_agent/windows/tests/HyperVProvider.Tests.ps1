@@ -202,11 +202,12 @@ Describe 'Hyper-V Gaming guest validation' {
             ManagementPort = 5985
         }
         $provider = New-EpicVMHyperVProvider -Config $config -CommandInvoker ${function:Invoke-MockHyperVCmdlet} -ManagementInvoker {
-            param($address, $credential, $scriptBlock, $args, $timeout, $port, $useSsl)
+            param($address, $credential, $scriptBlock, $arguments, $timeout, $port, $useSsl)
             $script:validationCalls += [pscustomobject]@{
                 address = $address
                 username = $credential.UserName
                 timeout = [int]$timeout
+                requireEncoder = $arguments[3]
             }
             return @{
                 ok = $true
@@ -229,5 +230,11 @@ Describe 'Hyper-V Gaming guest validation' {
         $script:validationCalls.Count | Should -Be 1
         $script:validationCalls[0].username | Should -Be '.\operator'
         $script:validationCalls[0].timeout | Should -Be 240
+        $script:validationCalls[0].requireEncoder | Should -BeFalse
+
+        $result = Invoke-EpicVMHyperVGamingGuestValidation -Provider $provider -Name 'alpha' -GuestUsername 'operator' -GuestPassword ('p' * 16) -GuestAddress '100.111.82.1'
+        $result.ok | Should -BeTrue
+        $script:validationCalls.Count | Should -Be 2
+        $script:validationCalls[1].requireEncoder | Should -BeTrue
     }
 }

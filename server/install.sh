@@ -8,7 +8,7 @@ set -o errtrace
 # - Sets up a shared docker network "proxy" (Traefik mode only)
 # - Deploys Traefik (HTTP only by default, optional HTTPS via ACME) unless disabled
 # - Builds the EpicVM image from this repository
-# - Installs the blobe-vm-manager CLI
+# - Installs the EpicVM CLI and the legacy compatibility launcher
 # - Optionally creates a first VM instance and prints its URL
 #
 # Environment overrides (optional, useful for automation):
@@ -831,7 +831,7 @@ auto_test_traefik() {
   fi
   rm -rf "/opt/blobe-vm/instances/${name}" 2>/dev/null || true
   # Create test VM
-  blobe-vm-manager create "$name" >/dev/null 2>&1 || blobe-vm-manager start "$name" >/dev/null 2>&1 || true
+  epicvm create "$name" >/dev/null 2>&1 || epicvm start "$name" >/dev/null 2>&1 || true
   # Wait for backend HTTP service to be ready inside the proxy network
   local cname="blobevm_${name}"
   local net_name="${TRAEFIK_NETWORK:-proxy}"
@@ -898,7 +898,7 @@ auto_test_traefik() {
       (cd /opt/blobe-vm/traefik && docker compose up -d) >/dev/null 2>&1 || true
     fi
     # Recreate VM to refresh labels and network
-    blobe-vm-manager recreate "$name" >/dev/null 2>&1 || true
+    epicvm recreate "$name" >/dev/null 2>&1 || true
     sleep 2
     ok=0
     code=$(_probe "$path_url"); export SELF_TEST_PATH_CODE="$code"; [[ "$code" =~ ^[23]..$ ]] && ok=1
@@ -1376,12 +1376,12 @@ deploy_dashboard_direct() {
   docker image rm -f python:3.11-slim 2>/dev/null || true
   echo "[dashboard] Pulling latest dashboard base image..."
   docker pull python:3.11-slim
-  docker run -d --name blobedash --restart unless-stopped \
+  docker run -d --name blobedash --init --restart unless-stopped \
     --env-file /opt/blobe-vm/.env \
     -p "${DASHBOARD_PORT}:5000" \
     -v /opt/blobe-vm:/opt/blobe-vm \
     -v /opt/epicvm:/opt/epicvm \
-    -v /usr/local/bin/blobe-vm-manager:/usr/local/bin/blobe-vm-manager:ro \
+    -v /usr/local/bin/epicvm:/usr/local/bin/epicvm:ro \
     -v "${docker_bin}:/usr/bin/docker:ro" \
     -v "${compose_bin}:/usr/libexec/docker/cli-plugins/docker-compose:ro" \
     -v /var/run/docker.sock:/var/run/docker.sock \
@@ -1402,7 +1402,7 @@ deploy_dashboard_direct() {
     -e EPICVM_MOONLIGHT_IMAGE="${EPICVM_MOONLIGHT_IMAGE:-}" \
     -e EPICVM_MOONLIGHT_NAT_HOST="${EPICVM_MOONLIGHT_NAT_HOST:-}" \
   python:3.11-slim \
-  bash -c "apt-get update && apt-get install -y curl jq && pip install --no-cache-dir flask && python /app/app.py" \
+  bash -c "apt-get update && apt-get install -y curl jq && pip install --no-cache-dir flask==3.1.1 cryptography==46.0.3 gunicorn==26.2.0 && gunicorn --bind 0.0.0.0:5000 --workers 1 --threads 4 --timeout 60 --access-logfile - --error-logfile - wsgi:app" \
     >/dev/null
 }
 
@@ -1443,7 +1443,7 @@ build_image() {
 }
 
 install_manager() {
-  echo "Installing blobe-vm-manager CLI..."
+  echo "Installing EpicVM CLI and legacy compatibility launcher..."
   # Only replace if changed to preserve running processes and avoid unnecessary writes.
   local src="$REPO_DIR/server/epicvm" dst="/usr/local/bin/epicvm"
   if [[ -f "$dst" ]]; then
@@ -1485,14 +1485,16 @@ install_manager() {
         break
       fi
     done
-    cp -f "$REPO_DIR/dashboard/app.py" /opt/blobe-vm/dashboard/app.py
-    # Keep the provider/RemoteVM imports beside the deployed app. Existing
-    # deployments often copy only app.py into /opt/blobe-vm/dashboard.
-    for dashboard_module in vm_hosts.py remote_hosts.py remote_agent_client.py guacamole_orchestrator.py moonlight_orchestrator.py; do
-      if [[ -f "$REPO_DIR/dashboard/$dashboard_module" ]]; then
-        install -Dm644 "$REPO_DIR/dashboard/$dashboard_module" "/opt/blobe-vm/dashboard/$dashboard_module"
-      fi
-    done
+    while IFS= read -r -d '' dashboard_module; do
+      install -Dm644 "$dashboard_module" "/opt/blobe-vm/dashboard/$(basename "$dashboard_module")"
+    done < <(find "$REPO_DIR/dashboard" -maxdepth 1 -type f -name '*.py' -print0 | sort -z)
+    if [[ -d "$REPO_DIR/epicvm_web" ]]; then
+      mkdir -p /opt/blobe-vm/epicvm_web
+      rsync -a --delete \
+        --exclude node_modules \
+        --exclude .pytest_cache \
+        "$REPO_DIR/epicvm_web/" /opt/blobe-vm/epicvm_web/
+    fi
   fi
   # Build dashboard_v2 frontend (if present) so /Dashboard is available after install
   # dashboard_v2 build is handled by Docker Compose only
@@ -1545,8 +1547,12 @@ install_manager() {
     echo "EPICVM_POSTGRES_IMAGE=$(sh_q "${EPICVM_POSTGRES_IMAGE:-}")";
     echo "EPICVM_MOONLIGHT_IMAGE=$(sh_q "${EPICVM_MOONLIGHT_IMAGE:-}")";
     echo "EPICVM_MOONLIGHT_NAT_HOST=$(sh_q "${EPICVM_MOONLIGHT_NAT_HOST:-}")";
+    echo "EPICVM_MOONLIGHT_TURN_URLS=$(sh_q "${EPICVM_MOONLIGHT_TURN_URLS:-}")";
+    echo "EPICVM_MOONLIGHT_TURN_USERNAME=$(sh_q "${EPICVM_MOONLIGHT_TURN_USERNAME:-}")";
+    echo "EPICVM_MOONLIGHT_TURN_CREDENTIAL=$(sh_q "${EPICVM_MOONLIGHT_TURN_CREDENTIAL:-}")";
     echo "EPICVM_BLOBEDASH_IMAGE=$(sh_q "${EPICVM_BLOBEDASH_IMAGE:-}")";
   } > /opt/blobe-vm/.env
+  chmod 600 /opt/blobe-vm/.env
 }
 
 # Verify that the dashboard will be able to show VM status by ensuring
@@ -1569,8 +1575,8 @@ preflight_dashboard_runtime() {
     return 1
   fi
   # 3) Manager binary
-  if [[ ! -x /usr/local/bin/blobe-vm-manager ]]; then
-    echo "[preflight] blobe-vm-manager missing at /usr/local/bin/blobe-vm-manager" >&2
+  if [[ ! -x /usr/local/bin/epicvm ]]; then
+    echo "[preflight] epicvm missing at /usr/local/bin/epicvm" >&2
     return 1
   fi
   # 4) Instances dir exists
@@ -1583,7 +1589,7 @@ preflight_dashboard_runtime() {
   if ! docker run --rm --name "$probe" \
       -v "/opt/blobe-vm:/opt/blobe-vm" \
       -v "/opt/epicvm:/opt/epicvm" \
-      -v "/usr/local/bin/blobe-vm-manager:/usr/local/bin/blobe-vm-manager:ro" \
+      -v "/usr/local/bin/epicvm:/usr/local/bin/epicvm:ro" \
       -v "$docker_bin:/usr/bin/docker:ro" \
       -v "/var/run/docker.sock:/var/run/docker.sock" \
     python:3.11-slim bash -lc "docker ps >/dev/null 2>&1"; then
@@ -1599,7 +1605,7 @@ maybe_create_first_vm() {
   if [[ "$auto_create" == "1" ]]; then
     local name="${BLOBEVM_INITIAL_VM_NAME:-alpha}"
     echo "Auto-creating initial VM '${name}'."
-    blobe-vm-manager create "$name"
+    epicvm create "$name"
     return 0
   fi
 
@@ -1616,7 +1622,7 @@ maybe_create_first_vm() {
       echo "No name provided, skipping initial VM creation."
       return 0
     fi
-    blobe-vm-manager create "$name"
+    epicvm create "$name"
   fi
 }
 
@@ -1680,8 +1686,8 @@ print_success() {
   fi
   test_vm_name="${BLOBEVM_INITIAL_VM_NAME:-testvm}"
   if [[ -d "/opt/blobe-vm/instances/${test_vm_name}" ]]; then
-    if command -v blobe-vm-manager >/dev/null 2>&1; then
-      test_vm_url="$(blobe-vm-manager url "${test_vm_name}" 2>/dev/null || true)"
+    if command -v epicvm >/dev/null 2>&1; then
+      test_vm_url="$(epicvm url "${test_vm_name}" 2>/dev/null || true)"
     fi
     if [[ -n "$test_vm_url" ]]; then
       echo "- Test VM (${test_vm_name}): ${test_vm_url}"
@@ -1689,8 +1695,8 @@ print_success() {
       echo "- Test VM (${test_vm_name}): ${scheme}://${base_host}${http_suffix}${base_path}/${test_vm_name}/"
     fi
   fi
-  echo "- Manage VMs: blobe-vm-manager [list|create|start|stop|delete|rename] <name>"
-  echo "- Uninstall everything: blobe-vm-manager nuke"
+  echo "- Manage VMs: epicvm [list|create|start|stop|delete|rename] <name>"
+  echo "- Uninstall everything: epicvm nuke"
   # Self-test summary if available
   if [[ -n "${SELF_TEST_STATUS:-}" ]]; then
     local st_path="${SELF_TEST_PATH_URL:-}" st_path_c="${SELF_TEST_PATH_CODE:-}" st_host="${SELF_TEST_HOST_URL:-}" st_host_c="${SELF_TEST_HOST_CODE:-}"
@@ -1800,9 +1806,9 @@ main() {
   install_manager
   # In proxy mode, refresh VM containers so latest routing labels (routers/services/middlewares) apply
   if [[ "${NO_TRAEFIK:-0}" -ne 1 ]]; then
-    if command -v blobe-vm-manager >/dev/null 2>&1; then
+    if command -v epicvm >/dev/null 2>&1; then
       echo "Refreshing VM routing labels (recreating containers in proxy mode)..."
-      blobe-vm-manager recreate-all || true
+      epicvm recreate-all || true
     fi
   fi
   # Check dashboard runtime dependencies before deployment
@@ -1843,7 +1849,7 @@ main() {
       if docker ps -a --format '{{.Names}}' | grep -qx "$cname"; then
         docker rm -f "$cname" >/dev/null 2>&1 || true
       fi
-      blobe-vm-manager start "$n" || true
+      epicvm start "$n" || true
     done
   fi
   # If reusing external Traefik while TLS is disabled, warn about possible redirect
@@ -1861,8 +1867,8 @@ main() {
   print_success
   echo
   echo "Current VMs:"
-  if command -v blobe-vm-manager >/dev/null 2>&1; then
-    blobe-vm-manager list || true
+  if command -v epicvm >/dev/null 2>&1; then
+    epicvm list || true
   else
     echo "  (manager not found in PATH)"
   fi

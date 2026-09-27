@@ -26,6 +26,7 @@ function Nav({ authed, onSignout }) {
         <a href="#faq" onClick={jump('faq')}>FAQ</a>
       </nav>
       <div className="evm-nav-actions">
+        <a className="evm-btn evm-btn-ghost" href="/EpicVM/settings">Settings</a>
         {authed ? (
           <>
             <button className="evm-btn evm-btn-ghost" onClick={() => window.location.assign('/EpicVM/pending')}>Account</button>
@@ -93,7 +94,10 @@ export default function Landing({ authed, onSignout }) {
     }
     const io = new IntersectionObserver((entries) => {
       entries.forEach((en) => {
-        en.target.classList.toggle('evm-reveal-in', en.isIntersecting)
+        if (en.isIntersecting) {
+          en.target.classList.add('evm-reveal-in')
+          io.unobserve(en.target)
+        }
       })
     }, { threshold: 0.12, rootMargin: '0px 0px -8% 0px' })
     els.forEach((el) => io.observe(el))

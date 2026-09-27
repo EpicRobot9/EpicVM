@@ -2,13 +2,27 @@
 const PORTAL = '/portal'
 const EPICVM = '/EpicVM/api'
 
+function hostQuery(hostId) {
+  const host = String(hostId || '').trim()
+  return host && host !== 'local' ? `?host_id=${encodeURIComponent(host)}` : ''
+}
+
 async function apiFetch(path, opts = {}) {
-  const res = await fetch(path, {
-    credentials: 'same-origin',
-    cache: 'no-store',
-    headers: { 'Content-Type': 'application/json' },
-    ...opts,
-  })
+  const { timeoutMs = 15000, ...fetchOptions } = opts
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs)
+  let res
+  try {
+    res = await fetch(path, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      ...fetchOptions,
+      signal: fetchOptions.signal || controller.signal,
+    })
+  } finally {
+    window.clearTimeout(timer)
+  }
   let body = {}
   try { body = await res.json() } catch { /* ignore */ }
   return { ok: res.ok, status: res.status, body }
@@ -43,28 +57,35 @@ export async function myVms() {
   return apiFetch(`${PORTAL}/api/vms`)
 }
 
-export async function startVm(name) {
-  return apiFetch(`${PORTAL}/api/start/${encodeURIComponent(name)}`, { method: 'POST' })
+export async function startVm(name, hostId, resourceKey) {
+  return apiFetch(`${PORTAL}/api/start/${encodeURIComponent(name)}${hostQuery(hostId)}`, {
+    method: 'POST', body: JSON.stringify({ hostId, resourceKey }),
+  })
 }
-export async function stopVm(name) {
-  return apiFetch(`${PORTAL}/api/stop/${encodeURIComponent(name)}`, { method: 'POST' })
+export async function stopVm(name, hostId, resourceKey) {
+  return apiFetch(`${PORTAL}/api/stop/${encodeURIComponent(name)}${hostQuery(hostId)}`, {
+    method: 'POST', body: JSON.stringify({ hostId, resourceKey }),
+  })
 }
-export async function restartVm(name) {
+export async function restartVm(name, hostId, resourceKey, resourceType) {
+  if (resourceType === 'cloudpc') return { ok: false, status: 409, body: { error: 'Cloud PC restart is not a physical power cycle and is unsupported.' } }
   // No dedicated backend endpoint; restart = stop, wait for it to actually stop, then start.
-  const s = await stopVm(name)
+  const s = await stopVm(name, hostId, resourceKey)
   if (!s.ok) return s
   // Poll the VM status until it reports stopped/offline (or timeout), so start
   // doesn't race a still-shutting-down container on slow hosts.
   const deadline = Date.now() + 30000
+  let stopped = false
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 1500))
     try {
-      const st = await apiFetch(`${PORTAL}/api/vm/${encodeURIComponent(name)}/status`)
+      const st = await apiFetch(`${PORTAL}/api/vm/${encodeURIComponent(name)}/status${hostQuery(hostId)}`)
       const state = (st.body && (st.body.state || st.body.status) || '').toLowerCase()
-      if (state === 'stopped' || state === 'offline' || state === 'exited' || state === 'dead') break
+      if (state === 'stopped' || state === 'off' || state === 'offline' || state === 'exited' || state === 'dead') { stopped = true; break }
     } catch { /* ignore, keep waiting */ }
   }
-  return startVm(name)
+  if (!stopped) return { ok: false, status: 409, body: { error: 'Stop did not complete before the restart timeout. The VM was not started again.' } }
+  return startVm(name, hostId, resourceKey)
 }
 
 // --- Cloud PC (bring-your-own Sunshine over Tailscale) ---

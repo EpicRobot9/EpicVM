@@ -1,1 +1,0 @@
-{"version": 1, "hosts": [{"id": "same", "display_name": "A", "agent_url": "http://100.64.0.2:1", "token": "a"}, {"id": "same", "display_name": "B", "agent_url": "http://100.64.0.3:1", "token": "b"}]}

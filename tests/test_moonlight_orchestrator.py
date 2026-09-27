@@ -12,6 +12,37 @@ from dashboard.guacamole_orchestrator import ConsoleOrchestrationError
 IMAGE = "mrcreativ3001/moonlight-web-stream@sha256:" + "a" * 64
 
 
+def test_multiple_consoles_reserve_disjoint_ports_and_keep_them_on_repair(tmp_path):
+    orch = make_orchestrator(tmp_path)
+    ranges = []
+    for name in ('first', 'second', 'third', 'cloudpc-desktop'):
+        target = orch.stage_plan(orch.build_plan(name=name, guest_ip='100.111.82.1'))
+        ports = json.loads((target / 'server/config.json').read_text())['webrtc']['port_range']
+        current = set(range(ports['min'], ports['max'] + 1))
+        assert all(current.isdisjoint(previous) for previous in ranges)
+        ranges.append(current)
+        assert f'{ports["min"]}-{ports["max"]}:{ports["min"]}-{ports["max"]}/udp' in (target / 'docker-compose.yml').read_text()
+    before = orch._staged_webrtc_ports('second')
+    (tmp_path / 'second').rename(tmp_path / '.second-retained')
+    fresh = make_orchestrator(tmp_path)
+    fresh.stage_plan(fresh.build_plan(name='second', guest_ip='100.111.82.1'))
+    assert fresh._staged_webrtc_ports('second') == before
+
+
+def test_port_allocation_respects_legacy_bundles_and_concurrent_reservations(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    orch = make_orchestrator(tmp_path)
+    legacy = tmp_path / 'legacy' / 'server'
+    legacy.mkdir(parents=True)
+    (legacy / 'config.json').write_text(orch.build_config(name='legacy'))
+    def reserve(index):
+        return make_orchestrator(tmp_path)._reserve_webrtc_ports(f'new-{index}')
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        allocated = list(pool.map(reserve, range(16)))
+    assert len(set(allocated)) == 16
+    assert all(start > 41010 for start, end in allocated)
+
+
 def make_orchestrator(root, **overrides):
     options = {
         "root": str(root),
@@ -81,10 +112,94 @@ def test_plan_advertises_configured_nat_host_and_udp_range(tmp_path):
     assert '41000-41010:41000-41010/udp' in plan.compose
 
 
-def test_rejects_nat_host_outside_tailnet(tmp_path):
+def test_plan_accepts_public_nat_host_for_internet_clients(tmp_path):
+    orch = make_orchestrator(tmp_path, webrtc_nat_host="72.60.29.204")
+    plan = orch.build_plan(name="alpha", guest_ip="100.111.82.1")
+    config = json.loads(plan.config)
+    assert config["webrtc"]["nat_1to1"] == {"ice_candidate_type": "host", "ips": ["72.60.29.204"]}
+    assert 'WEBRTC_NAT_1TO1_HOST: "72.60.29.204"' in plan.compose
+
+
+@pytest.mark.parametrize("address", ["127.0.0.1", "169.254.1.2", "192.168.1.10", "224.0.0.1"])
+def test_rejects_non_routable_nat_host_outside_tailnet(tmp_path, address):
     with pytest.raises(ConsoleOrchestrationError) as failure:
-        make_orchestrator(tmp_path, webrtc_nat_host="72.60.29.204")
+        make_orchestrator(tmp_path, webrtc_nat_host=address)
     assert failure.value.code == "invalid_moonlight_nat_host"
+
+
+def test_turn_credentials_are_written_only_to_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("EPICVM_MOONLIGHT_TURN_URLS", "turns:relay.example:5349,turn:relay.example:3478")
+    monkeypatch.setenv("EPICVM_MOONLIGHT_TURN_USERNAME", "turn-user")
+    monkeypatch.setenv("EPICVM_MOONLIGHT_TURN_CREDENTIAL", "turn-secret")
+
+    plan = make_orchestrator(tmp_path).build_plan(name="alpha", guest_ip="100.111.82.1")
+    servers = json.loads(plan.config)["webrtc"]["ice_servers"]
+    assert servers[-1] == {
+        "urls": ["turns:relay.example:5349", "turn:relay.example:3478"],
+        "username": "turn-user",
+        "credential": "turn-secret",
+    }
+    assert "turn-user" not in plan.compose
+    assert "turn-secret" not in plan.compose
+
+
+@pytest.mark.parametrize("variable", [
+    "EPICVM_MOONLIGHT_TURN_URLS",
+    "EPICVM_MOONLIGHT_TURN_USERNAME",
+    "EPICVM_MOONLIGHT_TURN_CREDENTIAL",
+])
+def test_incomplete_turn_configuration_fails_closed(tmp_path, monkeypatch, variable):
+    for name in (
+        "EPICVM_MOONLIGHT_TURN_URLS",
+        "EPICVM_MOONLIGHT_TURN_USERNAME",
+        "EPICVM_MOONLIGHT_TURN_CREDENTIAL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(variable, "turn:relay.example:3478" if variable.endswith("URLS") else "configured")
+
+    with pytest.raises(ConsoleOrchestrationError) as failure:
+        make_orchestrator(tmp_path)
+    assert failure.value.code == "moonlight_turn_config_required"
+
+
+def test_dashboard_installers_use_init_and_protected_turn_env_file():
+    install = pathlib.Path("server/install.sh").read_text(encoding="utf-8")
+    ensure = pathlib.Path("server/blobedash-ensure.sh").read_text(encoding="utf-8")
+    assert "docker run -d --name blobedash --init --restart unless-stopped" in install
+    assert 'docker run -d --name "$NAME" --init --restart unless-stopped' in ensure
+    assert "--env-file /opt/blobe-vm/.env" in install
+    assert '--env-file "$ENV_FILE"' in ensure
+    assert "chmod 600 /opt/blobe-vm/.env" in install
+    assert 'chmod 600 "$ENV_FILE"' in ensure
+    for text in (install, ensure):
+        assert "-e EPICVM_MOONLIGHT_TURN_CREDENTIAL" not in text
+
+
+def test_cloudpc_and_vm_plans_use_disjoint_webrtc_udp_ranges(tmp_path):
+    orch = make_orchestrator(tmp_path)
+    vm = orch.build_plan(name="alpha", guest_ip="100.111.82.1")
+    cloudpc = orch.build_plan(name="cloudpc-epic-a1", guest_ip="100.111.82.2")
+
+    vm_config = json.loads(vm.config)["webrtc"]["port_range"]
+    cloudpc_config = json.loads(cloudpc.config)["webrtc"]["port_range"]
+    assert vm_config == {"min": 41000, "max": 41010}
+    assert cloudpc_config == {"min": 41011, "max": 41021}
+    assert set(range(vm_config["min"], vm_config["max"] + 1)).isdisjoint(
+        range(cloudpc_config["min"], cloudpc_config["max"] + 1)
+    )
+    assert '41011-41021:41011-41021/udp' in cloudpc.compose
+
+
+def test_native_seat_uses_its_own_apollo_port_without_changing_vm_default(tmp_path):
+    probed = []
+    orch = make_orchestrator(tmp_path, tcp_probe=lambda host, port, timeout: probed.append(port) or True)
+    seat = orch.build_plan(name='seat-owner', guest_ip='100.111.82.1', sunshine_port=48130)
+    vm = orch.build_plan(name='gaming-vm', guest_ip='100.111.82.2')
+    assert probed[:2] == [48130, 48131]
+    assert json.loads(seat.config)['moonlight']['default_http_port'] == 48130
+    assert json.loads(vm.config)['moonlight']['default_http_port'] == 47989
+    target = orch.stage_plan(seat)
+    assert json.loads((target / 'plan.json').read_text())['sunshinePort'] == 48130
 
 
 def test_remote_plan_can_use_host_scoped_route_without_changing_vm_name(tmp_path):
@@ -104,7 +219,7 @@ def test_staging_writes_only_safe_owned_metadata(tmp_path):
     assert (target / "server" / "config.json").is_file()
     assert (target / "server" / "data.json").is_file()
     plan = json.loads((target / "plan.json").read_text())
-    assert plan == {"owner": "EpicVM", "version": 1, "backend": "moonlight", "name": "alpha", "guestIp": "100.111.82.1", "routePrefix": "/vm/alpha/", "paired": False}
+    assert plan == {"owner": "EpicVM", "version": 1, "backend": "moonlight", "name": "alpha", "guestIp": "100.111.82.1", "sunshinePort": 47989, "routePrefix": "/vm/alpha/", "paired": False}
     assert list(target.rglob("*"))
 
 
@@ -135,6 +250,7 @@ def test_runtime_isolation_accepts_only_expected_udp_bindings(tmp_path):
         }]))
 
     orch = make_orchestrator(tmp_path, command_runner=inspect)
+    orch.stage_plan(orch.build_plan(name='alpha', guest_ip='100.111.82.1'))
     assert orch._runtime_isolated("alpha") is True
 
     expected_bindings["8080/tcp"] = [{"HostIp": "", "HostPort": "8080"}]
@@ -404,7 +520,7 @@ def test_sunshine_pair_retries_when_sunshine_reports_pending_session(tmp_path):
     calls = []
     pin_responses = [
         {"status": False},
-        {"status": True},
+        {"status": "true"},
     ]
 
     class Response:

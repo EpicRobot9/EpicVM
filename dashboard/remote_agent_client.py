@@ -117,7 +117,10 @@ class RemoteAgentClient:
         # boundary, but each agent call still needs a finite worker deadline.
         # Do not reuse the VM-create timeout for status/failure callbacks or a
         # dead host can leave the retry task pending for ten minutes.
-        self.console_write_timeout = max(self.timeout, 120.0)
+        # Gaming setup stages the display driver, configures Sunshine, and
+        # waits for the first desktop after a reboot before encoder validation.
+        # The dashboard runs this outside the public HTTP request.
+        self.console_write_timeout = max(self.timeout, 900.0)
         self.console_transition_timeout = max(self.timeout, 60.0)
         self.console_failure_timeout = max(self.timeout, 15.0)
         # Hyper-V may briefly hold the provisioning store while a guest
@@ -255,7 +258,7 @@ class RemoteAgentClient:
         *,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Create a validated full-copy VM provisioning job."""
+        """Create a validated full-copy VM provisioning job for a supported guest profile."""
         payload: dict[str, Any] = {"name": str(name), "profile": str(profile)}
         if spec:
             payload.update(dict(spec))
@@ -313,7 +316,7 @@ class RemoteAgentClient:
             "POST",
             f"/v1/provisioning-jobs/{safe_id}/network-recovery",
             payload,
-            timeout=self.console_write_timeout,
+            timeout=self.operation_timeout,
         )
         return result if isinstance(result, dict) else {"ok": True, "job": result}
 
@@ -341,18 +344,24 @@ class RemoteAgentClient:
         *,
         route_prefix: str,
         guest_tcp_verified: bool,
-        video_frame_verified: bool = False,
-        keyboard_input_verified: bool = False,
-        mouse_input_verified: bool = False,
+        video_frame_verified: bool | None = None,
+        keyboard_input_verified: bool | None = None,
+        mouse_input_verified: bool | None = None,
+        frame_metrics: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         safe_id = quote(str(job_id), safe="")
         payload = {
             "routePrefix": str(route_prefix),
             "guestTcpVerified": bool(guest_tcp_verified),
-            "videoFrameVerified": bool(video_frame_verified),
-            "keyboardInputVerified": bool(keyboard_input_verified),
-            "mouseInputVerified": bool(mouse_input_verified),
         }
+        if video_frame_verified is not None:
+            payload["videoFrameVerified"] = bool(video_frame_verified)
+        if keyboard_input_verified is not None:
+            payload["keyboardInputVerified"] = bool(keyboard_input_verified)
+        if mouse_input_verified is not None:
+            payload["mouseInputVerified"] = bool(mouse_input_verified)
+        if frame_metrics is not None:
+            payload["frameMetrics"] = dict(frame_metrics)
         result = self._request(
             "POST",
             f"/v1/provisioning-jobs/{safe_id}/console-complete",
@@ -371,7 +380,7 @@ class RemoteAgentClient:
         sunshine_password: str,
         reconcile_only: bool = False,
     ) -> dict[str, Any]:
-        """Send request-only guest/Sunshine credentials to the Windows agent."""
+        """Send request-only guest/Sunshine credentials to the remote guest agent."""
         safe_id = quote(str(job_id), safe="")
         payload = {
             "username": str(guest_username),
@@ -522,9 +531,10 @@ class RemoteAgentHost:
         *,
         route_prefix: str,
         guest_tcp_verified: bool,
-        video_frame_verified: bool = False,
-        keyboard_input_verified: bool = False,
-        mouse_input_verified: bool = False,
+        video_frame_verified: bool | None = None,
+        keyboard_input_verified: bool | None = None,
+        mouse_input_verified: bool | None = None,
+        frame_metrics: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
             return self.client.console_complete(
@@ -534,6 +544,7 @@ class RemoteAgentHost:
                 video_frame_verified=video_frame_verified,
                 keyboard_input_verified=keyboard_input_verified,
                 mouse_input_verified=mouse_input_verified,
+                frame_metrics=frame_metrics,
             )
         except RemoteAgentError as exc:
             raise self._host_error(exc) from exc
@@ -630,6 +641,7 @@ class RemoteAgentHost:
             "delete": False,
             "console": False,
             "provisioning": False,
+            "omarchy_provisioning": False,
         }
         if value.get("available") is False:
             return result
@@ -648,6 +660,8 @@ class RemoteAgentHost:
                 result[output] = bool(value[key])
         if "gaming_provisioning" in value:
             result["gaming_provisioning"] = bool(value["gaming_provisioning"])
+        if "omarchy_provisioning" in value:
+            result["omarchy_provisioning"] = bool(value["omarchy_provisioning"])
         checks = value.get("provisioningChecks")
         if isinstance(checks, Mapping):
             result["provisioningChecks"] = {
@@ -661,6 +675,25 @@ class RemoteAgentHost:
                     "gpuPartitionable",
                 )
                 if key in checks
+            }
+        omarchy_checks = value.get("omarchyProvisioningChecks")
+        if isinstance(omarchy_checks, Mapping):
+            result["omarchyProvisioningChecks"] = {
+                str(key): bool(omarchy_checks[key])
+                for key in (
+                    "template",
+                    "isoPin",
+                    "tailscaleOAuthClient",
+                    "tailscaleTailnet",
+                    "tailscaleOAuthSecret",
+                    "gpuPartitionable",
+                    "pilotValidated",
+                    "secureBootDisabled",
+                    "vtpmDisabled",
+                    "guestValidationRequired",
+                    "linuxSshTransport",
+                )
+                if key in omarchy_checks
             }
         features = value.get("features", [])
         if isinstance(features, str):

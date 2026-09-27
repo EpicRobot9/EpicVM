@@ -4,16 +4,18 @@ export default function Modal({open, title, onClose, children, width=800}){
   const maxW = typeof width === 'number' ? `${width}px` : width
   const dialogRef = useRef(null)
   const priorFocus = useRef(null)
+  const closeCallback = useRef(onClose)
+  closeCallback.current = onClose
   const titleId = useId()
 
   useEffect(()=>{
     if(!open) return undefined
     priorFocus.current = document.activeElement
     const dialog = dialogRef.current
-    const focusable = () => [...dialog.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+    const focusable = () => [...dialog.querySelectorAll('button:not([disabled]), [href], iframe, input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
     ;(focusable()[0] || dialog).focus()
     function onKeyDown(event){
-      if(event.key === 'Escape'){ event.preventDefault(); onClose?.(); return }
+      if(event.key === 'Escape'){ event.preventDefault(); closeCallback.current?.(); return }
       if(event.key !== 'Tab') return
       const items = focusable()
       if(!items.length){ event.preventDefault(); dialog.focus(); return }
@@ -26,7 +28,7 @@ export default function Modal({open, title, onClose, children, width=800}){
       document.removeEventListener('keydown', onKeyDown)
       priorFocus.current?.focus?.()
     }
-  }, [open, onClose])
+  }, [open])
 
   if(!open) return null
   return (

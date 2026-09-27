@@ -10,7 +10,17 @@ __pycache__/
 /dashboard/jobs.sqlite3
 /dashboard_v2/last_error.txt
 /dashboard_v2/test-results/
+/\.pytest-*/
+/.pytest-tmp-local/
+/.omarchy-pytest.*
 /tmp/
+/recovery-evidence/account-workspace/
+/recovery-evidence/shared-games-ui/
+/recovery-evidence/duo-*.json
+/\.epicvm-*.json
+/.tmp-*
+/dashboard/*.orig
+/remote_agent/windows/testResults.xml
 /opt/blobe-vm/remote-hosts.json
 /opt/blobe-vm/remote-hosts.json.inventory.json
 

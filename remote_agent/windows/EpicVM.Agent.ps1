@@ -30,6 +30,10 @@ foreach ($providerExtension in @('GuestProvider.ps1','TailscaleProvider.ps1')) {
     $extensionPath = Join-Path $PSScriptRoot ('providers/' + $providerExtension)
     if (Test-Path -LiteralPath $extensionPath) { . $extensionPath }
 }
+$sharedGamesPath = Join-Path $PSScriptRoot 'SharedGames.ps1'
+if (Test-Path -LiteralPath $sharedGamesPath) { . $sharedGamesPath }
+$hostGamingPath = Join-Path $PSScriptRoot 'HostGaming.ps1'
+if (Test-Path -LiteralPath $hostGamingPath) { . $hostGamingPath }
 
 function Get-EpicVMDefaultConfig {
     return [pscustomobject]@{
@@ -50,6 +54,15 @@ function Get-EpicVMDefaultConfig {
         MaxDiskSizeBytes = 549755813888
         Generation = 2
         TemplateManifestPath = 'E:\EpicVM\templates\win11-25h2\manifest.json'
+        OmarchyTemplateManifestPath = 'E:\EpicVM\templates\omarchy-3.8.3\manifest.json'
+        OmarchyVersion = '3.8.3'
+        OmarchyIsoUrl = 'https://iso.omarchy.org/omarchy-3.8.3.iso'
+        OmarchyIsoSha256 = '40c9368eeb7e021a13d0899b379517843b4839f6e7721473169369fbd0fe61ac'
+        OmarchyGpuDeviceIdentity = 'VEN_1002&DEV_73BF'
+        OmarchyGpuPartitionPercent = 50
+        OmarchyTimezone = 'America/New_York'
+        OmarchyKeyboard = 'us'
+        OmarchyPilotValidated = $false
         ProvisioningStatePath = 'E:\EpicVM\provisioning-jobs.json'
         CatalogPath = 'E:\EpicVM\shared-games\catalog.json'
         GamingVMNames = @('testre')
@@ -74,6 +87,7 @@ function Get-EpicVMDefaultConfig {
             'C:\ProgramData\Sunshine\config\sunshine_state.json'
         )
         EnableGamingProvisioning = $false
+        EnableOmarchyProvisioning = $false
     }
 }
 
@@ -186,6 +200,7 @@ function New-EpicVMAgentState {
         StartedAt = [DateTime]::UtcNow
         SyncRoot = [object]::new()
         CompletedOperations = @{}
+        DeferProvisioning = $false
     }
     if (Get-Command -Name New-EpicVMProvisioningStore -ErrorAction SilentlyContinue) {
         $agentState | Add-Member -MemberType NoteProperty -Name Provisioning -Value (New-EpicVMProvisioningStore -Config $Config)
@@ -303,7 +318,11 @@ function Add-EpicVMProvisioningInventoryState {
     param([Parameter(Mandatory)] [object] $State, [Parameter(Mandatory)] [object[]] $Vms)
     foreach ($vm in $Vms) {
         $name = [string](Get-EpicVMProperty -Object $vm -Name 'name' -Default '')
-        $job = @($State.Provisioning.Jobs.Values | Where-Object { [string]$_.name -ceq $name } | Sort-Object updatedAt -Descending | Select-Object -First 1)
+        $vmId = [string](Get-EpicVMProperty -Object $vm -Name 'id' -Default '')
+        $job = @($State.Provisioning.Jobs.Values | Where-Object {
+            [string]$_.name -ceq $name -and
+            (-not $vmId -or [string](Get-EpicVMProperty -Object $_ -Name 'vmId' -Default '') -ieq $vmId)
+        } | Sort-Object updatedAt -Descending | Select-Object -First 1)
         if ($job.Count -eq 0) { continue }
         if ($vm -is [System.Collections.IDictionary]) {
             $vm['provisioningState'] = [string]$job[0].state
@@ -407,6 +426,56 @@ function Invoke-EpicVMApiRequest {
         if ($Method -eq 'GET' -and $normalizedPath -eq '/v1/health') {
             return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body ([ordered]@{ ok = $true; status = 'ok'; agent = 'EpicVM'; provider = [string]$State.Provider.Name })
         }
+        if ($normalizedPath -eq '/v1/host-gaming' -and $Method -eq 'GET') {
+            return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body (Get-EpicVMHostGamingView)
+        }
+        if ($normalizedPath -eq '/v1/host-gaming/launch' -and $Method -eq 'POST') {
+            return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body (Start-EpicVMHostGame (Get-EpicVMRequestBody -Body $Body))
+        }
+        if ($normalizedPath -eq '/v1/host-gaming/desktop' -and $Method -eq 'POST') {
+            return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body (Start-EpicVMHostDesktop (Get-EpicVMRequestBody -Body $Body))
+        }
+        if ($normalizedPath -eq '/v1/host-gaming/account-credential/reveal' -and $Method -eq 'POST') {
+            return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body (Reveal-EpicVMHostAccountCredential (Get-EpicVMRequestBody -Body $Body))
+        }
+        if ($normalizedPath -eq '/v1/host-gaming/stop' -and $Method -eq 'POST') {
+            return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body (Stop-EpicVMHostGame (Get-EpicVMRequestBody -Body $Body))
+        }
+        if ($normalizedPath -eq '/v1/host-gaming/pair' -and $Method -eq 'POST') {
+            return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body (Pair-EpicVMHostGaming (Get-EpicVMRequestBody -Body $Body))
+        }
+        if ($normalizedPath -eq '/v1/host-gaming/recover' -and $Method -eq 'POST') {
+            return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body (Recover-EpicVMHostGaming (Get-EpicVMRequestBody -Body $Body))
+        }
+        if ($normalizedPath -eq '/v1/host-gaming/games' -and $Method -eq 'POST') {
+            return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body (Register-EpicVMHostGame (Get-EpicVMRequestBody -Body $Body))
+        }
+        if ($normalizedPath -eq '/v1/host-gaming/games/remove' -and $Method -eq 'POST') {
+            return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body (Unregister-EpicVMHostGame (Get-EpicVMRequestBody -Body $Body))
+        }
+        if ($normalizedPath -eq '/v1/game-library' -and $Method -eq 'GET') {
+            $library = Get-EpicVMGameLibraryView
+            return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body (@{ok=$true} + $library)
+        }
+        if ($segments.Count -ge 2 -and $segments[0] -eq 'v1' -and $segments[1] -eq 'game-library') {
+            try {
+                if ($Method -eq 'POST' -and $segments.Count -eq 3 -and $segments[2] -eq 'upload') {
+                    return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body (@{ok=$true} + (Receive-EpicVMGameUpload (Get-EpicVMRequestBody -Body $Body)))
+                }
+                if ($Method -eq 'POST' -and $segments.Count -eq 3 -and $segments[2] -eq 'jobs') {
+                    $request = Get-EpicVMRequestBody -Body $Body
+                    $job = Start-EpicVMGameJob $request
+                    return ConvertTo-EpicVMJsonResponse -StatusCode 202 -Body @{ok=$true;job=$job}
+                }
+                if ($Method -eq 'GET' -and $segments.Count -eq 4 -and $segments[2] -eq 'jobs' -and $segments[3] -match '^[a-f0-9]{32}$') {
+                    $path = Join-Path $script:GameLibraryRoot ('jobs\' + $segments[3] + '.json')
+                    if (-not (Test-Path -LiteralPath $path)) { throw 'Game setup job was not found.' }
+                    $job = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+                    $job.Remove('request')
+                    return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body @{ok=$true;job=$job}
+                }
+            } catch { return ConvertTo-EpicVMJsonResponse -StatusCode 400 -Body (New-EpicVMApiError -Code 'game_setup_failed' -Message $_.Exception.Message) }
+        }
         if ($Method -eq 'GET' -and $normalizedPath -eq '/v1/capabilities') {
             $caps = Get-EpicVMProviderCapabilities -Provider $State.Provider
             $caps.ok = $true
@@ -442,13 +511,18 @@ function Invoke-EpicVMApiRequest {
                             # of hidden shares (EpicVMGames$) wholesale; splitting it
                             # out makes Get-SmbShare look up the wrong name.
                             $localExePath = $exePath
-                            if ($exePath -match '^\\\\(?<host>[^\\]+)\\(?<share>[^\\]+)\\(?<rest>.*)$') {
+                            if ($exePath -match '^\\\\(?<host>[^\\]+)\\(?<share>[^\\$]+)\$\\(?<rest>.*)$') {
                                 $shareRoot = $null
                                 try { $shareRoot = (Get-SmbShare -Name $Matches['share'] -ErrorAction Stop).Path } catch { }
                                 if ($null -ne $shareRoot) { $localExePath = Join-Path $shareRoot $Matches['rest'] }
                             }
                             if (Test-Path -LiteralPath $localExePath -ErrorAction SilentlyContinue) { $available = $true }
-                            elseif (Test-Path -LiteralPath $exePath -ErrorAction SilentlyContinue) { $available = $true }
+                            # Deliberately NO fallback Test-Path against the raw UNC:
+                            # under a freshly started LocalSystem process the SMB
+                            # self-session may not be established yet and the probe
+                            # can block far longer than this route's timeout, making
+                            # the whole endpoint appear dead. If the share root could
+                            # not be resolved locally, report unavailable instead.
                         } catch { $available = $false }
                     }
                     $rawSize = Get-EpicVMProperty -Object $_ -Name 'sizeBytes' -Default 0
@@ -478,6 +552,9 @@ function Invoke-EpicVMApiRequest {
                 $code = [string](Get-EpicVMProperty -Object $_.Exception -Name 'ErrorCode' -Default 'invalid_request')
                 $status = [int](Get-EpicVMProperty -Object $_.Exception -Name 'HttpStatus' -Default 422)
                 return ConvertTo-EpicVMJsonResponse -StatusCode $status -Body (New-EpicVMApiError -Code $code -Message ([string]$_.Exception.Message))
+            }
+            if ([bool](Get-EpicVMProperty -Object $State -Name 'DeferProvisioning' -Default $false)) {
+                return ConvertTo-EpicVMJsonResponse -StatusCode 202 -Body ([ordered]@{ ok=$true; job=(ConvertTo-EpicVMRedactedJob -Job $job) })
             }
             try { $claim = Start-EpicVMProvisioningJob -State $State -Job $job }
             catch {
@@ -532,7 +609,10 @@ function Invoke-EpicVMApiRequest {
                 catch {
                     $code = [string](Get-EpicVMProperty -Object $_.Exception -Name 'ErrorCode' -Default 'network_recovery_failed')
                     $allowed = @('invalid_credential_input','network_recovery_not_allowed','network_recovery_vm_missing',
-                        'tailscale_verification_failed','network_recovery_failed','management_handoff_failed')
+                        'tailscale_verification_failed','tailscale_enrollment_failed','tailscale_state_not_persisted',
+                        'tailscale_auth_input_failed','tailscale_guest_command_failed','tailscale_system_task_timeout',
+                        'tailscale_system_task_failed','tailscale_unattended_failed','tailscale_restart_failed',
+                        'network_recovery_failed','management_handoff_failed')
                     if ($allowed -notcontains $code) { $code = 'network_recovery_failed' }
                     $status = [int](Get-EpicVMProperty -Object $_.Exception -Name 'HttpStatus' -Default 422)
                     return ConvertTo-EpicVMJsonResponse -StatusCode $status -Body ([ordered]@{
@@ -692,7 +772,7 @@ function Invoke-EpicVMApiRequest {
                 }
                 $setter = Get-EpicVMProperty -Object $State.Provider -Name 'SetGamingGpuPercent' -Default $null
                 if ($null -eq $setter) {
-                    return ConvertTo-EpicVMJsonResponse -StatusCode 409 -Body (New-EpicVMApiError -Code 'gaming_unavailable' -Message 'Gaming GPU-P controls are unavailable for this provider.')
+                    return ConvertTo-EpicVMJsonResponse -StatusCode 409 -Body (New-EpicVMApiError -Code 'gpu_partition_unavailable' -Message 'GPU-P controls are unavailable for this provider.')
                 }
                 $result = & $setter $name $percent
                 return ConvertTo-EpicVMJsonResponse -StatusCode 200 -Body ([ordered]@{ ok = $true; vm = $result })
@@ -743,6 +823,7 @@ function Test-EpicVMMutationRequest {
         [Parameter(Mandatory)] [string] $Path
     )
     if ($Method -eq 'DELETE' -and $Path -match '^/v1/vms/[^/]+$') { return $true }
+    if ($Method -eq 'POST' -and $Path -match '^/v1/host-gaming/(launch|desktop|stop|pair|recover|games|games/remove)$') { return $true }
     if ($Method -eq 'POST' -and ($Path -eq '/v1/provisioning-jobs' -or $Path -eq '/v1/deprovisioning-jobs' -or $Path -match '^/v1/provisioning-jobs/[^/]+/(claim|claim-reissue|guest-recovery|network-recovery|direct-diagnostic|console-credentials|console-complete|console-failed)$')) { return $true }
     if ($Method -eq 'POST' -and ($Path -eq '/v1/vms' -or $Path -match '^/v1/vms/[^/]+/(start|stop|restart|gpu-partition)$' -or $Path -match '^/v1/vms/[^/]+/actions/(start|stop|restart|delete)$')) { return $true }
     return $false
@@ -792,65 +873,8 @@ function Start-EpicVMAgent {
     $listener.Prefixes.Add("http://$prefixAddress`:$ListenPort/")
     try { $listener.Start() } catch { throw 'Unable to start the EpicVM agent listener. Run the installer as an administrator.' }
     Write-Verbose ("EpicVM remote agent listening on {0}:{1}" -f $Bind, $ListenPort)
-    try {
-        while ($listener.IsListening) {
-            $context = $listener.GetContext()
-            try {
-                $requestId = [Guid]::NewGuid().ToString('N')
-                $response = $null
-                $headers = @{}
-                foreach ($key in $context.Request.Headers.AllKeys) { $headers[$key] = $context.Request.Headers[$key] }
-                $normalizedPath = '/' + $context.Request.Url.AbsolutePath.Trim('/')
-                $isMutation = Test-EpicVMMutationRequest -Method $context.Request.HttpMethod -Path $normalizedPath
-                $idempotencyKey = Get-EpicVMHeader -Headers $headers -Name 'Idempotency-Key'
-                $cacheKey = if ($isMutation -and $idempotencyKey -and $idempotencyKey.Length -le 128) {
-                    '{0}|{1}|{2}' -f $context.Request.HttpMethod, $normalizedPath, $idempotencyKey
-                } else { '' }
-                if ($cacheKey -and $State.CompletedOperations.ContainsKey($cacheKey)) {
-                    $response = $State.CompletedOperations[$cacheKey]
-                }
-                else {
-                    $body = $null
-                    if ($context.Request.ContentLength64 -gt 1048576) {
-                        $response = ConvertTo-EpicVMJsonResponse -StatusCode 413 -Body (New-EpicVMApiError -Code 'body_too_large' -Message 'Request body exceeds the 1 MiB limit.')
-                    }
-                    else {
-                        if ($context.Request.HasEntityBody) {
-                            $readResult = Read-EpicVMBoundedBody -Stream $context.Request.InputStream
-                            if ($readResult.TooLarge) {
-                                $response = ConvertTo-EpicVMJsonResponse -StatusCode 413 -Body (New-EpicVMApiError -Code 'body_too_large' -Message 'Request body exceeds the 1 MiB limit.')
-                            }
-                            else {
-                                $body = $readResult.Body
-                            }
-                        }
-                        if ($null -eq $response) {
-                            [System.Threading.Monitor]::Enter($State.SyncRoot)
-                            try {
-                                $response = Invoke-EpicVMApiRequest -State $State -Method $context.Request.HttpMethod -Path $context.Request.Url.AbsolutePath -Headers $headers -Body $body
-                            }
-                            finally { [System.Threading.Monitor]::Exit($State.SyncRoot) }
-                        }
-                    }
-                    if ($cacheKey -and $response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
-                        $State.CompletedOperations[$cacheKey] = $response
-                        if ($State.CompletedOperations.Count -gt 256) {
-                            $State.CompletedOperations.Remove(@($State.CompletedOperations.Keys)[0])
-                        }
-                    }
-                }
-                $response | Add-Member -MemberType NoteProperty -Name RequestId -Value $requestId -Force
-                [void](Write-EpicVMSafeHttpResponse -Response $context.Response -StatusCode $response.StatusCode -Json $response.Json -Headers $response.Headers -RequestId $requestId)
-            }
-            catch {
-                $body = (New-EpicVMApiError -Code 'internal_error' -Message 'The agent could not process the request.') | ConvertTo-Json -Depth 10 -Compress
-                [void](Write-EpicVMSafeHttpResponse -Response $context.Response -StatusCode 500 -Json $body -RequestId $requestId)
-            }
-            finally {
-                try { $context.Response.Close() } catch { }
-            }
-        }
-    }
+    . (Join-Path $PSScriptRoot 'AgentTransport.ps1')
+    try { Invoke-EpicVMAgentListener -State $State -Listener $listener -AgentPath (Join-Path $PSScriptRoot 'EpicVM.Agent.ps1') }
     finally { $listener.Stop(); $listener.Close() }
 }
 

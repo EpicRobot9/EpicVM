@@ -1,25 +1,38 @@
-# EpicVM Gaming Console — Operations Runbook
+# EpicVM Gaming Console Operations Runbook
 
 How to provision, repair, and verify a Gaming VM console end-to-end, and
-what to do when each stage fails. Written from the Aug 22 2026 recovery
-(local WSL2 simulation + production kvm2 run).
+what to do when each stage fails. The current provisioning and deployment
+instructions were updated September 13, 2026. Older verification records
+below are historical and do not describe the current routing configuration.
 
 ## The happy path
 
-1. **Provision** — `POST /dashboard/api/provisioning-jobs` with
+1. **Provision**: `POST /dashboard/api/provisioning-jobs` with
    `{host_id, name, profile: "gaming", mode: "automatic"}`. The dashboard
-   forwards to the Windows agent (`/v1/provisioning-jobs`). Stages run in
-   order: `claim → guest_setup → network_setup → management_handoff →
-   gaming_gpu → streaming_setup`.
-2. **Console staging (dashboard-side, async)** — the orchestrator writes
+   forwards to the Windows agent (`/v1/provisioning-jobs`). Creation returns
+   202 immediately. A single agent worker performs mutations while health,
+   inventory, and job status remain available. Stages run in order:
+   `queued → cloning → booting → unclaimed → claim → guest_setup →
+   network_setup → management_handoff → gaming_gpu → streaming_setup`.
+   The dashboard polls until the clone is claimable and obtains a new
+   one-use claim through the authenticated agent endpoint. Readiness remains
+   agent-owned and continues through `streaming_setup → ready`.
+2. **Guest capture**: enroll Tailscale under the intended desktop account
+   with unattended mode enabled, then verify that identity survives the
+   service restart. Install or reuse the virtual display, configure Sunshine
+   with its display device GUID and `encoder = amdvce`, and reboot the guest
+   when its first interactive desktop has not started. Pre-capture GPU
+   validation checks the adapter and GPU rendering. Hardware encoder
+   discovery is required after Sunshine configuration.
+3. **Console staging (dashboard-side, async)**: the orchestrator writes
    `$EPICVM_MOONLIGHT_ROOT/<vm>--<host>/` (compose + plan.json), starts the
-   bundle via `docker compose -p epicvm-<name>--<host> up -d --wait`, pairs
-   it with Sunshine (PIN dance), then calls the agent's
-   `POST /v1/provisioning-jobs/<id>/console-complete`.
-3. **Readiness** — the agent flips the job to `ready` ONLY after
-   `console-complete` carries route + TCP + **quantified frame metrics**
-   (nonblackFraction ≥ 0.60, meanLuma ≥ 12, stdDev ≥ 8, decodedFramesDelta
-   ≥ 3, durationMs ≥ 1500). This is deliberate. Do not bypass it.
+   bundle, pairs it with Sunshine, and verifies the application route plus
+   guest transport. Capture configuration has a separate 900-second agent
+   request limit to cover driver staging, reboot, and encoder validation.
+4. **Readiness**: the agent promotes the job after the automated GPU render,
+   provisioning, Tailscale/WinRM, capture, Sunshine, route, and guest-TCP
+   gates pass. The dashboard keeps the Moonlight stream available for the
+   browser, but no keyboard or mouse attestation is requested or persisted.
 
 ## Retry paths
 
@@ -27,13 +40,24 @@ what to do when each stage fails. Written from the Aug 22 2026 recovery
 |---|---|---|
 | Streaming stage failed, capture not configured | agent `POST /v1/provisioning-jobs/<id>/console-credentials` | body: `username`, `password` (guest), `sunshineUsername`, `sunshinePassword`. Note: guest creds are `username`/`password`, NOT `guestUsername`. |
 | Bundle missing/stale, capture already configured | dashboard `POST /dashboard/api/provisioning-jobs/<id>/repair-console` | same credential field names as above; requires `X-Forwarded-Proto: https` + CSRF header. Runs async (202). |
-| Everything green, need to flip state | agent `POST .../console-complete` | must carry REAL frame metrics from a browser session. |
+| Everything green, need to flip state | dashboard `POST .../console-verify` | requires only the validated route and `guestTcpVerified: true`; the agent remains authoritative. |
 
 ## Failure catalog (seen in production)
 
-- **`gaming_capacity`** — only one Gaming VM may run. Stop the old one
-  first (`POST /v1/vms/<name>/stop`). Stale `setup_failed:streaming` jobs
-  still count.
+- **`gaming_capacity`**: only one Gaming VM may run. Stop the old one
+  first (`POST /v1/vms/<name>/stop`). Queued/cloning requests reserve a
+  slot. Retained jobs for stopped or saved VMs do not reserve capacity.
+  Match a job to inventory using the immutable Hyper-V VM ID.
+- **Agent service fails after a PowerShell update**: use
+  `scripts/Repair-EpicVMAgentRuntime.ps1` on the PC. The service must use
+  the managed PowerShell runtime or a machine installation, never a
+  versioned WindowsApps executable that Store updates can remove.
+- **`CAPTURE_SUNSHINE_CONF`**: check Sunshine's display enumeration and
+  selected device GUID. Retrying setup must reuse the installed VDD.
+  Friendly display labels are not valid `output_name` values.
+- **`CAPTURE_DESKTOP_LOGON`**: the guest reboot did not produce the expected
+  account's interactive desktop in time. Check the guest boot, autologon,
+  Tailscale identity, and Explorer session. Do not mark it ready manually.
 - **`host_unavailable` from the dashboard** — usually NOT connectivity.
   Two known causes: (a) remote-hosts registry token not AES-GCM sealed
   (`EV1:` prefix) — the dashboard silently drops the host; (b) the agent
@@ -75,22 +99,35 @@ what to do when each stage fails. Written from the Aug 22 2026 recovery
   avoids this with `WEBRTC_NAT_1TO1_HOST=<public-ip>`. Local pixel proof
   needs the browser on the same host as docker, or host networking.
 
-## Prod deploy checklist (kvm2)
+## Production deployment from the PC
 
-1. `cd /opt/blobe-vm/repo && git pull --ff-only origin production`
-2. Copy changed dashboard files: `cp repo/dashboard/*.py /opt/blobe-vm/dashboard/`
-   (backup first — `.dashboard-backups/<date>/`).
-3. Rebuild the overlay if `docker/moonlight-web/patch_stream.py` changed:
-   `cd repo/docker/moonlight-web && docker build -t epicvm/moonlight-web:<tag> .`
-   then digest-pin it in `/opt/blobe-vm/.env`.
-4. Recreate `blobedash` (original image `blobedash:webrtc-udp-0f31510-r2`
-   has flask baked in; bare python:3.11-slim does NOT work):
-   see `.dashboard-backups` / `server/install.sh` for the exact
-   `docker run` shape (network `proxy`, port `20000:5000`, mounts for
-   /opt/blobe-vm, /opt/epicvm, docker socket, dashboard:/app:ro).
-5. Health: `curl :20000/dashboard/api/auth/csrf` → 401 (alive, gated).
-6. Confirm no stray qemu/KVM VMs: `ps aux | grep qemu-system` (kvm2 has no
-   virsh; gaming VMs run on the Windows agent host, not on kvm2).
+**Do not build EpicVM on KVM2.** Run frontend and container builds on
+Epic's PC. KVM2 is used for deployment and runtime checks over `ssh kvm2`.
+
+1. Inspect the working tree and deployment mounts; preserve unrelated
+   edits. Back up `/opt/blobe-vm/dashboard`, `dashboard_v2/dist`, and
+   `epicvm_web/dist` before replacing runtime files.
+2. On the PC, run relevant tests and `npm run build` in each changed
+   frontend. The Vite roots resolve the workspace junction to its real path.
+3. Archive the reviewed Python sources and built `dist` directories on
+   the PC, copy with `scp`, and extract into `/opt/blobe-vm`. The live
+   dashboard uses `/opt/blobe-vm/dashboard`, not the separate `repo` checkout.
+4. If the Moonlight image changed, build it on the PC and transfer the
+   finished image with `docker save`/`docker load` or a registry. Preserve
+   digest pinning and protected environment files. Do not pass TURN or
+   agent credentials on the command line.
+5. Wait for active provisioning operations to finish, then restart
+   `blobedash` for Python changes. Preserve its image, proxy network,
+   `20000:5000` mapping, and existing mounts.
+6. Install Windows agent sources on the PC using
+   `scripts/Install-EpicVMAgentSourcesSafe.ps1 -ReportPath <report.json>`
+   from an elevated PowerShell. It backs up replaced files, preserves
+   the protected token and service identity, rolls back failures, and
+   verifies health and installed hashes.
+7. Check the public dashboard, fresh provisioning status throughout
+   cloning, and the actual browser video. Build success or a running console
+   container is insufficient verification; keyboard/mouse input is not a
+   provisioning gate.
 
 ## Session auth for automation (prod)
 
@@ -113,9 +150,10 @@ as `X-CSRF-Token`. Mutating endpoints also require
 
 ## Evidence rules (non-negotiable)
 
-`console-complete` frame metrics must come from an actual browser session
-rendering the live stream. Fabricated metrics are the exact defect this
-system was rebuilt to reject. If the stream is black, fix the stream.
+The automated GPU/browser render gate must observe a changing, non-black
+stream before readiness. Fabricated metrics are rejected. If the stream is
+black or frozen, fix the stream. Keyboard and mouse human-attestation fields
+are not part of readiness.
 
 ## WSL-bundle video path (Aug 23 2026 — LIVE, pixel-verified)
 
@@ -135,7 +173,8 @@ browser ──https──> Cloudflare ──> kvm2 Traefik (auth chain unchanged
 
 Remote users: WebRTC falls back to TURN on kvm2.
   turn:72.60.29.204:3478 (public) AND turn:100.89.87.98:3478 (tailnet) are
-  both configured in the bundle's ice_servers; provider firewall now allows
+  both configured in the bundle's ice_servers; use plain TURN URLs without
+  transport query parameters; provider firewall now allows
   inbound 3478 tcp/udp (verified via authenticated allocation from WSL).
   Relay range 49160-49200/udp published on kvm2 docker.
   Long-term creds: kvm2:/root/.turncreds. Maintenance:
@@ -161,7 +200,8 @@ Verified working pieces:
   console container (priority 600) vs file router (650). The file router
   currently serves prod traffic; its exact copy also lives at
   `kvm2:/root/epicvm-gaming-verify-1-wsl.yml.bak-20260822`.
-- coturn on kvm2 (`docker run -d --name coturn -p 3478:3478/tcp
+- coturn on kvm2 (`docker run -d --init --network host --name coturn
+  -p 3478:3478/tcp
   -p 3478:3478/udp -p 49160-49200:49160-49200/udp coturn/coturn:latest -n
   --lt-cred-mech --realm=techexplore.us --min-port=49160 --max-port=49200
   --external-ip=72.60.29.204 --listening-ip=0.0.0.0 --no-cli

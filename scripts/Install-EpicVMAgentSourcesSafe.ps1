@@ -13,10 +13,17 @@ $ErrorActionPreference = 'Stop'
 $files = @(
     'EpicVM.Agent.ps1',
     'Provisioning.ps1',
+    'AgentTransport.ps1',
+    'ServiceRuntime.ps1',
+    'SharedGames.ps1',
+    'SharedGamesWorker.ps1',
+    'SharedGamesCodex.ps1',
+    'HostGaming.ps1',
     'providers\HyperVProvider.ps1',
     'providers\GuestProvider.ps1',
     'providers\TailscaleProvider.ps1',
-    'providers\GamingGpuPProvider.ps1'
+    'providers\GamingGpuPProvider.ps1',
+    'providers\OmarchyProvider.ps1'
 )
 $serviceName = 'EpicVMRemoteAgent'
 $stageRoot = Join-Path $InstallRoot ('.source-update-' + [guid]::NewGuid().ToString('N'))
@@ -25,6 +32,9 @@ $stagedRoot = Join-Path $stageRoot 'staged'
 $serviceWasRunning = $false
 $serviceStarted = $false
 $rollbackAttempted = $false
+$rollbackSucceeded = $false
+$transactionStarted = $false
+$replacedFiles = [Collections.Generic.List[string]]::new()
 $sourceHashes = [ordered]@{}
 $installedHashes = [ordered]@{}
 $targetAcls = @{}
@@ -52,6 +62,8 @@ try {
     $sourceFull = [IO.Path]::GetFullPath($SourceRoot).TrimEnd('\') + '\'
     $installFull = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\') + '\'
     if (-not $sourceFull -or -not $installFull) { throw 'Agent source roots are invalid.' }
+    $stageFull = [IO.Path]::GetFullPath($stageRoot)
+    if (-not $stageFull.StartsWith($installFull, [StringComparison]::OrdinalIgnoreCase)) { throw 'Agent staging path escaped the install root.' }
     foreach ($relative in $files) {
         $source = Join-Path $SourceRoot $relative
         $target = Get-RelativeTarget -RelativePath $relative
@@ -95,11 +107,13 @@ try {
         if ($null -ne $targetAcls[$relative]) { Set-Acl -LiteralPath $staged -AclObject $targetAcls[$relative] }
     }
 
+    $transactionStarted = $true
     if ($serviceWasRunning) { Stop-Service -Name $serviceName -Force -ErrorAction Stop }
     foreach ($relative in $files) {
         $target = Get-RelativeTarget -RelativePath $relative
         $staged = Join-Path $stagedRoot $relative
         Move-Item -LiteralPath $staged -Destination $target -Force
+        $replacedFiles.Add($relative)
         if ($null -ne $targetAcls[$relative]) { Set-Acl -LiteralPath $target -AclObject $targetAcls[$relative] }
     }
     Start-Service -Name $serviceName -ErrorAction Stop
@@ -120,6 +134,7 @@ try {
     }
     finally { $token = $null }
     if (-not $healthy) { throw 'The updated agent did not pass its safe health check.' }
+
 
     foreach ($relative in $files) {
         $target = Get-RelativeTarget -RelativePath $relative
@@ -143,11 +158,11 @@ try {
     $safe | ConvertTo-Json -Depth 8 -Compress
 }
 catch {
-    if ($serviceStarted -or $serviceWasRunning) {
+    if ($transactionStarted) {
         $rollbackAttempted = $true
         try {
             if ((Get-Service -Name $serviceName -ErrorAction Stop).Status -ne 'Stopped') { Stop-Service -Name $serviceName -Force -ErrorAction Stop }
-            foreach ($relative in $files) {
+            foreach ($relative in $replacedFiles) {
                 $target = Get-RelativeTarget -RelativePath $relative
                 $backup = if ($backupFiles.ContainsKey($relative)) { [string]$backupFiles[$relative] } else { '' }
                 if ($backup -and (Test-Path -LiteralPath $backup -PathType Leaf)) {
@@ -158,16 +173,21 @@ catch {
                     Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
                 }
             }
-            Start-Service -Name $serviceName -ErrorAction Stop
+            if ($serviceWasRunning) { Start-Service -Name $serviceName -ErrorAction Stop }
+            $rollbackSucceeded = $true
         }
         catch { }
     }
-    $failure = [ordered]@{ ok = $false; error = 'agent_source_update_failed'; rollbackAttempted = $rollbackAttempted; serviceIdentity = [string](Get-CimInstance Win32_Service -Filter ("Name='" + $serviceName + "'") -ErrorAction SilentlyContinue).StartName }
+    $failure = [ordered]@{ ok = $false; error = 'agent_source_update_failed'; rollbackAttempted = $rollbackAttempted; rollbackSucceeded = $rollbackSucceeded; retainedBackup = $(if($transactionStarted -and -not $rollbackSucceeded){$backupRoot}else{$null}); serviceIdentity = [string](Get-CimInstance Win32_Service -Filter ("Name='" + $serviceName + "'") -ErrorAction SilentlyContinue).StartName }
     Write-SafeReport -Value $failure
     $failure | ConvertTo-Json -Compress
     exit 1
 }
 finally {
     $token = $null
-    if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    if ((-not $rollbackAttempted -or $rollbackSucceeded) -and (Test-Path -LiteralPath $stageRoot)) {
+        $cleanupRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\') + '\'
+        $cleanupTarget = [IO.Path]::GetFullPath($stageRoot)
+        if ($cleanupTarget.StartsWith($cleanupRoot,[StringComparison]::OrdinalIgnoreCase)) { Remove-Item -LiteralPath $cleanupTarget -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }

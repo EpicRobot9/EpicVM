@@ -3,10 +3,12 @@
 Covers the three black-screen readiness defects:
 1. MoonlightOrchestrator.restart_session rebuilds stream state without
    touching the paired bundle contract (control-stream startup race).
-2. The dashboard console-verify endpoint rejects missing or sub-threshold
-   frame metrics instead of persisting false-positive readiness.
-3. Complete-EpicVMProvisioningConsole (agent) rejects jobs whose frame
-   metrics are missing or below threshold.
+2. The dashboard console-verify endpoint completes readiness only from the
+   dashboard's own server-measured guest transport result and never forwards
+   browser-claimed human video/keyboard/mouse evidence as truth.
+3. Complete-EpicVMProvisioningConsole (agent) requires that server-verified
+   transport gate, validates caller-supplied frame metrics when present, and
+   no longer blocks on any manual browser evidence.
 """
 from __future__ import annotations
 
@@ -115,7 +117,6 @@ GOOD_METRICS = {
     "decodedFramesDelta": 169,
     "durationMs": 5000,
 }
-BLACK_METRICS = {key: 0 for key in GOOD_METRICS}
 
 
 class _FakeHost:
@@ -123,15 +124,15 @@ class _FakeHost:
 
     def __init__(self, job):
         self._job = job
+        self.console_complete_calls = []
 
     def provisioning_status(self, job_id):
         return {"job": dict(self._job)}
 
     def console_complete(self, job_id, **kwargs):
+        self.console_complete_calls.append({"job_id": job_id, **kwargs})
         job = dict(self._job)
         job["state"] = "ready"
-        job.update({k: True for k in (
-            "consoleFrameVerified", "keyboardInputVerified", "mouseInputVerified")})
         return {"ok": True, "job": job}
 
 
@@ -148,16 +149,6 @@ def app_module(monkeypatch, tmp_path):
     return app
 
 
-def _verify_client(app, payload):
-    client = app.app.test_client()
-    # Bypass the HTTPS gate exactly as the production TLS terminator would.
-    client.post("/dashboard/api/provisioning-jobs/<id>".replace("<id>", "x"), data={})
-    resp = None
-    with client.session_transaction() as session:  # pragma: no cover
-        session.clear()
-    return client
-
-
 def _post_verify(app, monkeypatch, job, payload):
     host = _FakeHost(job)
     monkeypatch.setattr(app, "_vm_host", lambda host_id: host)
@@ -172,76 +163,89 @@ def _post_verify(app, monkeypatch, job, payload):
         json=payload,
         headers={"X-Forwarded-Proto": "https"},
     )
-    return response
+    return response, host
 
 
-def test_dashboard_verify_requires_quantified_metrics(app_module, monkeypatch):
+def test_dashboard_verify_completes_from_transport_and_decoded_video_evidence(app_module, monkeypatch):
     job = {"id": "jobframe1", "name": "vmx", "state": "streaming_setup"}
     payload = {
         "host_id": "epic-pc",
-        "routePrefix": "/vm/vmx/",
-        "evidenceSource": "browser_kvm",
-        "videoFrameVerified": True,
-        "keyboardInputVerified": True,
-        "mouseInputVerified": True,
-        "guestTcpVerified": True,
-    }
-    response = _post_verify(app_module, monkeypatch, job, payload)
-    assert response.status_code == 422
-    body = response.get_json()
-    assert body["error"]["code"] == "frame_metrics_required"
-
-
-def test_dashboard_verify_rejects_black_frames(app_module, monkeypatch):
-    job = {"id": "jobframe2", "name": "vmx", "state": "streaming_setup"}
-    payload = {
-        "host_id": "epic-pc",
-        "routePrefix": "/vm/vmx/",
-        "evidenceSource": "browser_kvm",
-        "videoFrameVerified": True,
-        "keyboardInputVerified": True,
-        "mouseInputVerified": True,
-        "guestTcpVerified": True,
-        "frameMetrics": BLACK_METRICS,
-    }
-    response = _post_verify(app_module, monkeypatch, job, payload)
-    assert response.status_code == 422
-    body = response.get_json()
-    assert body["error"]["code"] == "frame_evidence_rejected"
-    assert "nonblackFraction" in body["error"]["message"]
-
-
-def test_dashboard_verify_accepts_real_frame_evidence(app_module, monkeypatch):
-    job = {"id": "jobframe3", "name": "vmx", "state": "streaming_setup"}
-    payload = {
-        "host_id": "epic-pc",
-        "routePrefix": "/vm/vmx/",
-        "evidenceSource": "browser_kvm",
-        "videoFrameVerified": True,
-        "keyboardInputVerified": True,
-        "mouseInputVerified": True,
+        "routePrefix": "/vm/vmx--epic-pc/",
         "guestTcpVerified": True,
         "frameMetrics": GOOD_METRICS,
     }
-    response = _post_verify(app_module, monkeypatch, job, payload)
+    response, host = _post_verify(app_module, monkeypatch, job, payload)
     assert response.status_code == 200, response.get_data(as_text=True)
     body = response.get_json()
     assert body["ok"] is True
     assert body["visualValidationComplete"] is True
+    assert body["job"]["consoleVisualValidationPending"] is False
+    call = host.console_complete_calls[-1]
+    assert set(call) == {"job_id", "route_prefix", "guest_tcp_verified", "frame_metrics"}
+    assert call["guest_tcp_verified"] is True
+    assert call["frame_metrics"] == GOOD_METRICS
 
 
-def test_agent_console_complete_rejects_missing_metrics():
-    """Complete-EpicVMProvisioningConsole must fail closed without metrics.
+def test_dashboard_verify_ignores_browser_claimed_human_evidence(app_module, monkeypatch):
+    """A caller cannot fabricate readiness: human-evidence fields are never trusted."""
+    job = {"id": "jobframe2", "name": "vmx", "state": "streaming_setup"}
+    payload = {
+        "host_id": "epic-pc",
+        "routePrefix": "/vm/vmx--epic-pc/",
+        "guestTcpVerified": True,
+        "evidenceSource": "browser_kvm",
+        "videoFrameVerified": True,
+        "keyboardInputVerified": True,
+        "mouseInputVerified": True,
+        "frameMetrics": GOOD_METRICS,
+    }
+    response, host = _post_verify(app_module, monkeypatch, job, payload)
+    assert response.status_code == 200
+    call = host.console_complete_calls[-1]
+    # Human input claims are ignored. Quantified decoded-frame evidence is
+    # forwarded to the agent for deterministic threshold validation.
+    assert set(call) == {"job_id", "route_prefix", "guest_tcp_verified", "frame_metrics"}
+    assert call["guest_tcp_verified"] is True
+    assert call["frame_metrics"] == GOOD_METRICS
 
-    The PowerShell gate mirrors these thresholds; this test pins the shared
-    contract so a future edit cannot silently drop one side.
-    """
+
+def test_dashboard_verify_rejects_missing_guest_transport(app_module, monkeypatch):
+    job = {"id": "jobframe3", "name": "vmx", "state": "streaming_setup"}
+    for transport in (False, None):
+        payload = {
+            "host_id": "epic-pc",
+            "routePrefix": "/vm/vmx--epic-pc/",
+            "guestTcpVerified": transport,
+            "frameMetrics": GOOD_METRICS,
+        }
+        response, host = _post_verify(app_module, monkeypatch, job, payload)
+        assert response.status_code == 422
+        assert host.console_complete_calls == []
+
+
+def test_dashboard_verify_rejects_missing_decoded_video_metrics(app_module, monkeypatch):
+    job = {"id": "jobframe4", "name": "vmx", "state": "streaming_setup"}
+    response, host = _post_verify(app_module, monkeypatch, job, {
+        "host_id": "epic-pc",
+        "routePrefix": "/vm/vmx--epic-pc/",
+        "guestTcpVerified": True,
+    })
+    assert response.status_code == 422
+    assert host.console_complete_calls == []
+
+
+def test_agent_console_complete_is_transport_gated_with_optional_metrics():
+    """The agent gate mirrors the dashboard contract: transport required,
+    manual keyboard/mouse evidence gone, while decoded-frame metrics are
+    validated so absent or fabricated diagnostics fail closed."""
     provisioning_source = (REPO / "remote_agent" / "windows" / "Provisioning.ps1").read_text(encoding="utf-8")
-    assert "'nonblackFraction'; Min=0.60" in provisioning_source
-    assert "'meanLuma';         Min=12.0" in provisioning_source
+    assert "guestTcpVerified" in provisioning_source
+    assert "Rendered video, keyboard, and mouse evidence are required" not in provisioning_source
+    assert "'nonblackFraction'; Min=0.20" in provisioning_source
+    assert "'meanLuma'; Min=12.0" in provisioning_source
     assert "'stdDev' readiness threshold" in provisioning_source
     assert "'decodedFramesDelta'; Min=3.0" in provisioning_source
-    assert "'durationMs';       Min=1500.0" in provisioning_source
+    assert "'durationMs'; Min=1500.0" in provisioning_source
     assert "frameMetrics" in provisioning_source
 
 
@@ -250,7 +254,9 @@ def test_gaming_capture_script_is_wired_for_gaming_only():
     guest_source = (REPO / "remote_agent" / "windows" / "providers" / "GuestProvider.ps1").read_text(encoding="utf-8")
     assert "function Get-EpicVMGamingSunshineCaptureScript" in guest_source
     assert "$sunshineScript=Get-EpicVMSunshineConfigurationScript -ForGaming ([bool]$IsGaming)" in guest_source
-    # output_name pin must exist inside the capture script
-    assert "output_name = Virtual Display" in guest_source
+    # The capture target pins the MTT VDD adapter and an AMD hardware encoder
+    assert "friendly_name -eq 'VDD by MTT'" in guest_source
+    assert "'output_name = ' + $displayId" in guest_source
+    assert "encoder = amdvce" in guest_source
     # auto-logon keys must exist for a real interactive desktop session
     assert "AutoAdminLogon" in guest_source

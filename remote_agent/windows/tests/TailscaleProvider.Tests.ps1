@@ -9,6 +9,27 @@ BeforeAll {
 }
 
 Describe 'Tailscale OAuth enrollment' {
+    It 'polls task State separately from runtime result and has one launch path' {
+        $text=(Get-EpicVMTailscaleGuestScript).ToString()
+        $ast=[Management.Automation.Language.Parser]::ParseInput($text,[ref]$null,[ref]$null)
+        $taskFunction=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-EpicVMTailscaleTask'},$true)
+        . ([scriptblock]::Create($taskFunction.Extent.Text))
+        Mock New-ScheduledTaskAction { [Microsoft.Management.Infrastructure.CimInstance]::new('MSFT_TaskAction','root/Microsoft/Windows/TaskScheduler') }
+        Mock New-ScheduledTaskPrincipal { [Microsoft.Management.Infrastructure.CimInstance]::new('MSFT_TaskPrincipal','root/Microsoft/Windows/TaskScheduler') }
+        Mock Register-ScheduledTask {}
+        Mock Start-ScheduledTask {}
+        Mock Unregister-ScheduledTask {}
+        Mock Start-Sleep {}
+        $script:taskPoll=0
+        Mock Get-ScheduledTaskInfo { $script:taskPoll++; [pscustomobject]@{LastTaskResult=$(if($script:taskPoll -eq 1){267011}else{0})} }
+        Mock Get-ScheduledTask { [pscustomobject]@{State='Ready'} }
+        $result=Invoke-EpicVMTailscaleTask -TaskName test -Execute 'test.exe' -Arguments test -UserId 'machine\operator'
+        $result.exitCode | Should -Be 0
+        Should -Invoke Get-ScheduledTaskInfo -Times 2
+        Should -Invoke Start-ScheduledTask -Times 1
+        Should -Invoke New-ScheduledTaskPrincipal -ParameterFilter {$UserId -eq 'machine\operator' -and $LogonType -eq 'S4U' -and $RunLevel -eq 'Highest'} -Times 1
+        Should -Invoke Register-ScheduledTask -ParameterFilter { -not $Trigger } -Times 1
+    }
     It 'creates a non-reusable preauthorized guest key and verifies the guest IP' {
         $secretPath = 'mock://oauth-secret'
         $script:request = $null
@@ -45,6 +66,9 @@ Describe 'Tailscale OAuth enrollment' {
 
     It 'provides a read-only guest address probe for retained network recovery' {
         $scriptText=(Get-EpicVMTailscaleGuestAddressScript).ToString()
+        $scriptText | Should -Match 'status --json'
+        $scriptText | Should -Match 'BackendState'
+        $scriptText | Should -Match 'Self.Online'
         $scriptText | Should -Match 'Get-NetIPAddress'
         $scriptText | Should -Match 'AddressFamily IPv4'
         $scriptText | Should -Match '100'

@@ -2,6 +2,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO = Path(__file__).parents[1]
 CANONICAL = REPO / "server" / "epicvm"
@@ -11,8 +13,14 @@ LEGACY = REPO / "server" / "blobe-vm-manager"
 def run_cli(cli, *args):
     env = os.environ.copy()
     env["STATE_DIR"] = str(REPO / ".pytest-epicvm-state")
+    command = [str(cli), *args]
+    if os.name == "nt":
+        bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+        if not bash.is_file():
+            pytest.skip("Git Bash is required for the Bash CLI contract on Windows")
+        command = [str(bash), *command]
     return subprocess.run(
-        [str(cli), *args],
+        command,
         env=env,
         text=True,
         stdout=subprocess.PIPE,

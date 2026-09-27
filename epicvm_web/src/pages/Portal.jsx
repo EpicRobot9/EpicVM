@@ -1,13 +1,32 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Desktop, WindowsLogo, GameController, Power, Plug, ArrowClockwise, Stop, Spinner, Plus, CaretDown, Laptop } from '@phosphor-icons/react'
 import { myVms, logout, startVm, stopVm, restartVm, addCloudPc, pairCloudPc } from '../api'
+import { AvailableGames } from './SharedGames'
+import EpiChat from '../components/EpiChat'
 
 const TYPE_META = {
   linux: { label: 'Linux VM', icon: Desktop, cls: 't-linux', tag: 'BETA DEFAULT' },
   windows: { label: 'Windows VM', icon: WindowsLogo, cls: 't-windows', tag: 'LIMITED' },
   gaming: { label: 'Gaming VM', icon: GameController, cls: 't-gaming', tag: 'EXPERIMENTAL' },
   cloudpc: { label: 'Cloud PC', icon: Laptop, cls: 't-cloudpc', tag: 'YOUR PC' },
+}
+
+const PORTAL_CACHE_KEY = 'epicvm.portal.machines.v1'
+
+function cachedMachines(username) {
+  try {
+    const value = JSON.parse(window.sessionStorage.getItem(PORTAL_CACHE_KEY) || 'null')
+    if (value?.username === username && Array.isArray(value.vms)) return value
+  } catch { /* a damaged cache should never block the portal */ }
+  return null
+}
+
+function MachineSkeleton({ message }) {
+  return <section className="evm-loading-shell" aria-live="polite" aria-busy="true">
+    <div className="evm-loading-copy"><span className="evm-loading-check">✓</span><div><strong>Your account is connected</strong><p>{message}</p></div><Spinner size={24} className="spin" /></div>
+    <div className="evm-grid evm-skeleton-grid" aria-hidden="true">{[0, 1, 2].map(index => <div className="evm-card evm-skeleton-card" key={index}><span /><b /><i /><i /><em /></div>)}</div>
+  </section>
 }
 
 function readinessBadge(r) {
@@ -18,6 +37,8 @@ function readinessBadge(r) {
     stopped: ['OFFLINE', 'rb-off'],
     stopping: ['SHUTTING DOWN', 'rb-work'],
     failed: ['FAILED', 'rb-bad'],
+    unavailable: ['HOST UNAVAILABLE', 'rb-bad'],
+    'running-unready': ['RUNNING · NOT READY', 'rb-work'],
   }
   const [txt, cls] = map[r] || ['UNKNOWN', 'rb-off']
   return <span className={`evm-rbadge ${cls}`}>{txt}</span>
@@ -25,27 +46,56 @@ function readinessBadge(r) {
 
 export default function Portal({ user, onSignout }) {
   const navigate = useNavigate()
-  const [vms, setVms] = useState(null)
-  const [summary, setSummary] = useState(null)
-  const [loading, setLoading] = useState(true)
+  const username = user?.username || 'user'
+  const initialCache = useRef(cachedMachines(username))
+  const [vms, setVms] = useState(initialCache.current?.vms || null)
+  const [summary, setSummary] = useState(initialCache.current?.summary || null)
+  const [loading, setLoading] = useState(!initialCache.current)
+  const [refreshing, setRefreshing] = useState(Boolean(initialCache.current))
+  const [loadingMessage, setLoadingMessage] = useState('Finding your machines and checking their latest status…')
   const [err, setErr] = useState('')
+  const loadingRef = useRef(false)
+  const hasLoadedRef = useRef(Boolean(initialCache.current))
 
   const [showAddPc, setShowAddPc] = useState(false)
   const [addPc, setAddPc] = useState({ displayName: '', tailnetIp: '', sunshineUsername: '', sunshinePassword: '' })
   const [addPcBusy, setAddPcBusy] = useState(false)
   const [addPcErr, setAddPcErr] = useState('')
 
-  const load = () => {
-    setLoading(true)
-    myVms().then((res) => {
-      if (!res.ok) { setErr('Could not load your machines.'); setLoading(false); return }
+  const load = async ({ initial = false } = {}) => {
+    if (loadingRef.current) return
+    loadingRef.current = true
+    if (initial && !hasLoadedRef.current) setLoading(true)
+    if (hasLoadedRef.current) setRefreshing(true)
+    try {
+      const res = await myVms()
+      if (!res.ok) { setErr('Could not load your machines.'); return }
       setVms(res.body.vms || [])
       setSummary(res.body.summary || null)
+      hasLoadedRef.current = true
+      window.sessionStorage.setItem(PORTAL_CACHE_KEY, JSON.stringify({ username, vms: res.body.vms || [], summary: res.body.summary || null }))
+      setErr('')
+    } catch (error) {
+      setErr(error?.name === 'AbortError' ? 'Machine status took too long to respond. Try refreshing.' : 'Could not load your machines.')
+    } finally {
+      loadingRef.current = false
       setLoading(false)
-    }).catch(() => { setErr('Could not load your machines.'); setLoading(false) })
+      setRefreshing(false)
+    }
   }
 
-  useEffect(() => { load() }, [])
+  useEffect(() => {
+    load({ initial: true })
+    const timer = window.setInterval(() => load(), 10000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    if (!loading) return undefined
+    const checking = window.setTimeout(() => setLoadingMessage('Your account is connected. We’re checking live host status now…'), 1400)
+    const slower = window.setTimeout(() => setLoadingMessage('This host is taking a little longer to answer. You can safely stay on this page.'), 5000)
+    return () => { window.clearTimeout(checking); window.clearTimeout(slower) }
+  }, [loading])
 
   async function signout() {
     await logout().catch(() => {})
@@ -58,12 +108,14 @@ export default function Portal({ user, onSignout }) {
 
   const toggleManage = (n) => setOpenName((o) => (o === n ? null : n))
 
-  async function act(kind, vmName) {
+  async function act(kind, vm) {
+    const vmName = vm.name
+    const hostId = vm.host_id
     setBusy(vmName + ':' + kind)
     let res
-    if (kind === 'start') res = await startVm(vmName)
-    else if (kind === 'stop') res = await stopVm(vmName)
-    else if (kind === 'restart') res = await restartVm(vmName)
+    if (kind === 'start') res = await startVm(vmName, hostId, vm.resourceKey)
+    else if (kind === 'stop') res = await stopVm(vmName, hostId, vm.resourceKey)
+    else if (kind === 'restart') res = await restartVm(vmName, hostId, vm.resourceKey, vm.resourceType)
     setBusy('')
     if (res && res.ok) { load() } else if (res) alert(res.body.error || 'Action failed')
   }
@@ -99,8 +151,6 @@ export default function Portal({ user, onSignout }) {
     if (res.ok) { load() } else { alert(res.body.error || 'Pairing failed') }
   }
 
-  const username = user?.username || 'user'
-
   return (
     <div className="evm-page evm-portal">
       <header className="evm-portal-head">
@@ -112,14 +162,17 @@ export default function Portal({ user, onSignout }) {
         </div>
         <div className="evm-ph-right">
           <span className="evm-who">@{username}</span>
+          <a className="evm-btn evm-btn-ghost evm-btn-sm" href="/EpicVM/settings">Settings</a>
+          {user?.isAdmin && <a className="evm-btn evm-btn-ghost evm-btn-sm" href="/EpicVM/Management">Management</a>}
           <button className="evm-btn evm-btn-ghost evm-btn-sm" onClick={signout}>Sign out</button>
         </div>
       </header>
 
       <section className="evm-hero2">
         <div className="evm-hero2-main">
-          <h1 className="evm-hero2-title">YOUR<br />MACHINES</h1>
+          <h1 className="evm-hero2-title">Your machines</h1>
           <p className="evm-hero2-sub">Welcome back, {username}. This is your EpicVM control center.</p>
+          {refreshing && <span className="evm-refreshing"><Spinner size={13} className="spin" /> Refreshing live status</span>}
         </div>
         <div className="evm-summary">
           {summary ? (
@@ -134,9 +187,10 @@ export default function Portal({ user, onSignout }) {
       </section>
 
       {err && <div className="evm-error">{err}</div>}
+      <AvailableGames />
 
       {loading && !vms ? (
-        <div className="evm-portal-loading"><Spinner size={28} className="spin" /> Loading your machines…</div>
+        <MachineSkeleton message={loadingMessage} />
       ) : (
         <section className="evm-grid">
           {(vms || []).map((vm) => {
@@ -146,8 +200,9 @@ export default function Portal({ user, onSignout }) {
             const provisioning = vm.readiness === 'provisioning'
             const open = openName === vm.name
             const isCloudPc = vm.type === 'cloudpc'
+            const isRemote = vm.placement === 'remote'
             return (
-              <article key={vm.name} className={`evm-card ${tm.cls}`}>
+              <article key={vm.resourceKey || `${vm.host_id}:${vm.name}`} className={`evm-card ${tm.cls}`}>
                 <div className="evm-m-top">
                   <span className={`evm-type-tag ${tm.cls}`}><Icon size={14} /> {tm.tag}</span>
                   {readinessBadge(vm.readiness)}
@@ -188,16 +243,16 @@ export default function Portal({ user, onSignout }) {
                       {pairBusy === vm.name ? <Spinner size={16} className="spin" /> : null} PAIR
                     </button>
                   )}
-                  <button className="evm-btn evm-btn-block evm-mp-btn" disabled={busy === vm.name + ':start' || provisioning} onClick={() => act('start', vm.name)}>
+                   <button className="evm-btn evm-btn-block evm-mp-btn" disabled={busy === vm.name + ':start' || provisioning || vm.capabilities?.powerStart === false && !isCloudPc} onClick={() => act('start', vm)}>
                     {busy === vm.name + ':start' ? <Spinner size={16} className="spin" /> : <Power size={16} />} START
                   </button>
-                  <button className="evm-btn evm-btn-block evm-mp-btn" disabled={busy === vm.name + ':restart'} onClick={() => act('restart', vm.name)}>
+                   <button className="evm-btn evm-btn-block evm-mp-btn" disabled={busy === vm.name + ':restart' || isCloudPc || vm.capabilities?.restart === false} onClick={() => act('restart', vm)}>
                     {busy === vm.name + ':restart' ? <Spinner size={16} className="spin" /> : <ArrowClockwise size={16} />} RESTART
                   </button>
-                  <button className="evm-btn evm-btn-block evm-mp-btn evm-btn-danger" disabled={busy === vm.name + ':stop'} onClick={() => act('stop', vm.name)}>
+                   <button className="evm-btn evm-btn-block evm-mp-btn evm-btn-danger" disabled={busy === vm.name + ':stop' || vm.capabilities?.powerStop === false && !isCloudPc} onClick={() => act('stop', vm)}>
                     {busy === vm.name + ':stop' ? <Spinner size={16} className="spin" /> : <Stop size={16} />} STOP
                   </button>
-                  <a className="evm-mp-details" href={`/EpicVM/vm/${encodeURIComponent(vm.name)}/`} onClick={(e) => { e.preventDefault(); window.location.assign(`/EpicVM/vm/${encodeURIComponent(vm.name)}/`) }}>Open console →</a>
+                   <a className="evm-mp-details" href={`/EpicVM/vm/${encodeURIComponent(vm.name)}/${isRemote && vm.host_id ? `?host_id=${encodeURIComponent(vm.host_id)}` : ''}`} onClick={(e) => { e.preventDefault(); window.location.assign(`/EpicVM/vm/${encodeURIComponent(vm.name)}/${isRemote && vm.host_id ? `?host_id=${encodeURIComponent(vm.host_id)}` : ''}`) }}>Open console →</a>
                 </div>
               </article>
             )
@@ -248,6 +303,7 @@ export default function Portal({ user, onSignout }) {
         <span>Beta · use at your own risk</span>
         <a href="https://techexplore.us/EpicVM/" onClick={(e) => { e.preventDefault(); window.location.assign('/EpicVM/') }}>Back to home</a>
       </footer>
+      <EpiChat />
     </div>
   )
 }

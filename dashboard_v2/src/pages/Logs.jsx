@@ -10,6 +10,8 @@ export default function Logs(){
   const [running, setRunning] = useState(true)
   const [filterText, setFilterText] = useState('')
   const [limit, setLimit] = useState(500)
+  const [jev, setJev] = useState(null)
+  const [jevBusy, setJevBusy] = useState(false)
   const ivRef = useRef(null)
 
   async function loadVms(){
@@ -65,6 +67,17 @@ export default function Logs(){
     URL.revokeObjectURL(url)
   }
 
+  async function analyzeLogs(){
+    setJevBusy(true)
+    try{
+      const r = await apiFetch('/jev/analyze', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task:'log_triage', state:{source, vm:selectedVm, logs:logs.slice(-24000)}})})
+      const body = await r.json().catch(()=>({}))
+      if(!r.ok || !body.ok) throw new Error(body.error || 'Jev analysis failed')
+      setJev(body.advisory)
+    }catch(error){ setJev({error:String(error)}) }
+    setJevBusy(false)
+  }
+
   return (
     <div>
       <h1 style={{marginTop:0}}>Logs Viewer</h1>
@@ -92,6 +105,7 @@ export default function Logs(){
             <Button onClick={()=>setRunning(r=>!r)}>{running ? 'Pause' : 'Resume'}</Button>
             <Button onClick={()=>{ setLogs(''); }}>Clear</Button>
             <Button onClick={downloadLogs}>Download</Button>
+            <Button disabled={jevBusy || !logs.trim()} onClick={analyzeLogs}>{jevBusy ? 'Analyzing…' : 'Analyze with Jev'}</Button>
           </div>
         </div>
 
@@ -100,6 +114,7 @@ export default function Logs(){
             <pre style={{whiteSpace:'pre-wrap',margin:0}}>{logs}</pre>
           </div>
         </div>
+        {jev && <div className="glass-card" style={{marginTop:12,borderLeft:'3px solid #02bdf3'}}><strong>Jev log advisory</strong><p style={{color:'var(--muted)',fontSize:12}}>Read-only prioritization. Raw logs and deterministic status remain authoritative.</p>{jev.error ? <p>{jev.error}</p> : <div style={{display:'flex',gap:10,flexWrap:'wrap'}}>{Object.entries(jev.answers||{}).map(([key,answer])=><span key={key} style={{padding:'8px 10px',border:'1px solid rgba(255,255,255,.1)',borderRadius:7}}><b>{key.replaceAll('_',' ')}</b>: {String(answer.choice ?? (answer.score !== undefined ? Number(answer.score).toFixed(1) : `${Math.round(Number(answer.noul||0)*100)}%`))}</span>)}</div>}</div>}
       </div>
     </div>
   )

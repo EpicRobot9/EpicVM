@@ -1,0 +1,16 @@
+# Host-seat browser defaults on the deployed Moonlight Web release.
+ARG BASE_IMAGE=mrcreativ3001/moonlight-web-stream@sha256:4ee561ec4043526e93b0b3dba4926031c86ee3c9dab0333475a6b3c7117c701a
+FROM ${BASE_IMAGE} AS upstream
+
+FROM python:3.13-slim AS patcher
+USER root
+COPY --from=upstream /moonlight-web/static/default_settings.js /tmp/default_settings.js
+COPY patch_defaults.py /tmp/patch_defaults.py
+RUN cp /tmp/default_settings.js /tmp/default_settings-edit.js && \
+    python /tmp/patch_defaults.py /tmp/default_settings-edit.js
+
+FROM ${BASE_IMAGE}
+USER root
+COPY --from=patcher /tmp/default_settings-edit.js /moonlight-web/static/default_settings.js
+RUN chown 999:999 /moonlight-web/static/default_settings.js
+USER 999:999

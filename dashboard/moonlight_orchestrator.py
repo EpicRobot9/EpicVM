@@ -4,11 +4,14 @@ The bundle is intentionally smaller than the legacy Guacamole bundle.  The
 Moonlight Web database contains only its own client keys and safe host/user
 metadata.  Sunshine credentials are accepted by :meth:`pair_staged` for one
 request, used for the official Sunshine pairing API, and never written to the
-bundle, compose file, process arguments, or logs.
+bundle, compose file, process arguments, or logs. Optional TURN credentials
+are deployment secrets used to build the protected server config for browser
+media relay.
 """
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -18,7 +21,7 @@ import socket
 import ssl
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib import error as urlerror, request as urlrequest
@@ -36,6 +39,14 @@ DEFAULT_MOONLIGHT_IMAGE = "mrcreativ3001/moonlight-web-stream@sha256:82cf429ffea
 MOONLIGHT_PAIR_DEVICE_NAME = "EpicVMWeb"
 WEBRTC_PORT_MIN = 41000
 WEBRTC_PORT_MAX = 41010
+
+
+def _webrtc_port_range(name: str) -> tuple[int, int]:
+    """Keep the physical-PC proxy off the VM proxy's published UDP range."""
+    safe = validate_vm_name(name)
+    if safe.startswith("cloudpc-"):
+        return WEBRTC_PORT_MAX + 1, WEBRTC_PORT_MAX + 11
+    return WEBRTC_PORT_MIN, WEBRTC_PORT_MAX
 
 
 def validate_vm_name(name: str) -> str:
@@ -71,21 +82,43 @@ def validate_webrtc_nat_host(address: Any) -> str:
     value = _strip_shell_quotes(address)
     if not value:
         return ""
-    if not TAILSCALE_IP_RE.fullmatch(value):
-        raise ConsoleOrchestrationError(
-            "The Moonlight WebRTC NAT host must be a Tailscale IPv4 address.",
-            status=503,
-            code="invalid_moonlight_nat_host",
-        )
     try:
-        socket.inet_aton(value)
-    except OSError as exc:
+        parsed = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError as exc:
         raise ConsoleOrchestrationError(
             "The Moonlight WebRTC NAT host is invalid.",
             status=503,
             code="invalid_moonlight_nat_host",
         ) from exc
+    # A console can deliberately advertise either the KVM host's tailnet
+    # address for private-only access or its public address for Internet
+    # clients. Reject every other non-routable address so an accidental LAN,
+    # loopback, or link-local value cannot silently strand remote browsers.
+    public_unicast = parsed.is_global and not (parsed.is_multicast or parsed.is_reserved or parsed.is_unspecified)
+    if not TAILSCALE_IP_RE.fullmatch(value) and not public_unicast:
+        raise ConsoleOrchestrationError(
+            "The Moonlight WebRTC NAT host must be a Tailscale or public IPv4 address.",
+            status=503,
+            code="invalid_moonlight_nat_host",
+        )
     return value
+
+
+def _turn_urls(value: Any) -> list[str]:
+    """Return TURN URLs in the syntax accepted by the bundled ICE client."""
+    urls = []
+    for item in str(value or '').split(','):
+        url = item.strip()
+        if not url:
+            continue
+        if not re.fullmatch(r'turns?:[A-Za-z0-9][A-Za-z0-9._:-]*', url):
+            raise ConsoleOrchestrationError(
+                'The Moonlight TURN URL is invalid.',
+                status=503,
+                code='invalid_moonlight_turn_url',
+            )
+        urls.append(url)
+    return urls
 
 
 @dataclass(frozen=True)
@@ -96,6 +129,7 @@ class MoonlightPlan:
     compose: str
     config: str
     data: str
+    sunshine_port: int = 47989
 
 
 class MoonlightOrchestrator:
@@ -130,6 +164,17 @@ class MoonlightOrchestrator:
         self.router_priority = str(router_priority or os.environ.get("EPICVM_TRAEFIK_ROUTER_PRIORITY", "")).strip()
         nat_value = webrtc_nat_host if webrtc_nat_host is not None else os.environ.get("EPICVM_MOONLIGHT_NAT_HOST", "")
         self.webrtc_nat_host = validate_webrtc_nat_host(nat_value)
+        self.webrtc_turn_urls = _turn_urls(os.environ.get('EPICVM_MOONLIGHT_TURN_URLS', ''))
+        self.webrtc_turn_username = _strip_shell_quotes(os.environ.get('EPICVM_MOONLIGHT_TURN_USERNAME', ''))
+        self.webrtc_turn_credential = _strip_shell_quotes(os.environ.get('EPICVM_MOONLIGHT_TURN_CREDENTIAL', ''))
+        if any((self.webrtc_turn_urls, self.webrtc_turn_username, self.webrtc_turn_credential)) and not all(
+            (self.webrtc_turn_urls, self.webrtc_turn_username, self.webrtc_turn_credential)
+        ):
+            raise ConsoleOrchestrationError(
+                'Moonlight TURN configuration requires URLs, username, and credential together.',
+                status=503,
+                code='moonlight_turn_config_required',
+            )
         self.digests = dict(digests or {})
         self.tcp_probe = tcp_probe or self._tcp_probe
         self.disk_probe = disk_probe or self._disk_ready
@@ -245,24 +290,35 @@ class MoonlightOrchestrator:
     def _project_name(name: str) -> str:
         return f"epicvm-{validate_vm_name(name).replace('.', '-')}-moonlight"
 
-    def build_config(self, *, name: str, route_name: str | None = None) -> str:
+    def build_config(self, *, name: str, route_name: str | None = None, ports: tuple[int, int] | None = None, sunshine_port: int = 47989) -> str:
         safe = validate_vm_name(name)
         route = validate_vm_name(route_name or name)
+        port_min, port_max = ports or _webrtc_port_range(safe)
         nat_1to1 = {"ice_candidate_type": "host", "ips": [self.webrtc_nat_host]} if self.webrtc_nat_host else None
+        ice_servers = [
+            {"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:3478"], "username": "", "credential": ""}
+        ]
+        if self.webrtc_turn_urls and self.webrtc_turn_username and self.webrtc_turn_credential:
+            ice_servers.append({
+                "urls": self.webrtc_turn_urls,
+                "username": self.webrtc_turn_username,
+                "credential": self.webrtc_turn_credential,
+            })
         value = {
             "data_storage": {"type": "json", "path": "server/data.json", "session_expiration_check_interval": {"secs": 300, "nanos": 0}},
-            "webrtc": {"ice_servers": [{"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:3478"], "username": "", "credential": ""}], "ice_server_script": None, "port_range": {"min": WEBRTC_PORT_MIN, "max": WEBRTC_PORT_MAX}, "nat_1to1": nat_1to1, "network_types": ["udp4"], "include_loopback_candidates": False},
+            "webrtc": {"ice_servers": ice_servers, "ice_server_script": None, "port_range": {"min": port_min, "max": port_max}, "nat_1to1": nat_1to1, "network_types": ["udp4"], "include_loopback_candidates": False},
             "web_server": {"bind_address": "0.0.0.0:8080", "url_path_prefix": f"/vm/{route}", "session_cookie_secure": True, "session_cookie_expiration": {"secs": 86400, "nanos": 0}, "first_login_create_admin": True, "first_login_assign_global_hosts": True, "default_user_id": None, "default_role_id": None, "forwarded_header": {"username_header": "X-EpicVM-User", "auto_create_missing_user": True, "ignore_case": True}},
-            "moonlight": {"default_http_port": 47989, "pair_device_name": MOONLIGHT_PAIR_DEVICE_NAME},
+            "moonlight": {"default_http_port": sunshine_port, "pair_device_name": MOONLIGHT_PAIR_DEVICE_NAME},
             "streamer_path": "./streamer",
             "log": {"level_filter": "INFO", "file_path": None, "dev_venator": False},
             "default_settings": None,
         }
         return json.dumps(value, separators=(",", ":")) + "\n"
 
-    def build_compose(self, *, name: str, route_name: str | None = None) -> str:
+    def build_compose(self, *, name: str, route_name: str | None = None, ports: tuple[int, int] | None = None) -> str:
         safe = validate_vm_name(name)
         route = validate_vm_name(route_name or name)
+        port_min, port_max = ports or _webrtc_port_range(safe)
         public_host, resolver, priority = self._routing_config()
         image = self._image()
         # Console authentication is per-VM and must go through the dashboard's
@@ -298,13 +354,14 @@ class MoonlightOrchestrator:
         return f'''services:
   moonlight-web:
     image: {_yaml_quote(image)}
+    init: true
     restart: unless-stopped
     environment:
       BIND_ADDRESS: "0.0.0.0:8080"
       PATH_PREFIX: "/vm/{route}"
-      WEBRTC_PORT_RANGE: "{WEBRTC_PORT_MIN}:{WEBRTC_PORT_MAX}"
+      WEBRTC_PORT_RANGE: "{port_min}:{port_max}"
 {nat_environment}    ports:
-      - "{WEBRTC_PORT_MIN}-{WEBRTC_PORT_MAX}:{WEBRTC_PORT_MIN}-{WEBRTC_PORT_MAX}/udp"
+      - "{port_min}-{port_max}:{port_min}-{port_max}/udp"
     volumes:
       - ./server:/moonlight-web/server
     networks:
@@ -325,7 +382,7 @@ networks:
     driver: bridge
 '''
 
-    def _wait_for_sunshine(self, guest_ip: str, *, timeout: float = 30.0) -> None:
+    def _wait_for_sunshine(self, guest_ip: str, *, timeout: float = 30.0, sunshine_port: int = 47989) -> None:
         """Wait through the bounded guest-service restart window.
 
         A VM restart can leave RDP/WinRM reachable while Sunshine is still
@@ -337,7 +394,7 @@ networks:
         deadline = time.monotonic() + max(0.0, float(timeout))
         while True:
             missing = [
-                port for port in (47989, 47990)
+                port for port in (sunshine_port, sunshine_port + 1)
                 if not self.tcp_probe(str(guest_ip), port, 2.0)
             ]
             if not missing:
@@ -358,11 +415,14 @@ networks:
         guest_ip: str,
         route_name: str | None = None,
         allow_existing_owned_route: bool = False,
+        sunshine_port: int = 47989,
     ) -> MoonlightPlan:
         safe = validate_vm_name(name)
         route = validate_vm_name(route_name or name)
         address = validate_guest_ip(guest_ip)
-        self._wait_for_sunshine(address)
+        if not 1024 <= int(sunshine_port) <= 65534:
+            raise ConsoleOrchestrationError("Invalid stream port.", status=400, code="invalid_stream_port")
+        self._wait_for_sunshine(address, sunshine_port=int(sunshine_port))
         route_prefix = f"/vm/{route}/"
         if not self.route_owner_probe(route_prefix):
             existing_owned_bundle = False
@@ -378,7 +438,7 @@ networks:
                     existing_owned_bundle = False
             if not existing_owned_bundle:
                 raise ConsoleOrchestrationError("The requested console route is already owned.", status=409, code="route_collision")
-        return MoonlightPlan(safe, address, route_prefix, self.build_compose(name=safe, route_name=route), self.build_config(name=safe, route_name=route), '{"version":"3","users":{},"hosts":{},"roles":{}}\n')
+        return MoonlightPlan(safe, address, route_prefix, self.build_compose(name=safe, route_name=route), self.build_config(name=safe, route_name=route, sunshine_port=int(sunshine_port)), '{"version":"3","users":{},"hosts":{},"roles":{}}\n', int(sunshine_port))
 
     def stage_plan(self, plan: MoonlightPlan) -> Path:
         target = self._instance_root(plan.name)
@@ -391,6 +451,14 @@ networks:
         if not self.route_owner_probe(plan.route_prefix):
             raise ConsoleOrchestrationError("The requested console route is already owned.", status=409, code="route_collision")
         target.parent.mkdir(parents=True, exist_ok=True)
+        # Reserve atomically across dashboard workers, including stopped bundles.
+        # Keep reservations during quarantine so repair/restart cannot steal a
+        # different console's ports. Legacy bundles are discovered from config.
+        ports = self._reserve_webrtc_ports(plan.name)
+        route = plan.route_prefix.strip('/').split('/')[-1]
+        plan = replace(plan,
+                       compose=self.build_compose(name=plan.name, route_name=route, ports=ports),
+                       config=self.build_config(name=plan.name, route_name=route, ports=ports, sunshine_port=plan.sunshine_port))
         # The pinned image runs as uid/gid 999.  Keep the bundle private from
         # ordinary users while allowing only that service account to traverse
         # and update Moonlight's client-key database.
@@ -407,7 +475,7 @@ networks:
             server.mkdir(mode=0o700)
             (server / "config.json").write_text(plan.config, encoding="utf-8")
             (server / "data.json").write_text(plan.data, encoding="utf-8")
-            (stage / "plan.json").write_text(json.dumps({"owner": "EpicVM", "version": 1, "backend": "moonlight", "name": plan.name, "guestIp": plan.guest_ip, "routePrefix": plan.route_prefix, "paired": False}, separators=(",", ":")), encoding="utf-8")
+            (stage / "plan.json").write_text(json.dumps({"owner": "EpicVM", "version": 1, "backend": "moonlight", "name": plan.name, "guestIp": plan.guest_ip, "sunshinePort": plan.sunshine_port, "routePrefix": plan.route_prefix, "paired": False}, separators=(",", ":")), encoding="utf-8")
             os.chmod(stage / "docker-compose.yml", 0o600)
             os.chmod(server, 0o750)
             os.chmod(server / "config.json", 0o640)
@@ -443,7 +511,46 @@ networks:
         except Exception as exc:
             raise ConsoleOrchestrationError("The named console instance is not owned by EpicVM.", status=403, code="ownership_required") from exc
 
+    def _reserve_webrtc_ports(self, name: str) -> tuple[int, int]:
+        safe = validate_vm_name(name)
+        reservations = self.root / '.webrtc-ports'
+        reservations.mkdir(mode=0o700, exist_ok=True)
+        occupied = set()
+        for config_path in self.root.glob('*/server/config.json'):
+            if config_path.parent.parent.name == safe or config_path.parent.parent.name.startswith('.'):
+                continue
+            try:
+                ports = json.loads(config_path.read_text(encoding='utf-8'))['webrtc']['port_range']
+                occupied.update(range(int(ports['min']), int(ports['max']) + 1))
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise ConsoleOrchestrationError('Console port ownership could not be verified.', status=503, code='console_port_probe_failed') from exc
+        preferred, _ = _webrtc_port_range(safe)
+        for reservation in reservations.iterdir():
+            if reservation.name.isdigit() and reservation.read_text(encoding='utf-8') == safe:
+                start = int(reservation.name)
+                if not occupied.intersection(range(start, start + 11)):
+                    return start, start + 10
+        for start in [preferred, *range(WEBRTC_PORT_MIN, 65525, 11)]:
+            end = start + 10
+            if occupied.intersection(range(start, end + 1)):
+                continue
+            reservation = reservations / str(start)
+            try:
+                with reservation.open('x', encoding='utf-8') as handle:
+                    handle.write(safe)
+                return start, end
+            except FileExistsError:
+                if reservation.read_text(encoding='utf-8') == safe:
+                    return start, end
+        raise ConsoleOrchestrationError('No streaming UDP port range is available.', status=503, code='console_ports_exhausted')
+
+    def _staged_webrtc_ports(self, name: str) -> tuple[int, int]:
+        config = json.loads((self._instance_root(name) / 'server' / 'config.json').read_text(encoding='utf-8'))
+        ports = config['webrtc']['port_range']
+        return int(ports['min']), int(ports['max'])
+
     def _runtime_isolated(self, name: str) -> bool:
+        safe = validate_vm_name(name)
         project = self._project_name(name)
         try:
             listed = self.command_runner(["docker", "ps", "--filter", f"label=com.docker.compose.project={project}", "-q"], check=True, capture_output=True, text=True)
@@ -456,7 +563,8 @@ networks:
             if str(labels.get("com.docker.compose.service") or "") != "moonlight-web":
                 return False
             ports = (((record or {}).get("HostConfig") or {}).get("PortBindings") or {})
-            expected_ports = {f"{port}/udp" for port in range(WEBRTC_PORT_MIN, WEBRTC_PORT_MAX + 1)}
+            port_min, port_max = self._staged_webrtc_ports(safe)
+            expected_ports = {f"{port}/udp" for port in range(port_min, port_max + 1)}
             if set(str(key) for key in ports) != expected_ports:
                 return False
             for container_port, mappings in ports.items():
@@ -497,7 +605,7 @@ networks:
     def start_staged(self, name: str) -> dict[str, Any]:
         plan = self._read_plan(name)
         target = self._instance_root(name)
-        self._wait_for_sunshine(str(plan["guestIp"]), timeout=30.0)
+        self._wait_for_sunshine(str(plan["guestIp"]), timeout=30.0, sunshine_port=int(plan.get("sunshinePort") or 47989))
         try:
             self.command_runner(["docker", "compose", "-p", self._project_name(name), "up", "-d", "--wait", "--wait-timeout", "90"], cwd=str(target), check=True, capture_output=True, text=True)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -574,11 +682,11 @@ networks:
             raise ConsoleOrchestrationError("Moonlight returned an invalid guest host id.", status=502, code="moonlight_host_failed")
         return host_id
 
-    def _register_host(self, base: str, user: str, guest_ip: str) -> int:
+    def _register_host(self, base: str, user: str, guest_ip: str, sunshine_port: int = 47989) -> int:
         for host in self._hosts(base, user):
-            if str(host.get("address") or "") == guest_ip and str(host.get("http_port") or "47989") == "47989":
+            if str(host.get("address") or "") == guest_ip and str(host.get("http_port") or "47989") == str(sunshine_port):
                 return self._coerce_host_id(host.get("host_id"))
-        body = json.dumps({"address": guest_ip, "http_port": 47989}, separators=(",", ":")).encode("utf-8")
+        body = json.dumps({"address": guest_ip, "http_port": sunshine_port}, separators=(",", ":")).encode("utf-8")
         response = self._http("POST", base + "/api/host", headers={"Content-Type": "application/json", "X-EpicVM-User": user}, body=body, timeout=15)
         try:
             raw = response.read()
@@ -656,7 +764,7 @@ networks:
                 except Exception:
                     pass
 
-    def _sunshine_pair(self, guest_ip: str, username: str, password: str, pin: str, vm_name: str) -> None:
+    def _sunshine_pair(self, guest_ip: str, username: str, password: str, pin: str, vm_name: str, sunshine_port: int = 47989) -> None:
         if not username or not password:
             raise ConsoleOrchestrationError("Sunshine credentials are required for pairing.", status=400, code="sunshine_credentials_required")
         raw = f"{username}:{password}".encode("utf-8")
@@ -672,7 +780,7 @@ networks:
             try:
                 response = self._http(
                     "POST",
-                    f"https://{guest_ip}:47990/api/pin",
+                    f"https://{guest_ip}:{sunshine_port + 1}/api/pin",
                     headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
                     body=body,
                     timeout=min(5.0, remaining),
@@ -683,9 +791,10 @@ networks:
                     payload = json.loads(text)
                 except (TypeError, ValueError, json.JSONDecodeError) as exc:
                     raise ConsoleOrchestrationError("Sunshine returned an invalid pairing response.", status=502, code="sunshine_pair_failed") from exc
-                if isinstance(payload, dict) and payload.get("status") is True:
+                status = payload.get("status") if isinstance(payload, dict) else None
+                if status is True or str(status).strip().lower() == "true":
                     return
-                if not (isinstance(payload, dict) and payload.get("status") is False):
+                if status is not False and str(status).strip().lower() != "false":
                     raise ConsoleOrchestrationError("Sunshine did not accept the pairing request.", status=502, code="sunshine_pair_failed")
             except urlerror.HTTPError as exc:
                 code = "sunshine_auth_failed" if int(exc.code) in (401, 403) else "sunshine_pair_failed"
@@ -733,7 +842,8 @@ networks:
                 status=409,
                 code="moonlight_stale_bundle",
             )
-        self._wait_for_sunshine(guest, timeout=30.0)
+        sunshine_port = int(plan.get("sunshinePort") or 47989)
+        self._wait_for_sunshine(guest, timeout=30.0, sunshine_port=sunshine_port)
         base = self._container_url(safe, str(plan.get("routePrefix") or expected_prefix))
         user = validate_vm_name(safe)
         # /api/hosts exposes paired state but not always the guest address.
@@ -745,7 +855,7 @@ networks:
             paired = str(record.get("paired") or "").strip().lower() == "paired"
             address = str(record.get("address") or "").strip()
             port = str(record.get("http_port") or "47989").strip()
-            if paired or (address == guest and port == "47989"):
+            if paired or (address == guest and port == str(sunshine_port)):
                 try:
                     candidate = self._coerce_host_id(record.get("host_id"))
                 except ConsoleOrchestrationError:
@@ -777,11 +887,12 @@ networks:
             "guestTcpVerified": True,
         }
 
-    def pair_staged(self, name: str, *, sunshine_username: str, sunshine_password: str) -> dict[str, Any]:
+    def pair_staged(self, name: str, *, sunshine_username: str = '', sunshine_password: str = '', pin_submitter: Callable[[str], Any] | None = None) -> dict[str, Any]:
         plan = self._read_plan(name)
         base = self._container_url(name, str(plan.get("routePrefix") or ""))
         user = validate_vm_name(name)
-        host_id = self._register_host(base, user, str(plan["guestIp"]))
+        sunshine_port = int(plan.get("sunshinePort") or 47989)
+        host_id = self._register_host(base, user, str(plan["guestIp"]), sunshine_port)
         if not host_id:
             raise ConsoleOrchestrationError("Moonlight did not return a guest host id.", status=502, code="moonlight_host_failed")
         if plan.get("paired") is True:
@@ -796,7 +907,10 @@ networks:
                 pin = str(first.get("Pin") or "") if isinstance(first, dict) else ""
                 if not pin:
                     raise ConsoleOrchestrationError("Moonlight did not provide a pairing PIN.", status=502, code="moonlight_pair_failed")
-                self._sunshine_pair(str(plan["guestIp"]), str(sunshine_username), str(sunshine_password), pin, str(plan["name"]))
+                if pin_submitter is not None:
+                    pin_submitter(pin)
+                else:
+                    self._sunshine_pair(str(plan["guestIp"]), str(sunshine_username), str(sunshine_password), pin, str(plan["name"]), sunshine_port)
                 second = self._json_line(response)
                 paired = isinstance(second, dict) and str(second.get("Paired") or "")
                 if not paired:
@@ -905,7 +1019,8 @@ networks:
         though the container is healthy.  A bounded container restart gives
         the next client a fresh WebRTC endpoint without rebuilding the paired
         bundle or touching VM, guest, or claim state.  This is a stream-start
-        recovery action only: readiness still requires real frame evidence.
+        recovery action only: readiness still requires the agent's automated
+        capture, transport, route, and stream checks.
         """
         safe = validate_vm_name(name)
         route = validate_vm_name(route_name or safe)

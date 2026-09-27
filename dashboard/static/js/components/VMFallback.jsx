@@ -212,7 +212,7 @@
                   className:'btn btn-secondary',
                   onClick: ()=>attemptRecover(recovery.startsWith('protected-') ? 'Cautious recovery requested for protected VM from dashboard' : 'Manual recovery requested from dashboard', false)
                 }, recovery.startsWith('protected-') ? 'Cautious recovery' : 'Try recovery'),
-                React.createElement('button', { className:'btn btn-secondary', onClick: ()=>{ window.location.href = '/portal'; } }, 'Open Portal'),
+                React.createElement('button', { className:'btn btn-secondary', onClick: ()=>{ window.location.href = '/EpicVM/portal'; } }, 'Open Portal'),
                 React.createElement('button', { className:'btn btn-ghost', onClick: ()=>window.location.reload() }, 'Refresh')
               ),
               errorMsg && React.createElement('div', { className:'error-box' },

@@ -113,3 +113,30 @@ The kvm2 console plan is source-only here. It requires digest-pinned
 Guacamole, guacd, and PostgreSQL images, keeps database/guacd internal, puts
 only Guacamole on the existing proxy network with dashboard ForwardAuth, and
 refuses to start until kvm2 can reach the guest on TCP 3389.
+
+### Experimental Omarchy + AMD GPU-P profile
+
+Omarchy is a separate, disabled-by-default profile. It is remote Hyper-V only,
+uses the pinned Omarchy v3.8.3 ISO, and requires an AMD GPU-P partition,
+Tailscale SSH, accelerated guest rendering, Hyprland/Wayland, and Sunshine
+hardware encoding. The Microsoft GPU-P support matrix does not list Arch or
+Omarchy, so a VM is never marked ready merely because Hyper-V reports it as
+running.
+
+The source-only builder is plan-only unless `-Execute` is supplied. It creates
+a disposable Gen2 builder on an existing NAT or external Hyper-V switch with
+Internet egress (the default is `Default Switch`), uses a removable `cidata`
+seed, requires the operator to run the bundled sanitation script, and publishes
+a standalone Dynamic VHDX with its SHA-256 in `manifest.json`:
+
+```powershell
+.\scripts\Build-EpicVMOmarchyTemplate.ps1
+.\scripts\Build-EpicVMOmarchyTemplate.ps1 -Execute
+```
+
+The build must remain outside normal service operation until the separate pilot
+proves AMD rendering, Sunshine hardware encoding, Tailscale SSH, Moonlight
+video/audio/input, and reboot recovery. Enable the dashboard option only after
+the host config contains the validated manifest and the explicit
+`OmarchyPilotValidated` / `EnableOmarchyProvisioning` gates are intentionally
+enabled.

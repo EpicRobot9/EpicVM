@@ -231,6 +231,23 @@ Describe 'EpicVM agent shared games endpoint' {
         $response.Body.ok | Should -BeTrue
         $response.Body.games | Should -BeNullOrEmpty
     }
+
+    It 'marks unresolvable UNC exes unavailable without probing the network path' {
+        $config = Get-EpicVMDefaultConfig
+        $config.Provider = 'Mock'
+        $config.CatalogPath = Join-Path (Get-PSDrive TestDrive).Root 'unc-catalog.json'
+        Set-Content -LiteralPath $config.CatalogPath -Value '{"library":"test","version":2,"games":[{"id":"u1","title":"Unc Game","platform":"windows","version":"1","exe":"\\\\no-such-host-epicvm\\share$\\games\\g.exe"}]}' -Encoding UTF8
+
+        $state = New-EpicVMAgentState -Config $config -Token 'test-secret-token' -Provider (New-TestProvider)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $response = Invoke-EpicVMApiRequest -State $state -Method 'GET' -Path '/v1/games' -Headers @{ Authorization = 'Bearer test-secret-token' }
+        $sw.Stop()
+
+        $response.StatusCode | Should -Be 200
+        $response.Body.games.Count | Should -Be 1
+        $response.Body.games[0].available | Should -BeFalse
+        ($sw.ElapsedMilliseconds -lt 15000) | Should -BeTrue
+    }
 }
 
 Describe 'EpicVM tailscale stale device sweep' {

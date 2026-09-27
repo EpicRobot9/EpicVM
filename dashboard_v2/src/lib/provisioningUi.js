@@ -1,4 +1,4 @@
-export const PROVISIONING_STATES = ['queued','cloning','booting','unclaimed','claim_in_progress','guest_setup','network_setup','management_handoff','gaming_gpu_validation','streaming_setup','stream_validation','ready']
+export const PROVISIONING_STATES = ['queued','cloning','booting','unclaimed','claim_in_progress','guest_setup','network_setup','management_handoff','gaming_gpu_validation','omarchy_gpu_validation','streaming_setup','stream_validation','ready']
 export const PROVISIONING_MODES = ['automatic','claim']
 
 export function canClaimProvisioningJob(job){
@@ -35,7 +35,7 @@ export function provisioningCreatePayload({ hostId, name, profile = 'standard', 
     profile:safeProfile,
     mode:safeMode,
   }
-  if(safeProfile === 'gaming'){
+  if(safeProfile === 'gaming' || safeProfile === 'omarchy'){
     payload.cpuCount = normalizeGamingInteger(cpuCount, 6, 1, 16)
     payload.memoryGiB = normalizeGamingInteger(memoryGiB, 12, 1, 16)
     payload.diskSizeGiB = normalizeGamingInteger(diskSizeGiB, 128, 1, 512)
@@ -64,6 +64,7 @@ export function provisioningClaimPayload({ hostId, username, password, claimToke
 
 export function provisioningFailureReason(job){
   const code = String(job?.errorCode || '').trim().toLowerCase()
+  const isOmarchy = String(job?.profile || '').trim().toLowerCase() === 'omarchy'
   const reasons = {
     bootstrap_credential_unavailable: 'The machine bootstrap channel was unavailable.',
     bootstrap_readiness_unavailable: 'The host lacks the secure guest-readiness check.',
@@ -81,8 +82,8 @@ export function provisioningFailureReason(job){
     claim_in_progress: 'Another request already owns this claim.',
     claim_atomic_commit_failed: 'The claim could not be committed safely; no guest work was started.',
     guest_configuration_unavailable: 'The secure guest configuration channel is unavailable; no claim was consumed.',
-    guest_account_failed: 'Windows guest-account setup failed after the claim was consumed.',
-    guest_account_readiness_failed: 'The desired Windows account did not pass readiness verification.',
+    guest_account_failed: isOmarchy ? 'Linux guest-account setup failed after the claim was consumed.' : 'Windows guest-account setup failed after the claim was consumed.',
+    guest_account_readiness_failed: isOmarchy ? 'The desired Linux account did not pass readiness verification.' : 'The desired Windows account did not pass readiness verification.',
     bootstrap_cleanup_failed: 'Guest bootstrap cleanup did not verify.',
     bootstrap_cleanup_transport_failed: 'The guest bootstrap cleanup channel failed.',
     tailscale_enrollment_failed: 'Tailscale guest enrollment failed after guest setup.',
@@ -94,6 +95,18 @@ export function provisioningFailureReason(job){
     gaming_gpu_validation_failed: 'The GPU-P guest validation gate failed; the VM was retained for diagnosis.',
     gaming_encoder_unavailable: 'Sunshine did not report an AMD hardware encoder for the Gaming VM.',
     gaming_webgl_unavailable: 'The Gaming guest did not report WebGL hardware acceleration.',
+    omarchy_not_validated: 'Omarchy Linux remains experimental until the pinned image, AMD GPU-P path, and accelerated guest pilot are verified.',
+    omarchy_provisioning_unavailable: 'Omarchy Linux provisioning is unavailable on this host.',
+    omarchy_template_invalid: 'The pinned Omarchy Linux template manifest failed validation.',
+    omarchy_bootstrap_not_ready: 'The Omarchy Linux guest did not become reachable over Tailscale SSH.',
+    omarchy_guest_configuration_unavailable: 'The Omarchy Linux guest configuration transport is unavailable.',
+    omarchy_guest_configuration_failed: 'Omarchy Linux guest configuration failed at the secure setup gate.',
+    omarchy_gpu_validation_failed: 'Omarchy accelerated rendering did not pass the AMD GPU-P guest validation gate.',
+    omarchy_guest_validation_unavailable: 'The Omarchy AMD GPU and renderer validation channel is unavailable.',
+    omarchy_encoder_unavailable: 'Sunshine did not report a working hardware encoder in Omarchy Linux.',
+    omarchy_sunshine_configuration_failed: 'Sunshine hardware encoding could not be configured in Omarchy Linux.',
+    omarchy_bootstrap_cleanup_failed: 'Omarchy Linux bootstrap cleanup did not verify; readiness was withheld.',
+    omarchy_network_recovery_failed: 'Omarchy Linux Tailscale SSH recovery stopped safely; the VM was retained for diagnosis.',
      streaming_setup_failed: 'Moonlight/Sunshine setup failed after guest and network setup.',
      sunshine_invalid_input: 'The Sunshine credential input was rejected before guest setup.',
      sunshine_service_missing: 'The retained guest does not have the pinned Sunshine service.',
@@ -119,11 +132,11 @@ export function provisioningFailureReason(job){
   if(code === 'guest_account_failed'){
     const detail = String(job?.failureDetailCode || '').trim().toLowerCase()
     const detailReasons = {
-      account_create_failed: 'The requested Windows account could not be created.',
-      account_update_failed: 'The requested Windows account could not be updated.',
-      account_password_policy_failed: 'Windows rejected the password under its local policy.',
-      admin_membership_failed: 'Administrator membership could not be verified.',
-      account_verification_failed: 'The requested Windows account could not be verified after setup.',
+      account_create_failed: isOmarchy ? 'The requested Linux account could not be created.' : 'The requested Windows account could not be created.',
+      account_update_failed: isOmarchy ? 'The requested Linux account could not be updated.' : 'The requested Windows account could not be updated.',
+      account_password_policy_failed: isOmarchy ? 'Linux rejected the password under its local policy.' : 'Windows rejected the password under its local policy.',
+      admin_membership_failed: isOmarchy ? 'The Linux wheel membership could not be verified.' : 'Administrator membership could not be verified.',
+      account_verification_failed: isOmarchy ? 'The requested Linux account could not be verified after setup.' : 'The requested Windows account could not be verified after setup.',
     }
     if(detailReasons[detail]) return `${base} ${detailReasons[detail]}`
   }

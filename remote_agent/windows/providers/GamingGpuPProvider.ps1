@@ -481,7 +481,7 @@ function Resolve-EpicVMGamingGpuDriverSourcePaths {
 
 function Get-EpicVMGamingGuestValidationScript {
     return {
-        param($DeviceIdentity, $SunshineServiceName, $SunshineStatePaths)
+        param($DeviceIdentity, $SunshineServiceName, $SunshineStatePaths, [bool]$RequireEncoder=$true)
         $ErrorActionPreference = 'Stop'
         $errors = [System.Collections.Generic.List[string]]::new()
         $diagnostics = [ordered]@{}
@@ -650,18 +650,22 @@ function Get-EpicVMGamingGuestValidationScript {
         try {
             $service = Get-Service -Name ([string]$SunshineServiceName) -ErrorAction Stop
             $sunshineFiles = @($SunshineStatePaths) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) -and (Test-Path -LiteralPath $_ -PathType Leaf) }
-            $sunshineText = @($sunshineFiles | ForEach-Object { Get-Content -LiteralPath $_ -Raw -ErrorAction SilentlyContinue }) -join "`n"
             $logPaths = @(
                 'C:\ProgramData\Sunshine\config\sunshine.log',
                 'C:\Program Files\Sunshine\config\sunshine.log'
             ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
-            $sunshineText += "`n" + (@($logPaths | ForEach-Object { Get-Content -LiteralPath $_ -Tail 200 -ErrorAction SilentlyContinue }) -join "`n")
-            $encoderOk = ([string]$service.Status -ieq 'Running') -and ($sunshineText -match '(?i)(encoder\s*=\s*amf|\bAMF\b|AMD.*(encoder|hardware))')
+            # Discovery is logged at startup. Repeated host polls can push it
+            # out of a short tail before validation finishes. Stream the log
+            # for the actual successful discovery line without reading the
+            # credential-bearing Sunshine state into memory.
+            $encoderPattern='(?i)Found (H\.264|HEVC) encoder:\s*\w+_amf\s*\[amdvce\]'
+            $encoderFound=@($logPaths | Where-Object { Select-String -LiteralPath $_ -Pattern $encoderPattern -Quiet -ErrorAction SilentlyContinue }).Count -gt 0
+            $encoderOk = ([string]$service.Status -ieq 'Running') -and $encoderFound
             $diagnostics.sunshineServiceRunning = ([string]$service.Status -ieq 'Running')
             $diagnostics.sunshineStateFileCount = $sunshineFiles.Count
         }
         catch { $diagnostics.sunshineProbe = 'failed' }
-        if (-not $encoderOk) { $errors.Add('Sunshine did not report AMD hardware encoding.') }
+        if ($RequireEncoder -and -not $encoderOk) { $errors.Add('Sunshine did not report AMD hardware encoding.') }
 
         $failureDetailCode = $null
         $safeMarker = $null
@@ -671,7 +675,7 @@ function Get-EpicVMGamingGuestValidationScript {
             if ($webglHardwareOk) { $failureDetailCode = 'GAMING_GPU_FRAME' } else { $failureDetailCode = 'GAMING_GPU_WEBGL' }
             $safeMarker = 'EPICVM_GAMING_GPU_VALIDATION_FAILED'
         }
-        elseif (-not $encoderOk) { $failureDetailCode = 'GAMING_GPU_ENCODER'; $safeMarker = 'EPICVM_GAMING_ENCODER_UNAVAILABLE' }
+        elseif ($RequireEncoder -and -not $encoderOk) { $failureDetailCode = 'GAMING_GPU_ENCODER'; $safeMarker = 'EPICVM_GAMING_ENCODER_UNAVAILABLE' }
         return [ordered]@{
             ok = ($errors.Count -eq 0)
             displayOk = $displayOk

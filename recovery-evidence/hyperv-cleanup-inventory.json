@@ -1,0 +1,114 @@
+[
+  {
+    "Name": "astra-testmann",
+    "Id": "d542813d-04eb-441d-9043-c742e916fce8",
+    "State": "Running",
+    "Notes": "EpicVM-Managed: true\r\nEpicVM-Profile: gaming",
+    "Path": "E:\\EpicVM\\vms\\astra-testmann\\astra-testmann",
+    "ConfigurationLocation": "E:\\EpicVM\\vms\\astra-testmann\\astra-testmann",
+    "Disks": [
+      "E:\\EpicVM\\vms\\astra-testmann\\astra-testmann.vhdx"
+    ],
+    "Checkpoints": []
+  },
+  {
+    "Name": "EpicVM-CleanTemplateSource",
+    "Id": "d688f312-6a44-4190-8ff5-a7512efc4a5e",
+    "State": "Off",
+    "Notes": "EpicVM-CleanTemplateSource: true\nQuarantineUntil: 2026-08-18T17:20:21.9824990Z",
+    "Path": "E:\\EpicVM\\clean-template-source\\EpicVM-CleanTemplateSource",
+    "ConfigurationLocation": "E:\\EpicVM\\clean-template-source\\EpicVM-CleanTemplateSource",
+    "Disks": [
+      "E:\\EpicVM\\clean-template-source\\clean-source.vhdx"
+    ],
+    "Checkpoints": []
+  },
+  {
+    "Name": "epicvm-local-gaming-1",
+    "Id": "725d9f9c-bdc9-4c9c-89f3-4fa16f1a49d9",
+    "State": "Off",
+    "Notes": "EpicVM-Managed: true\r\nEpicVM-Profile: gaming",
+    "Path": "E:\\EpicVM\\vms\\epicvm-local-gaming-1\\epicvm-local-gaming-1",
+    "ConfigurationLocation": "E:\\EpicVM\\vms\\epicvm-local-gaming-1\\epicvm-local-gaming-1",
+    "Disks": [
+      "E:\\EpicVM\\vms\\epicvm-local-gaming-1\\epicvm-local-gaming-1.vhdx"
+    ],
+    "Checkpoints": []
+  },
+  {
+    "Name": "EpicVM-Omarchy-TemplateBuilder",
+    "Id": "315b35c3-dead-4e01-90f2-fce7f59240e4",
+    "State": "Off",
+    "Notes": "EpicVM-Omarchy-TemplateBuilder: true",
+    "Path": "E:\\EpicVM\\template-work\\omarchy-72076a960abb4de5ae86f59c20b04e3c\\EpicVM-Omarchy-TemplateBuilder",
+    "ConfigurationLocation": "E:\\EpicVM\\template-work\\omarchy-72076a960abb4de5ae86f59c20b04e3c\\EpicVM-Omarchy-TemplateBuilder",
+    "Disks": [
+      "E:\\EpicVM\\template-work\\omarchy-72076a960abb4de5ae86f59c20b04e3c\\omarchy-3.8.3-builder-recovered.vhdx",
+      "E:\\EpicVM\\template-work\\omarchy-72076a960abb4de5ae86f59c20b04e3c\\omarchy-3.8.3.cidata.vhdx"
+    ],
+    "Checkpoints": []
+  },
+  {
+    "Name": "gaming-e2e-0919",
+    "Id": "d9be8f7c-a8fd-403c-acc2-ae56c9cfcc78",
+    "State": "Running",
+    "Notes": "EpicVM-Managed: true\r\nEpicVM-Profile: gaming",
+    "Path": "E:\\EpicVM\\vms\\gaming-e2e-0919\\gaming-e2e-0919",
+    "ConfigurationLocation": "E:\\EpicVM\\vms\\gaming-e2e-0919\\gaming-e2e-0919",
+    "Disks": [
+      "E:\\EpicVM\\vms\\gaming-e2e-0919\\gaming-e2e-0919.vhdx"
+    ],
+    "Checkpoints": []
+  },
+  {
+    "Name": "indogaming",
+    "Id": "0c828c4c-cfda-4979-ab02-fae6c178e63a",
+    "State": "Running",
+    "Notes": "EpicVM-Managed: true\r\nEpicVM-Profile: gaming",
+    "Path": "E:\\EpicVM\\vms\\indogaming\\indogaming",
+    "ConfigurationLocation": "E:\\EpicVM\\vms\\indogaming\\indogaming",
+    "Disks": [
+      "E:\\EpicVM\\vms\\indogaming\\indogaming.vhdx"
+    ],
+    "Checkpoints": []
+  },
+  {
+    "Name": "prod-gaming-verify-1",
+    "Id": "b23705f7-3633-4580-ae0c-1f928a28d920",
+    "State": "Off",
+    "Notes": "EpicVM-Managed: true\r\nEpicVM-Profile: gaming",
+    "Path": "E:\\EpicVM\\vms\\prod-gaming-verify-1\\prod-gaming-verify-1",
+    "ConfigurationLocation": "E:\\EpicVM\\vms\\prod-gaming-verify-1\\prod-gaming-verify-1",
+    "Disks": [
+      "E:\\EpicVM\\vms\\prod-gaming-verify-1\\prod-gaming-verify-1.vhdx"
+    ],
+    "Checkpoints": []
+  },
+  {
+    "Name": "testre",
+    "Id": "e050ae4b-10e7-435e-9745-4b70059c7ec6",
+    "State": "Off",
+    "Notes": "EpicVM-Managed: true\nOS: Windows 11 Pro 25H2\nPurpose: browser RDP",
+    "Path": "E:\\EpicVM\\vms\\testre",
+    "ConfigurationLocation": "E:\\EpicVM\\vms\\testre",
+    "Disks": [
+      "E:\\EpicVM\\vms\\testre\\Virtual Hard Disks\\testre_9C6710CA-9DCA-483F-BAD8-5CCDE587FFEC.avhdx"
+    ],
+    "Checkpoints": [
+      "Automatic Checkpoint - testre - (8/9/2026 - 12:09:27 PM)",
+      "pre-gpup-20260809-160242"
+    ]
+  },
+  {
+    "Name": "Windows 11 dev environment",
+    "Id": "6e689095-25d6-4a05-9737-3e87585eaf9c",
+    "State": "Off",
+    "Notes": "",
+    "Path": "C:\\ProgramData\\Microsoft\\Windows\\Hyper-V",
+    "ConfigurationLocation": "C:\\ProgramData\\Microsoft\\Windows\\Hyper-V",
+    "Disks": [
+      "C:\\ProgramData\\Microsoft\\Windows\\Virtual Hard Disks\\Windows 11 dev environment.vhdx"
+    ],
+    "Checkpoints": []
+  }
+]

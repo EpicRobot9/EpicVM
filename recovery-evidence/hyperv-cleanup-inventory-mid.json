@@ -1,0 +1,39 @@
+[
+  {
+    "Name": "EpicVM-CleanTemplateSource",
+    "Id": "d688f312-6a44-4190-8ff5-a7512efc4a5e",
+    "State": "Off",
+    "Notes": "EpicVM-CleanTemplateSource: true\nQuarantineUntil: 2026-08-18T17:20:21.9824990Z",
+    "Path": "E:\\EpicVM\\clean-template-source\\EpicVM-CleanTemplateSource",
+    "ConfigurationLocation": "E:\\EpicVM\\clean-template-source\\EpicVM-CleanTemplateSource",
+    "Disks": [
+      "E:\\EpicVM\\clean-template-source\\clean-source.vhdx"
+    ],
+    "Checkpoints": []
+  },
+  {
+    "Name": "EpicVM-Omarchy-TemplateBuilder",
+    "Id": "315b35c3-dead-4e01-90f2-fce7f59240e4",
+    "State": "Off",
+    "Notes": "EpicVM-Omarchy-TemplateBuilder: true",
+    "Path": "E:\\EpicVM\\template-work\\omarchy-72076a960abb4de5ae86f59c20b04e3c\\EpicVM-Omarchy-TemplateBuilder",
+    "ConfigurationLocation": "E:\\EpicVM\\template-work\\omarchy-72076a960abb4de5ae86f59c20b04e3c\\EpicVM-Omarchy-TemplateBuilder",
+    "Disks": [
+      "E:\\EpicVM\\template-work\\omarchy-72076a960abb4de5ae86f59c20b04e3c\\omarchy-3.8.3-builder-recovered.vhdx",
+      "E:\\EpicVM\\template-work\\omarchy-72076a960abb4de5ae86f59c20b04e3c\\omarchy-3.8.3.cidata.vhdx"
+    ],
+    "Checkpoints": []
+  },
+  {
+    "Name": "Windows 11 dev environment",
+    "Id": "6e689095-25d6-4a05-9737-3e87585eaf9c",
+    "State": "Off",
+    "Notes": "",
+    "Path": "C:\\ProgramData\\Microsoft\\Windows\\Hyper-V",
+    "ConfigurationLocation": "C:\\ProgramData\\Microsoft\\Windows\\Hyper-V",
+    "Disks": [
+      "C:\\ProgramData\\Microsoft\\Windows\\Virtual Hard Disks\\Windows 11 dev environment.vhdx"
+    ],
+    "Checkpoints": []
+  }
+]
